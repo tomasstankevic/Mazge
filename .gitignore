@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+*.egg
+
+# Jupyter
+.ipynb_checkpoints/
+
+# PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# ESP-IDF
+build/
+sdkconfig.old
+managed_components/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data
+*.jpg
+*.jpeg
+*.png
+!docs/**/*.png
+datasets/
+models/*.tflite
+models/*.onnx
+models/*.pt
