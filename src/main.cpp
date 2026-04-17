@@ -64,6 +64,58 @@ volatile int jpegQuality = 12;
 // Pre-allocated binning buffer in PSRAM (400*300 = 120000 bytes)
 uint8_t *binBuf = NULL;
 
+// ===== Burst capture =====
+#define BURST_COUNT 5
+#define BURST_TRIGGER_MM 220
+struct BurstImage {
+  uint8_t *buf;
+  size_t len;
+};
+BurstImage burstImages[BURST_COUNT];
+volatile int burstReady = 0;          // number of images stored
+volatile bool burstCapturing = false; // capture in progress
+unsigned long burstCooldown = 0;      // prevent re-trigger
+
+void captureBurst() {
+  burstCapturing = true;
+  Serial.println("Burst capture starting...");
+  // Free old images
+  for (int i = 0; i < BURST_COUNT; i++) {
+    if (burstImages[i].buf) { free(burstImages[i].buf); burstImages[i].buf = NULL; }
+    burstImages[i].len = 0;
+  }
+  burstReady = 0;
+
+  // Temporarily switch camera to VGA JPEG for burst
+  sensor_t *s = esp_camera_sensor_get();
+  framesize_t origSize = s->status.framesize;
+  s->set_framesize(s, FRAMESIZE_VGA);
+  s->set_quality(s, 10);
+  // Discard first frame (may be partial after resize)
+  camera_fb_t *discard = esp_camera_fb_get();
+  if (discard) esp_camera_fb_return(discard);
+
+  for (int i = 0; i < BURST_COUNT; i++) {
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) { Serial.printf("Burst frame %d failed\n", i); continue; }
+    burstImages[i].buf = (uint8_t *)ps_malloc(fb->len);
+    if (burstImages[i].buf) {
+      memcpy(burstImages[i].buf, fb->buf, fb->len);
+      burstImages[i].len = fb->len;
+      burstReady = i + 1;
+      Serial.printf("Burst %d: %u bytes\n", i, fb->len);
+    }
+    esp_camera_fb_return(fb);
+  }
+
+  // Restore original resolution
+  s->set_framesize(s, origSize);
+  s->set_quality(s, jpegQuality);
+  burstCapturing = false;
+  burstCooldown = millis();
+  Serial.printf("Burst complete: %d images\n", burstReady);
+}
+
 // ===== 2x2 binning: extract Y from YUV422 and average 4 pixels =====
 // YUV422 layout: Y0 U0 Y1 V0 Y2 U1 Y3 V1 ...
 // Y is at byte offsets 0, 2, 4, 6 ... (every even byte)
@@ -112,6 +164,10 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   <p id="motion" style="font-size:1.1em;font-weight:bold;margin:4px 0 8px;">Motion: <span id="motion-val" style="color:#888;">--</span> | Distance: <span id="dist-val" style="color:#888;">--</span></p>
   <button id="toggle-stream" onclick="toggleStream()" style="margin:0 0 8px;padding:8px 20px;font-size:1em;cursor:pointer;border-radius:6px;border:none;background:#4a4;color:#fff;">Stop Stream</button>
   <img id="stream" src="" />
+  <div id="burst-section" style="width:100%;max-width:700px;margin-top:16px;">
+    <h2 style="font-size:1.1em;margin:0 0 6px;">Burst Captures: <span id="burst-count">0</span></h2>
+    <div id="burst-gallery" style="display:flex;flex-wrap:wrap;gap:6px;"></div>
+  </div>
   <div class="controls">
     <label>Binning</label>
     <select id="binning">
@@ -195,6 +251,21 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
         const dv = document.getElementById('dist-val');
         if (s.distance >= 0) { dv.textContent = s.distance + ' mm'; dv.style.color = '#4cf'; }
         else { dv.textContent = 'Error'; dv.style.color = '#f84'; }
+        // Update burst gallery
+        const bc = document.getElementById('burst-count');
+        const bg = document.getElementById('burst-gallery');
+        bc.textContent = s.burstReady;
+        if (s.burstReady > 0 && s.burstReady !== parseInt(bg.dataset.count || '0')) {
+          bg.dataset.count = s.burstReady;
+          bg.innerHTML = '';
+          for (let i = 0; i < s.burstReady; i++) {
+            const img = document.createElement('img');
+            img.src = '/burst?i=' + i + '&t=' + Date.now();
+            img.style.cssText = 'width:48%;border:1px solid #555;border-radius:4px;cursor:pointer;';
+            img.onclick = function() { window.open(this.src); };
+            bg.appendChild(img);
+          }
+        }
       } catch(e) {}
     }
     let statsInterval = setInterval(pollStats, 1000);
@@ -396,11 +467,11 @@ static esp_err_t index_handler(httpd_req_t *req) {
 }
 
 static esp_err_t stats_handler(httpd_req_t *req) {
-  char json[160];
+  char json[200];
   snprintf(json, sizeof(json),
-    "{\"fps\":%.1f,\"frameBytes\":%u,\"frameMs\":%u,\"totalFrames\":%u,\"motion\":%s,\"distance\":%d}",
+    "{\"fps\":%.1f,\"frameBytes\":%u,\"frameMs\":%u,\"totalFrames\":%u,\"motion\":%s,\"distance\":%d,\"burstReady\":%d}",
     streamFps, lastFrameBytes, lastFrameMs, frameCount,
-    motionDetected ? "true" : "false", tofDistance);
+    motionDetected ? "true" : "false", tofDistance, burstReady);
   httpd_resp_set_type(req, "application/json");
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
   return httpd_resp_send(req, json, strlen(json));
@@ -477,6 +548,20 @@ void startStreamServer() {
   }
 }
 
+static esp_err_t burst_handler(httpd_req_t *req) {
+  char buf[32];
+  char val[8];
+  int len = httpd_req_get_url_query_len(req) + 1;
+  if (len <= 1 || len > (int)sizeof(buf)) { httpd_resp_send_404(req); return ESP_FAIL; }
+  httpd_req_get_url_query_str(req, buf, sizeof(buf));
+  if (httpd_query_key_value(buf, "i", val, sizeof(val)) != ESP_OK) { httpd_resp_send_404(req); return ESP_FAIL; }
+  int idx = atoi(val);
+  if (idx < 0 || idx >= burstReady || !burstImages[idx].buf) { httpd_resp_send_404(req); return ESP_FAIL; }
+  httpd_resp_set_type(req, "image/jpeg");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  return httpd_resp_send(req, (const char *)burstImages[idx].buf, burstImages[idx].len);
+}
+
 void startUIServer() {
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   config.server_port = 80;
@@ -505,10 +590,18 @@ void startUIServer() {
     .user_ctx = NULL
   };
 
+  httpd_uri_t burst_uri = {
+    .uri = "/burst",
+    .method = HTTP_GET,
+    .handler = burst_handler,
+    .user_ctx = NULL
+  };
+
   if (httpd_start(&ui_httpd, &config) == ESP_OK) {
     httpd_register_uri_handler(ui_httpd, &index_uri);
     httpd_register_uri_handler(ui_httpd, &stats_uri);
     httpd_register_uri_handler(ui_httpd, &cmd_uri);
+    httpd_register_uri_handler(ui_httpd, &burst_uri);
     Serial.println("UI server started on port 80");
   }
 }
@@ -599,5 +692,11 @@ void loop() {
     lastTof = now;
     int d = tofSensor.readRangeSingleMillimeters();
     tofDistance = tofSensor.timeoutOccurred() ? -1 : d;
+  }
+
+  // Trigger burst when distance < threshold (5s cooldown)
+  if (tofReady && tofDistance >= 0 && tofDistance < BURST_TRIGGER_MM
+      && !burstCapturing && (now - burstCooldown > 5000)) {
+    captureBurst();
   }
 }
