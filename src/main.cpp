@@ -1,5 +1,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <Wire.h>
+#include <VL6180X.h>
 #include <ArduinoOTA.h>
 #include "esp_camera.h"
 #include "esp_http_server.h"
@@ -29,6 +31,17 @@ const char *WIFI_PASS = "YOUR_WIFI_PASS";
 #define HREF_GPIO_NUM   7
 #define PCLK_GPIO_NUM  13
 
+// ===== PIR motion sensor =====
+#define PIR_PIN 14
+volatile bool motionDetected = false;
+
+// ===== VL6180X ToF sensor =====
+#define TOF_SDA 47
+#define TOF_SCL 21
+VL6180X tofSensor;
+volatile int tofDistance = -1; // mm, -1 = error
+bool tofReady = false;
+
 // ===== MJPEG stream constants =====
 #define PART_BOUNDARY "123456789000000000000987654321"
 static const char *STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
@@ -45,7 +58,7 @@ volatile uint32_t lastFrameBytes = 0;
 volatile uint32_t lastFrameMs = 0;
 volatile uint32_t frameCount = 0;
 volatile int targetFps = 15;  // adjustable from web UI
-volatile bool useBinning = true; // YUV→bin mode
+volatile bool useBinning = false; // YUV→bin mode
 volatile int jpegQuality = 12;
 
 // Pre-allocated binning buffer in PSRAM (400*300 = 120000 bytes)
@@ -96,12 +109,14 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <body>
   <h1>ESP32-CAM Live</h1>
   <p id="stats">Connecting...</p>
+  <p id="motion" style="font-size:1.1em;font-weight:bold;margin:4px 0 8px;">Motion: <span id="motion-val" style="color:#888;">--</span> | Distance: <span id="dist-val" style="color:#888;">--</span></p>
+  <button id="toggle-stream" onclick="toggleStream()" style="margin:0 0 8px;padding:8px 20px;font-size:1em;cursor:pointer;border-radius:6px;border:none;background:#4a4;color:#fff;">Stop Stream</button>
   <img id="stream" src="" />
   <div class="controls">
     <label>Binning</label>
     <select id="binning">
-      <option value="0">Off (VGA 640x480)</option>
-      <option value="1" selected>On (SVGA→2x2 400x300)</option>
+      <option value="0" selected>Off (SVGA 800x600)</option>
+      <option value="1">On (SVGA→2x2 400x300)</option>
     </select><span></span>
 
     <label>JPEG Quality</label>
@@ -145,17 +160,44 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     </select><span></span>
   </div>
   <script>
-    document.getElementById('stream').src = 'http://' + location.hostname + ':81/stream';
+    let streamOn = true;
+    const streamImg = document.getElementById('stream');
+    const toggleBtn = document.getElementById('toggle-stream');
+    streamImg.src = 'http://' + location.hostname + ':81/stream';
 
-    // Stats polling
-    setInterval(async () => {
+    function toggleStream() {
+      if (streamOn) {
+        streamImg.src = '';
+        toggleBtn.textContent = 'Start Stream';
+        toggleBtn.style.background = '#a44';
+        streamOn = false;
+        clearInterval(statsInterval);
+        statsInterval = setInterval(pollStats, 200);
+      } else {
+        streamImg.src = 'http://' + location.hostname + ':81/stream?t=' + Date.now();
+        toggleBtn.textContent = 'Stop Stream';
+        toggleBtn.style.background = '#4a4';
+        streamOn = true;
+        clearInterval(statsInterval);
+        statsInterval = setInterval(pollStats, 1000);
+      }
+    }
+
+    async function pollStats() {
       try {
         const r = await fetch('/stats');
         const s = await r.json();
         document.getElementById('stats').textContent =
           `FPS: ${s.fps.toFixed(1)} | Frame: ${(s.frameBytes/1024).toFixed(1)} KB | Send: ${s.frameMs} ms | Total: ${s.totalFrames}`;
+        const mv = document.getElementById('motion-val');
+        if (s.motion) { mv.textContent = 'DETECTED'; mv.style.color = '#f44'; }
+        else { mv.textContent = 'None'; mv.style.color = '#4f4'; }
+        const dv = document.getElementById('dist-val');
+        if (s.distance >= 0) { dv.textContent = s.distance + ' mm'; dv.style.color = '#4cf'; }
+        else { dv.textContent = 'Error'; dv.style.color = '#f84'; }
       } catch(e) {}
-    }, 1000);
+    }
+    let statsInterval = setInterval(pollStats, 1000);
 
     // Send command helper
     async function cmd(k, v) {
@@ -222,9 +264,9 @@ bool initCamera(bool binning) {
     config.fb_location  = CAMERA_FB_IN_PSRAM;
     config.jpeg_quality = 12; // unused for YUV but required
   } else {
-    // Hardware JPEG at VGA
+    // Hardware JPEG at SVGA
     config.pixel_format = PIXFORMAT_JPEG;
-    config.frame_size   = FRAMESIZE_VGA;   // 640x480
+    config.frame_size   = FRAMESIZE_SVGA;  // 800x600
     config.jpeg_quality = jpegQuality;
     config.fb_count     = 2;
     config.fb_location  = CAMERA_FB_IN_PSRAM;
@@ -354,10 +396,11 @@ static esp_err_t index_handler(httpd_req_t *req) {
 }
 
 static esp_err_t stats_handler(httpd_req_t *req) {
-  char json[128];
+  char json[160];
   snprintf(json, sizeof(json),
-    "{\"fps\":%.1f,\"frameBytes\":%u,\"frameMs\":%u,\"totalFrames\":%u}",
-    streamFps, lastFrameBytes, lastFrameMs, frameCount);
+    "{\"fps\":%.1f,\"frameBytes\":%u,\"frameMs\":%u,\"totalFrames\":%u,\"motion\":%s,\"distance\":%d}",
+    streamFps, lastFrameBytes, lastFrameMs, frameCount,
+    motionDetected ? "true" : "false", tofDistance);
   httpd_resp_set_type(req, "application/json");
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
   return httpd_resp_send(req, json, strlen(json));
@@ -475,6 +518,20 @@ void setup() {
   Serial.begin(115200);
   Serial.println();
 
+  pinMode(PIR_PIN, INPUT);
+
+  Wire.begin(TOF_SDA, TOF_SCL);
+  Wire.beginTransmission(0x29); // VL6180X default address
+  if (Wire.endTransmission() == 0) {
+    tofSensor.init();
+    tofSensor.configureDefault();
+    tofSensor.setTimeout(500);
+    tofReady = true;
+    Serial.println("VL6180X ToF sensor ready");
+  } else {
+    Serial.println("VL6180X not found on I2C");
+  }
+
   if (!initCamera(useBinning)) {
     Serial.println("Camera init failed \u2013 restarting in 5 s");
     delay(5000);
@@ -534,5 +591,13 @@ void loop() {
   if (now - lastOTA >= 500) {
     lastOTA = now;
     ArduinoOTA.handle();
+  }
+  motionDetected = digitalRead(PIR_PIN) == HIGH;
+
+  static unsigned long lastTof = 0;
+  if (tofReady && now - lastTof >= 100) {
+    lastTof = now;
+    int d = tofSensor.readRangeSingleMillimeters();
+    tofDistance = tofSensor.timeoutOccurred() ? -1 : d;
   }
 }
