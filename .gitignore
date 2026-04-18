@@ -38,3 +38,4 @@ datasets/
 models/*.tflite
 models/*.onnx
 models/*.pt
+captures/

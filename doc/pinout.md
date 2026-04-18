@@ -58,26 +58,41 @@ Not used by camera, PSRAM, USB, or UART0:
 
 | GPIO | Notes | Good for |
 |------|-------|----------|
-| **1** | ADC1_CH0, touch | I2C SDA (ToF) |
-| **2** | ADC1_CH1, touch, "LED ON" label | I2C SCL (ToF) |
+| **1** | ADC1_CH0, touch | general I/O |
+| **2** | ADC1_CH1, touch, "LED ON" label | general I/O |
 | **3** | ADC, touch, JTAG_EN | digital I/O |
-| **14** | ADC2_CH3, touch | PIR sensor |
-| **21** | clean GPIO | digital I/O |
+| **14** | ADC2_CH3, touch | **PIR sensor** (in use) |
+| **21** | clean GPIO | **VL6180X SCL** (in use) |
 | **41** | JTAG MTDI | digital I/O |
 | **42** | JTAG MTMS | digital I/O |
-| **47** | clean GPIO | digital I/O |
+| **47** | clean GPIO | **VL6180X SDA** (in use) |
 | **38–40** | SD card pins | usable if no SD card |
 
 ## Peripheral Wiring
 
-### TOF050C (VL53L0X I2C ToF sensor)
+### PIR Motion Sensor (GPIO 14)
 
-| TOF050C | ESP32 | Notes |
+| PIR | ESP32 | Notes |
+|-----|-------|-------|
+| OUT | GPIO14 | Digital HIGH = motion detected |
+| VCC | 3.3V | Add 10µF + 100nF cap at sensor end to reduce WiFi noise |
+| GND | GND | |
+
+> **Noise note:** Long wires pick up EMI from the ESP32 WiFi radio, causing false triggers. Keep wires short, add decoupling caps, and consider 100nF on signal line at ESP32 end.
+
+### VL6180X ToF Distance Sensor (I2C)
+
+| VL6180X | ESP32 | Notes |
 |---------|-------|-------|
 | VIN | 3.3V | |
 | GND | GND | |
-| SDA | GPIO47 | Wire1 bus |
-| SCL | GPIO21 | Wire1 bus |
+| SDA | GPIO47 | I2C bus |
+| SCL | GPIO21 | I2C bus |
+
+- I2C address: **0x29** (default)
+- Range: 0–200mm (reliable), up to ~600mm with reduced accuracy
+- Init is non-blocking: if sensor not found on I2C, firmware boots normally without it
+- Burst capture triggers when distance < 220mm (5 VGA JPEG frames stored in PSRAM)
 | SHUT | 3.3V | tie high (always enabled) |
 | INT | — | leave unconnected |
 

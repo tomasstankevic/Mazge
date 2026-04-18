@@ -1,7 +1,6 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <Wire.h>
-#include <VL6180X.h>
 #include <ArduinoOTA.h>
 #include "esp_camera.h"
 #include "esp_http_server.h"
@@ -35,12 +34,81 @@ const char *WIFI_PASS = "YOUR_WIFI_PASS";
 #define PIR_PIN 14
 volatile bool motionDetected = false;
 
-// ===== VL6180X ToF sensor =====
+// ===== TOF050C / VL6180X ToF sensor (raw I2C, 16-bit registers) =====
 #define TOF_SDA 47
 #define TOF_SCL 21
-VL6180X tofSensor;
-volatile int tofDistance = -1; // mm, -1 = error
+#define TOF_ADDR 0x29
+volatile int tofDistance = -2; // mm, -1 = no object (>range), -2 = sensor error
 bool tofReady = false;
+
+void tofWriteReg(uint16_t reg, uint8_t val) {
+  Wire.beginTransmission(TOF_ADDR);
+  Wire.write((reg >> 8) & 0xFF);
+  Wire.write(reg & 0xFF);
+  Wire.write(val);
+  Wire.endTransmission();
+}
+
+uint8_t tofReadReg(uint16_t reg) {
+  Wire.beginTransmission(TOF_ADDR);
+  Wire.write((reg >> 8) & 0xFF);
+  Wire.write(reg & 0xFF);
+  Wire.endTransmission();
+  Wire.requestFrom(TOF_ADDR, 1);
+  return Wire.available() ? Wire.read() : 0;
+}
+
+void tofInit() {
+  // Mandatory init sequence from VL6180X datasheet (AN4545)
+  // Only write private regs if fresh out of reset
+  if (tofReadReg(0x016) == 1) {
+    tofWriteReg(0x0207, 0x01);
+    tofWriteReg(0x0208, 0x01);
+    tofWriteReg(0x0096, 0x00);
+    tofWriteReg(0x0097, 0xFD);
+    tofWriteReg(0x00E3, 0x00);
+    tofWriteReg(0x00E4, 0x04);
+    tofWriteReg(0x00E5, 0x02);
+    tofWriteReg(0x00E6, 0x01);
+    tofWriteReg(0x00E7, 0x03);
+    tofWriteReg(0x00F5, 0x02);
+    tofWriteReg(0x00D9, 0x05);
+    tofWriteReg(0x00DB, 0xCE);
+    tofWriteReg(0x00DC, 0x03);
+    tofWriteReg(0x00DD, 0xF8);
+    tofWriteReg(0x009F, 0x00);
+    tofWriteReg(0x00A3, 0x3C);
+    tofWriteReg(0x00B7, 0x00);
+    tofWriteReg(0x00BB, 0x3C);
+    tofWriteReg(0x00B2, 0x09);
+    tofWriteReg(0x00CA, 0x09);
+    tofWriteReg(0x0198, 0x01);
+    tofWriteReg(0x01B0, 0x17);
+    tofWriteReg(0x01AD, 0x00);
+    tofWriteReg(0x00FF, 0x05);
+    tofWriteReg(0x0100, 0x05);
+    tofWriteReg(0x0199, 0x05);
+    tofWriteReg(0x01A6, 0x1B);
+    tofWriteReg(0x01AC, 0x3E);
+    tofWriteReg(0x01A7, 0x1F);
+    tofWriteReg(0x0030, 0x00);
+    tofWriteReg(0x0016, 0x00); // clear fresh out of reset
+    Serial.println("TOF050C: wrote private init regs");
+  } else {
+    Serial.println("TOF050C: already initialized, skipping private regs");
+  }
+  // Always configure for ranging (safe to re-apply)
+  tofWriteReg(0x0011, 0x10); // GPIO1 = new sample ready
+  tofWriteReg(0x010A, 0x30); // averaging period = 48
+  tofWriteReg(0x003F, 0x46); // ALS analogue gain
+  tofWriteReg(0x0031, 0xFF); // cal every 255 measurements
+  tofWriteReg(0x0041, 0x63); // ALS integration time 100ms
+  tofWriteReg(0x002E, 0x00); // ranging inter-measurement period = minimum
+  tofWriteReg(0x001B, 0x05); // max convergence time 5.0ms (faster, less accurate at edge)
+  tofWriteReg(0x003E, 0x31); // range check enables
+  tofWriteReg(0x0014, 0x24); // range/ALS interrupt config
+  tofWriteReg(0x0015, 0x07); // clear any pending interrupts
+}
 
 // ===== MJPEG stream constants =====
 #define PART_BOUNDARY "123456789000000000000987654321"
@@ -64,56 +132,80 @@ volatile int jpegQuality = 12;
 // Pre-allocated binning buffer in PSRAM (400*300 = 120000 bytes)
 uint8_t *binBuf = NULL;
 
-// ===== Burst capture =====
-#define BURST_COUNT 5
-#define BURST_TRIGGER_MM 220
+// ===== Burst capture (pre-trigger ring buffer) =====
+#define RING_SIZE 10
+#define BURST_TRIGGER_MM 500
+#define BURST_ARCHIVES 30
 struct BurstImage {
   uint8_t *buf;
   size_t len;
 };
-BurstImage burstImages[BURST_COUNT];
-volatile int burstReady = 0;          // number of images stored
-volatile bool burstCapturing = false; // capture in progress
-unsigned long burstCooldown = 0;      // prevent re-trigger
+struct BurstArchive {
+  BurstImage images[RING_SIZE];
+  int count;
+  unsigned long timestamp;
+};
+BurstArchive burstArchives[BURST_ARCHIVES];
+volatile int burstArchiveCount = 0;
+volatile int burstGen = 0;  // increments on each new burst
+volatile bool burstCapturing = false;
+unsigned long burstCooldown = 0;
 
-void captureBurst() {
+// Post-trigger: capture N more frames after trigger before freezing
+#define POST_TRIGGER_FRAMES 3
+int postTriggerRemaining = 0;  // >0 means we're in post-trigger phase
+
+// Ring buffer: continuously captures frames so we have the PAST frames on trigger
+BurstImage ringBuf[RING_SIZE];
+int ringHead = 0;
+int ringCount = 0;
+
+void freezeRingToArchive() {
   burstCapturing = true;
-  Serial.println("Burst capture starting...");
-  // Free old images
-  for (int i = 0; i < BURST_COUNT; i++) {
-    if (burstImages[i].buf) { free(burstImages[i].buf); burstImages[i].buf = NULL; }
-    burstImages[i].len = 0;
-  }
-  burstReady = 0;
+  Serial.println("Burst: freezing ring buffer...");
 
-  // Temporarily switch camera to VGA JPEG for burst
-  sensor_t *s = esp_camera_sensor_get();
-  framesize_t origSize = s->status.framesize;
-  s->set_framesize(s, FRAMESIZE_VGA);
-  s->set_quality(s, 10);
-  // Discard first frame (may be partial after resize)
-  camera_fb_t *discard = esp_camera_fb_get();
-  if (discard) esp_camera_fb_return(discard);
-
-  for (int i = 0; i < BURST_COUNT; i++) {
-    camera_fb_t *fb = esp_camera_fb_get();
-    if (!fb) { Serial.printf("Burst frame %d failed\n", i); continue; }
-    burstImages[i].buf = (uint8_t *)ps_malloc(fb->len);
-    if (burstImages[i].buf) {
-      memcpy(burstImages[i].buf, fb->buf, fb->len);
-      burstImages[i].len = fb->len;
-      burstReady = i + 1;
-      Serial.printf("Burst %d: %u bytes\n", i, fb->len);
+  // Shift archives if full
+  if (burstArchiveCount >= BURST_ARCHIVES) {
+    for (int i = 0; i < RING_SIZE; i++) {
+      if (burstArchives[0].images[i].buf) { free(burstArchives[0].images[i].buf); }
     }
-    esp_camera_fb_return(fb);
+    for (int a = 0; a < BURST_ARCHIVES - 1; a++) {
+      burstArchives[a] = burstArchives[a + 1];
+    }
+    burstArchiveCount = BURST_ARCHIVES - 1;
   }
 
-  // Restore original resolution
-  s->set_framesize(s, origSize);
-  s->set_quality(s, jpegQuality);
+  int slot = burstArchiveCount;
+  memset(&burstArchives[slot], 0, sizeof(BurstArchive));
+
+  // Save all ring frames (oldest first)
+  int available = ringCount;
+  int toSave = available;
+  int start = (ringCount < RING_SIZE) ? 0 : ringHead;
+  for (int i = 0; i < toSave; i++) {
+    int idx = (start + i) % RING_SIZE;
+    burstArchives[slot].images[i].buf = ringBuf[idx].buf;
+    burstArchives[slot].images[i].len = ringBuf[idx].len;
+    ringBuf[idx].buf = NULL;
+    ringBuf[idx].len = 0;
+  }
+  burstArchives[slot].count = toSave;
+  burstArchives[slot].timestamp = millis();
+  burstArchiveCount = slot + 1;
+  burstGen++;
+
+  // Free remaining ring frames and reset
+  for (int i = 0; i < RING_SIZE; i++) {
+    if (ringBuf[i].buf) { free(ringBuf[i].buf); ringBuf[i].buf = NULL; }
+    ringBuf[i].len = 0;
+  }
+  ringCount = 0;
+  ringHead = 0;
+
   burstCapturing = false;
   burstCooldown = millis();
-  Serial.printf("Burst complete: %d images\n", burstReady);
+  Serial.printf("Burst archived: %d frames (archive %d/%d)\n",
+    burstArchives[slot].count, burstArchiveCount, BURST_ARCHIVES);
 }
 
 // ===== 2x2 binning: extract Y from YUV422 and average 4 pixels =====
@@ -150,6 +242,11 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     h1 { margin: 0 0 4px; font-size: 1.3em; }
     #stats { color: #888; margin: 0 0 8px; font-family: monospace; font-size: 0.85em; }
     img { max-width: 100%; border: 2px solid #333; border-radius: 8px; }
+    .rot90 { transform: rotate(-90deg); }
+    #stream-wrap { display:inline-block; position:relative; overflow:hidden; max-width:400px; }
+    #stream-wrap img { position:absolute; top:50%; left:50%; transform:rotate(-90deg) translate(-50%,-50%); transform-origin:0 0; max-width:none; }
+    .thumb-wrap { display:inline-block; position:relative; width:19%; aspect-ratio:3/4; overflow:hidden; border:1px solid #555; border-radius:3px; cursor:pointer; }
+    .thumb-wrap img { position:absolute; top:50%; left:50%; transform:rotate(-90deg) translate(-50%,-50%); transform-origin:0 0; width:133.33%; max-width:none; border:none; border-radius:0; }
     .controls { display: grid; grid-template-columns: 110px 1fr 50px;
                 gap: 4px 8px; align-items: center; width: 100%; max-width: 500px;
                 margin-top: 12px; font-size: 0.85em; }
@@ -162,11 +259,11 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   <h1>ESP32-CAM Live</h1>
   <p id="stats">Connecting...</p>
   <p id="motion" style="font-size:1.1em;font-weight:bold;margin:4px 0 8px;">Motion: <span id="motion-val" style="color:#888;">--</span> | Distance: <span id="dist-val" style="color:#888;">--</span></p>
-  <button id="toggle-stream" onclick="toggleStream()" style="margin:0 0 8px;padding:8px 20px;font-size:1em;cursor:pointer;border-radius:6px;border:none;background:#4a4;color:#fff;">Stop Stream</button>
-  <img id="stream" src="" />
+  <button id="toggle-stream" onclick="toggleStream()" style="margin:0 0 8px;padding:8px 20px;font-size:1em;cursor:pointer;border-radius:6px;border:none;background:#a44;color:#fff;">Start Stream</button>
+  <div id="stream-wrap"><img id="stream" src="" onload="var w=this.naturalHeight,h=this.naturalWidth;this.parentElement.style.width=w+'px';this.parentElement.style.height=h+'px';this.style.width=h+'px';" /></div>
   <div id="burst-section" style="width:100%;max-width:700px;margin-top:16px;">
-    <h2 style="font-size:1.1em;margin:0 0 6px;">Burst Captures: <span id="burst-count">0</span></h2>
-    <div id="burst-gallery" style="display:flex;flex-wrap:wrap;gap:6px;"></div>
+    <h2 style="font-size:1.1em;margin:0 0 6px;">Burst Archives: <span id="burst-archive-count">0</span></h2>
+    <div id="burst-archives"></div>
   </div>
   <div class="controls">
     <label>Binning</label>
@@ -216,10 +313,9 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     </select><span></span>
   </div>
   <script>
-    let streamOn = true;
+    let streamOn = false;
     const streamImg = document.getElementById('stream');
     const toggleBtn = document.getElementById('toggle-stream');
-    streamImg.src = 'http://' + location.hostname + ':81/stream';
 
     function toggleStream() {
       if (streamOn) {
@@ -250,25 +346,59 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
         else { mv.textContent = 'None'; mv.style.color = '#4f4'; }
         const dv = document.getElementById('dist-val');
         if (s.distance >= 0) { dv.textContent = s.distance + ' mm'; dv.style.color = '#4cf'; }
-        else { dv.textContent = 'Error'; dv.style.color = '#f84'; }
+        else if (s.distance === -1) { dv.textContent = '> 500 mm'; dv.style.color = '#888'; }
+        else { dv.textContent = 'Sensor Error'; dv.style.color = '#f84'; }
         // Update burst gallery
-        const bc = document.getElementById('burst-count');
-        const bg = document.getElementById('burst-gallery');
-        bc.textContent = s.burstReady;
-        if (s.burstReady > 0 && s.burstReady !== parseInt(bg.dataset.count || '0')) {
-          bg.dataset.count = s.burstReady;
-          bg.innerHTML = '';
-          for (let i = 0; i < s.burstReady; i++) {
-            const img = document.createElement('img');
-            img.src = '/burst?i=' + i + '&t=' + Date.now();
-            img.style.cssText = 'width:48%;border:1px solid #555;border-radius:4px;cursor:pointer;';
-            img.onclick = function() { window.open(this.src); };
-            bg.appendChild(img);
+        const bac = document.getElementById('burst-archive-count');
+        const ba = document.getElementById('burst-archives');
+        bac.textContent = s.burstArchives;
+        const key = s.burstGen;
+        if (s.burstArchives > 0 && key !== parseInt(ba.dataset.key || '0')) {
+          ba.dataset.key = key;
+          ba.innerHTML = '';
+          for (let a = s.burstArchives - 1; a >= 0; a--) {
+            const isLatest = (a === s.burstArchives - 1);
+            const div = document.createElement('div');
+            div.style.cssText = 'margin:8px 0;padding:8px;background:#1a1a2e;border-radius:6px;cursor:pointer;';
+            const h = document.createElement('h3');
+            h.style.cssText = 'font-size:0.95em;margin:0 0 4px;color:#aaa;';
+            h.textContent = (isLatest ? '\u25BC ' : '\u25B6 ') + 'Burst #' + (a+1) + ' (' + s.burstCounts[a] + ' frames)';
+            div.appendChild(h);
+            const gallery = document.createElement('div');
+            gallery.style.cssText = 'display:flex;flex-wrap:wrap;gap:4px;' + (isLatest ? '' : 'display:none;');
+            h.onclick = function() {
+              gallery.style.display = gallery.style.display === 'none' ? 'flex' : 'none';
+              h.textContent = (gallery.style.display === 'none' ? '\u25B6 ' : '\u25BC ') + 'Burst #' + (a+1) + ' (' + s.burstCounts[a] + ' frames)';
+              if (gallery.childElementCount === 0) {
+                for (let i = 0; i < s.burstCounts[a]; i++) {
+                  const wrap = document.createElement('div');
+                  wrap.className = 'thumb-wrap';
+                  const img = document.createElement('img');
+                  img.src = '/burst?a=' + a + '&i=' + i + '&t=' + Date.now();
+                  wrap.onclick = function(e) { e.stopPropagation(); window.open(img.src); };
+                  wrap.appendChild(img);
+                  gallery.appendChild(wrap);
+                }
+              }
+            };
+            if (isLatest) {
+              for (let i = 0; i < s.burstCounts[a]; i++) {
+                const wrap = document.createElement('div');
+                wrap.className = 'thumb-wrap';
+                const img = document.createElement('img');
+                img.src = '/burst?a=' + a + '&i=' + i + '&t=' + Date.now();
+                wrap.onclick = function(e) { e.stopPropagation(); window.open(img.src); };
+                wrap.appendChild(img);
+                gallery.appendChild(wrap);
+              }
+            }
+            div.appendChild(gallery);
+            ba.appendChild(div);
           }
         }
       } catch(e) {}
     }
-    let statsInterval = setInterval(pollStats, 1000);
+    let statsInterval = setInterval(pollStats, 200);
 
     // Send command helper
     async function cmd(k, v) {
@@ -351,7 +481,14 @@ bool initCamera(bool binning) {
 
   if (!binning) {
     sensor_t *s = esp_camera_sensor_get();
-    if (s) s->set_special_effect(s, 2); // greyscale
+    if (s) {
+      s->set_special_effect(s, 2); // greyscale
+      s->set_exposure_ctrl(s, 1);  // enable auto exposure for day/night
+      s->set_aec2(s, 1);           // enable DSP auto exposure (night mode)
+      s->set_gain_ctrl(s, 1);      // enable auto gain
+      s->set_agc_gain(s, 30);      // high gain ceiling for low light
+      s->set_gainceiling(s, (gainceiling_t)6); // 128x max gain
+    }
   }
   return true;
 }
@@ -467,11 +604,19 @@ static esp_err_t index_handler(httpd_req_t *req) {
 }
 
 static esp_err_t stats_handler(httpd_req_t *req) {
-  char json[200];
+  char json[300];
+  // Build burst archive counts array
+  char archBuf[80] = "[";
+  for (int a = 0; a < burstArchiveCount; a++) {
+    char tmp[12];
+    snprintf(tmp, sizeof(tmp), "%s%d", a > 0 ? "," : "", burstArchives[a].count);
+    strlcat(archBuf, tmp, sizeof(archBuf));
+  }
+  strlcat(archBuf, "]", sizeof(archBuf));
   snprintf(json, sizeof(json),
-    "{\"fps\":%.1f,\"frameBytes\":%u,\"frameMs\":%u,\"totalFrames\":%u,\"motion\":%s,\"distance\":%d,\"burstReady\":%d}",
+    "{\"fps\":%.1f,\"frameBytes\":%u,\"frameMs\":%u,\"totalFrames\":%u,\"motion\":%s,\"distance\":%d,\"burstArchives\":%d,\"burstGen\":%d,\"burstCounts\":%s}",
     streamFps, lastFrameBytes, lastFrameMs, frameCount,
-    motionDetected ? "true" : "false", tofDistance, burstReady);
+    motionDetected ? "true" : "false", tofDistance, burstArchiveCount, burstGen, archBuf);
   httpd_resp_set_type(req, "application/json");
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
   return httpd_resp_send(req, json, strlen(json));
@@ -549,17 +694,20 @@ void startStreamServer() {
 }
 
 static esp_err_t burst_handler(httpd_req_t *req) {
-  char buf[32];
+  char buf[48];
   char val[8];
   int len = httpd_req_get_url_query_len(req) + 1;
   if (len <= 1 || len > (int)sizeof(buf)) { httpd_resp_send_404(req); return ESP_FAIL; }
   httpd_req_get_url_query_str(req, buf, sizeof(buf));
-  if (httpd_query_key_value(buf, "i", val, sizeof(val)) != ESP_OK) { httpd_resp_send_404(req); return ESP_FAIL; }
-  int idx = atoi(val);
-  if (idx < 0 || idx >= burstReady || !burstImages[idx].buf) { httpd_resp_send_404(req); return ESP_FAIL; }
+  // /burst?a=archiveIdx&i=imageIdx
+  int archIdx = 0, imgIdx = 0;
+  if (httpd_query_key_value(buf, "a", val, sizeof(val)) == ESP_OK) archIdx = atoi(val);
+  if (httpd_query_key_value(buf, "i", val, sizeof(val)) == ESP_OK) imgIdx = atoi(val);
+  if (archIdx < 0 || archIdx >= burstArchiveCount) { httpd_resp_send_404(req); return ESP_FAIL; }
+  if (imgIdx < 0 || imgIdx >= burstArchives[archIdx].count || !burstArchives[archIdx].images[imgIdx].buf) { httpd_resp_send_404(req); return ESP_FAIL; }
   httpd_resp_set_type(req, "image/jpeg");
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-  return httpd_resp_send(req, (const char *)burstImages[idx].buf, burstImages[idx].len);
+  return httpd_resp_send(req, (const char *)burstArchives[archIdx].images[imgIdx].buf, burstArchives[archIdx].images[imgIdx].len);
 }
 
 void startUIServer() {
@@ -614,15 +762,16 @@ void setup() {
   pinMode(PIR_PIN, INPUT);
 
   Wire.begin(TOF_SDA, TOF_SCL);
-  Wire.beginTransmission(0x29); // VL6180X default address
+  Wire.setClock(400000); // 400kHz fast mode
+  Wire.beginTransmission(TOF_ADDR);
   if (Wire.endTransmission() == 0) {
-    tofSensor.init();
-    tofSensor.configureDefault();
-    tofSensor.setTimeout(500);
+    tofInit();
+    // Start continuous ranging
+    tofWriteReg(0x0018, 0x03); // SYSRANGE__START = continuous mode
     tofReady = true;
-    Serial.println("VL6180X ToF sensor ready");
+    Serial.println("TOF050C sensor ready (continuous mode)");
   } else {
-    Serial.println("VL6180X not found on I2C");
+    Serial.println("TOF050C not found on I2C");
   }
 
   if (!initCamera(useBinning)) {
@@ -630,7 +779,14 @@ void setup() {
     delay(5000);
     ESP.restart();
   }
-
+  // Set QVGA for ring buffer capture (stream is off by default)
+  {
+    sensor_t *s = esp_camera_sensor_get();
+    if (s) {
+      s->set_framesize(s, FRAMESIZE_QVGA); // 320x240
+      s->set_quality(s, 10);
+    }
+  }
   // Allocate binning buffer in PSRAM (400*300 greyscale)
   binBuf = (uint8_t *)ps_malloc(400 * 300);
   if (!binBuf) {
@@ -656,7 +812,10 @@ void setup() {
 
   // OTA updates
   ArduinoOTA.setHostname("esp32cam");
-  ArduinoOTA.onStart([]() { Serial.println("OTA Start"); });
+  ArduinoOTA.onStart([]() {
+    burstCapturing = true; // pause ring buffer during OTA
+    Serial.println("OTA Start");
+  });
   ArduinoOTA.onEnd([]() { Serial.println("OTA End"); });
   ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
     Serial.printf("OTA: %u%%\r", progress / (total / 100));
@@ -688,15 +847,73 @@ void loop() {
   motionDetected = digitalRead(PIR_PIN) == HIGH;
 
   static unsigned long lastTof = 0;
-  if (tofReady && now - lastTof >= 100) {
+  static unsigned long lastValidTof = now; // watchdog: last time we got a valid reading
+  if (tofReady && now - lastTof >= 1) { // poll as fast as possible
     lastTof = now;
-    int d = tofSensor.readRangeSingleMillimeters();
-    tofDistance = tofSensor.timeoutOccurred() ? -1 : d;
+    uint8_t status = tofReadReg(0x004F); // RESULT__INTERRUPT_STATUS_GPIO
+    if (status & 0x04) { // range ready
+      uint8_t rangeStatus = (tofReadReg(0x004D) >> 4) & 0x0F;
+      // Read 2 bytes from result register 0x0062, divide by 100 for mm
+      Wire.beginTransmission(TOF_ADDR);
+      Wire.write(0x00); Wire.write(0x62);
+      Wire.endTransmission();
+      Wire.requestFrom(TOF_ADDR, 2);
+      if (Wire.available() == 2) {
+        int hi = Wire.read();
+        int lo = Wire.read();
+        int d = ((hi << 8) | lo) / 100;
+        if (rangeStatus == 0 && d <= 600) {
+          tofDistance = d;  // valid reading
+        } else if (rangeStatus == 6 || rangeStatus == 5 || d > 600) {
+          tofDistance = -1;  // no target / out of range
+        } else {
+          tofDistance = -2;  // sensor error
+        }
+        lastValidTof = now;
+      }
+      tofWriteReg(0x0015, 0x07); // clear interrupts
+    }
+    // Watchdog: if no valid reading for 3 seconds, reinit sensor
+    if (now - lastValidTof > 3000) {
+      Serial.println("TOF watchdog: no reading for 3s, reinitializing...");
+      tofWriteReg(0x0018, 0x00); // stop continuous mode
+      delay(10);
+      tofInit();
+      tofWriteReg(0x0018, 0x03); // restart continuous mode
+      lastValidTof = now;
+      Serial.println("TOF watchdog: sensor restarted");
+    }
   }
 
-  // Trigger burst when distance < threshold (5s cooldown)
-  if (tofReady && tofDistance >= 0 && tofDistance < BURST_TRIGGER_MM
-      && !burstCapturing && (now - burstCooldown > 5000)) {
-    captureBurst();
+  if (tofReady && tofDistance >= 0 && tofDistance < 480
+      && !burstCapturing && postTriggerRemaining == 0 && (now - burstCooldown > 5000)) {
+    postTriggerRemaining = POST_TRIGGER_FRAMES; // start post-trigger countdown
+  }
+
+  // Continuously fill ring buffer with frames (pre-trigger capture)
+  // Also continues during post-trigger countdown to capture frames after event
+  // Camera stays at QVGA when stream is off (set in setup)
+  static unsigned long lastRing = 0;
+  if (!burstCapturing && now - lastRing >= 100) { // ~10 fps ring buffer
+    lastRing = now;
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (fb) {
+      if (ringBuf[ringHead].buf) free(ringBuf[ringHead].buf);
+      ringBuf[ringHead].buf = (uint8_t *)ps_malloc(fb->len);
+      if (ringBuf[ringHead].buf) {
+        memcpy(ringBuf[ringHead].buf, fb->buf, fb->len);
+        ringBuf[ringHead].len = fb->len;
+        ringHead = (ringHead + 1) % RING_SIZE;
+        if (ringCount < RING_SIZE) ringCount++;
+        // Count down post-trigger frames, freeze when done
+        if (postTriggerRemaining > 0) {
+          postTriggerRemaining--;
+          if (postTriggerRemaining == 0) {
+            freezeRingToArchive();
+          }
+        }
+      }
+      esp_camera_fb_return(fb);
+    }
   }
 }
