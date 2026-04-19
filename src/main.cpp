@@ -784,7 +784,7 @@ void setup() {
     sensor_t *s = esp_camera_sensor_get();
     if (s) {
       s->set_framesize(s, FRAMESIZE_QVGA); // 320x240
-      s->set_quality(s, 10);
+      s->set_quality(s, 6);               // lower = better quality (was 10)
     }
   }
   // Allocate binning buffer in PSRAM (400*300 greyscale)

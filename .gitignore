@@ -8,6 +8,8 @@ build/
 venv/
 *.egg
 
+API_key_prey_detector.txt
+
 # Jupyter
 .ipynb_checkpoints/
 
@@ -39,3 +41,4 @@ models/*.tflite
 models/*.onnx
 models/*.pt
 captures/
+API_key_prey_detector.txt
