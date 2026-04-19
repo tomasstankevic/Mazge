@@ -178,6 +178,13 @@ struct BurstArchive {
   int apiFramesSent;            // how many frames sent to API
   unsigned long apiCallMs;      // when API was called
   int8_t apiPreyDetected;       // -1=not checked, 0=no prey, 1=prey found
+  // Per-frame timing breakdown (up to API_FRAMES_PER_BURST)
+  unsigned long cropMs[RING_SIZE];
+  unsigned long b64Ms[RING_SIZE];
+  unsigned long tlsMs[RING_SIZE];
+  unsigned long postMs[RING_SIZE];
+  unsigned long totalMs[RING_SIZE];
+  unsigned long apiDoneMs;        // when autonomousApiCheck finished
 };
 BurstArchive burstArchives[BURST_ARCHIVES];
 volatile int burstArchiveCount = 0;
@@ -300,14 +307,61 @@ static int apiResponseLen = 0;
 static int lastApiEspErr = 0;
 static int lastApiHttpStatus = 0;
 
+// ===== Persistent TLS connection for prey API =====
+static WiFiClientSecure *tlsClient = NULL;
+static HTTPClient *httpApi = NULL;
+static bool tlsConnected = false;
+static unsigned long lastTlsConnectMs = 0;
+
+// Ensure TLS connection is alive, reconnect if needed
+static bool ensureTlsConnection() {
+  if (tlsConnected && tlsClient && tlsClient->connected()) {
+    return true;
+  }
+  Serial.println("TLS: (re)connecting...");
+  unsigned long t0 = millis();
+
+  if (httpApi) { httpApi->end(); delete httpApi; httpApi = NULL; }
+  if (tlsClient) { tlsClient->stop(); delete tlsClient; tlsClient = NULL; }
+  tlsConnected = false;
+
+  tlsClient = new WiFiClientSecure();
+  if (!tlsClient) { Serial.println("TLS: alloc failed"); return false; }
+  tlsClient->setInsecure();
+
+  httpApi = new HTTPClient();
+  httpApi->setReuse(true); // enable HTTP keep-alive
+
+  if (!httpApi->begin(*tlsClient, PREY_API_URL)) {
+    Serial.println("TLS: begin failed");
+    delete httpApi; httpApi = NULL;
+    delete tlsClient; tlsClient = NULL;
+    return false;
+  }
+
+  char authHeader[128];
+  snprintf(authHeader, sizeof(authHeader), "Bearer %s", PREY_API_KEY);
+  httpApi->addHeader("Content-Type", "application/json");
+  httpApi->addHeader("Authorization", authHeader);
+  httpApi->addHeader("Connection", "keep-alive");
+  httpApi->setTimeout(15000);
+
+  tlsConnected = true;
+  lastTlsConnectMs = millis();
+  Serial.printf("TLS: connected in %lums\n", millis() - t0);
+  return true;
+}
+
 // ===== Crop JPEG for API =====
 // From 640x480: remove right 128px (occluded), then center-crop to 384x384.
-// All offsets 8-aligned (JPEG MCU boundary for greyscale).
+// All offsets MCU-aligned (16x8 for 4:2:2 YCbCr).
 // Crop region in original image: x=64..448, y=48..432.
 // Returns new JPEG in PSRAM (caller must free). Sets outLen. NULL on failure.
-#define CROP_X  64    // left margin (64px, 8-aligned)
-#define CROP_Y  48    // top margin  (48px, 8-aligned)
+#define CROP_X  64    // left margin (64px, MCU-aligned)
+#define CROP_Y  48    // top margin  (48px, MCU-aligned)
 #define CROP_SZ 384   // output 384x384
+
+#include "jpeg_lossless_crop.h"
 
 static uint8_t *cropJpegForApi(const uint8_t *jpgBuf, size_t jpgLen, size_t *outLen) {
   unsigned long t0 = millis();
@@ -315,67 +369,51 @@ static uint8_t *cropJpegForApi(const uint8_t *jpgBuf, size_t jpgLen, size_t *out
   Serial.printf("Crop: freeHeap=%u freePSRAM=%u jpgLen=%u\n",
     ESP.getFreeHeap(), ESP.getFreePsram(), jpgLen);
 
-  // Decode JPEG to RGB888 (greyscale gets expanded to 3 channels)
-  size_t rgbLen = CAM_W * CAM_H * 3;
-  uint8_t *rgb = (uint8_t *)ps_malloc(rgbLen);
-  if (!rgb) {
-    Serial.println("Crop: rgb malloc failed");
-    return NULL;
-  }
-  bool ok = fmt2rgb888(jpgBuf, jpgLen, PIXFORMAT_JPEG, rgb);
-  if (!ok) {
-    free(rgb);
-    Serial.println("Crop: JPEG decode failed");
-    return NULL;
-  }
+  uint8_t *result = jpeg_lossless_crop(jpgBuf, jpgLen,
+    CROP_X, CROP_Y, CROP_SZ, CROP_SZ, outLen);
+
   unsigned long t1 = millis();
 
-  // Allocate destination: 384x384x3 = 442368 bytes in PSRAM
-  uint8_t *dst = (uint8_t *)ps_malloc(CROP_SZ * CROP_SZ * 3);
-  if (!dst) {
-    free(rgb);
-    Serial.println("Crop: dst malloc failed");
+  if (!result) {
+    Serial.println("Crop: lossless crop failed");
     return NULL;
   }
 
-  // Pure crop — copy rows, no scaling
-  for (int dy = 0; dy < CROP_SZ; dy++) {
-    int sy = CROP_Y + dy;
-    const uint8_t *srcRow = rgb + (sy * CAM_W + CROP_X) * 3;
-    uint8_t *dstRow = dst + dy * CROP_SZ * 3;
-    memcpy(dstRow, srcRow, CROP_SZ * 3);
-  }
-  free(rgb);
-  unsigned long t2 = millis();
-
-  // Re-encode to JPEG
-  uint8_t *outJpg = NULL;
-  size_t outJpgLen = 0;
-  ok = fmt2jpg(dst, CROP_SZ * CROP_SZ * 3, CROP_SZ, CROP_SZ, PIXFORMAT_RGB888, 80, &outJpg, &outJpgLen);
-  free(dst);
-  unsigned long t3 = millis();
-
-  if (!ok || !outJpg) {
-    Serial.println("Crop: JPEG encode failed");
-    return NULL;
-  }
-
-  *outLen = outJpgLen;
-  Serial.printf("Crop: 640x480→384x384 JPEG %uB→%uB (decode=%lums crop=%lums encode=%lums total=%lums)\n",
-    jpgLen, outJpgLen, t1 - t0, t2 - t1, t3 - t2, t3 - t0);
-  return outJpg;
+  Serial.printf("Crop: 640x480→384x384 JPEG %uB→%uB (lossless %lums)\n",
+    jpgLen, *outLen, t1 - t0);
+  return result;
 }
 
-// Send a single JPEG frame to the prey API. Returns: -1=error, 0=no prey, 1=prey
-static int callPreyApi(const uint8_t *jpgBuf, size_t jpgLen) {
-  // Crop to 384x384 before sending
-  size_t croppedLen = 0;
-  uint8_t *croppedJpg = cropJpegForApi(jpgBuf, jpgLen, &croppedLen);
-  const uint8_t *sendBuf = croppedJpg ? croppedJpg : jpgBuf;
-  size_t sendLen = croppedJpg ? croppedLen : jpgLen;
-  Serial.printf("API: sending %uB %s\n", sendLen, croppedJpg ? "(cropped)" : "(original, crop failed)");
+// Timing breakdown for a single API call
+struct ApiTiming {
+  unsigned long b64Ms;
+  unsigned long tlsMs;
+  unsigned long postMs;
+};
 
-  // Base64 encode the JPEG
+// Send a JPEG frame to the prey API. If croppedJpg/croppedLen provided, skip cropping.
+// Returns: -1=error, 0=no prey, 1=prey
+static int callPreyApi(const uint8_t *jpgBuf, size_t jpgLen,
+                       const uint8_t *preCropped = NULL, size_t preCroppedLen = 0,
+                       ApiTiming *timing = NULL) {
+  const uint8_t *sendBuf;
+  size_t sendLen;
+  uint8_t *croppedJpg = NULL;
+
+  if (preCropped && preCroppedLen > 0) {
+    sendBuf = preCropped;
+    sendLen = preCroppedLen;
+    Serial.printf("API: sending %uB (pre-cropped)\n", sendLen);
+  } else {
+    size_t cl = 0;
+    croppedJpg = cropJpegForApi(jpgBuf, jpgLen, &cl);
+    sendBuf = croppedJpg ? croppedJpg : jpgBuf;
+    sendLen = croppedJpg ? cl : jpgLen;
+    Serial.printf("API: sending %uB %s\n", sendLen, croppedJpg ? "(cropped)" : "(original)");
+  }
+
+  // Base64 encode
+  unsigned long tb0 = millis();
   size_t b64Len = 0;
   mbedtls_base64_encode(NULL, 0, &b64Len, sendBuf, sendLen);
   char *b64Buf = (char *)ps_malloc(b64Len + 1);
@@ -384,17 +422,22 @@ static int callPreyApi(const uint8_t *jpgBuf, size_t jpgLen) {
   b64Buf[b64Len] = 0;
   if (croppedJpg) free(croppedJpg);
 
-  // Build JSON body: {"image_base64": "..."}
+  // Build JSON body
   size_t jsonLen = b64Len + 32;
   char *jsonBody = (char *)ps_malloc(jsonLen);
   if (!jsonBody) { free(b64Buf); Serial.println("API: json malloc failed"); return -1; }
   snprintf(jsonBody, jsonLen, "{\"image_base64\":\"%s\"}", b64Buf);
   free(b64Buf);
+  unsigned long tb1 = millis();
 
-  // HTTPS POST using Arduino WiFiClientSecure
-  WiFiClientSecure tlsClient;
-  tlsClient.setInsecure(); // skip cert verification (Cloudflare workers)
-  HTTPClient http;
+  // Ensure persistent TLS connection
+  unsigned long tt0 = millis();
+  if (!ensureTlsConnection()) {
+    free(jsonBody);
+    lastApiEspErr = -1;
+    return -1;
+  }
+  unsigned long tt1 = millis();
 
   apiResponseLen = 0;
   apiResponseBuf[0] = 0;
@@ -402,55 +445,45 @@ static int callPreyApi(const uint8_t *jpgBuf, size_t jpgLen) {
   lastApiHttpStatus = 0;
 
   unsigned long startMs = millis();
-  Serial.println("API: connecting...");
-
-  if (!http.begin(tlsClient, PREY_API_URL)) {
-    free(jsonBody);
-    lastApiEspErr = -1;
-    Serial.println("API: http.begin() failed");
-    return -1;
-  }
-
-  char authHeader[128];
-  snprintf(authHeader, sizeof(authHeader), "Bearer %s", PREY_API_KEY);
-  http.addHeader("Content-Type", "application/json");
-  http.addHeader("Authorization", authHeader);
-  http.setTimeout(15000);
-
-  int httpCode = http.POST((uint8_t *)jsonBody, strlen(jsonBody));
+  int httpCode = httpApi->POST((uint8_t *)jsonBody, strlen(jsonBody));
   free(jsonBody);
 
   unsigned long elapsed = millis() - startMs;
   lastApiHttpStatus = httpCode;
 
+  if (timing) {
+    timing->b64Ms = tb1 - tb0;
+    timing->tlsMs = tt1 - tt0;
+    timing->postMs = elapsed;
+  }
+  Serial.printf("API: timing b64=%lums tls=%lums post=%lums\n", tb1 - tb0, tt1 - tt0, elapsed);
+
   if (httpCode <= 0) {
     Serial.printf("API: POST failed, error=%d (%lums): %s\n",
-      httpCode, elapsed, http.errorToString(httpCode).c_str());
+      httpCode, elapsed, httpApi->errorToString(httpCode).c_str());
     lastApiEspErr = httpCode;
-    http.end();
+    // Connection broken — force reconnect next time
+    tlsConnected = false;
     return -1;
   }
 
-  String response = http.getString();
-  http.end();
+  String response = httpApi->getString();
 
-  // Copy response to global buffer for diagnostics
   strncpy(apiResponseBuf, response.c_str(), sizeof(apiResponseBuf) - 1);
   apiResponseBuf[sizeof(apiResponseBuf) - 1] = 0;
   apiResponseLen = response.length();
 
-  Serial.printf("API: HTTP %d, %dB response in %lums: %s\n",
+  Serial.printf("API: HTTP %d, %dB in %lums: %s\n",
     httpCode, apiResponseLen, elapsed, apiResponseBuf);
 
   if (httpCode != 200) return -1;
 
-  // Parse "detected":true/false from response
   if (strstr(apiResponseBuf, "\"detected\":true") || strstr(apiResponseBuf, "\"detected\": true"))
     return 1;
   return 0;
 }
 
-// Pick best N frames (largest JPEG = most detail) and call API for each
+// Pick best N frames, crop+send each sequentially (keeps TLS warm between calls)
 void autonomousApiCheck(int archIdx) {
   if (archIdx < 0 || archIdx >= burstArchiveCount) return;
   BurstArchive &archive = burstArchives[archIdx];
@@ -459,7 +492,6 @@ void autonomousApiCheck(int archIdx) {
   // Sort frame indices by JPEG size descending (pick largest = most detail)
   int indices[RING_SIZE];
   for (int i = 0; i < archive.count; i++) indices[i] = i;
-  // Simple selection sort for top N
   for (int i = 0; i < min(API_FRAMES_PER_BURST, archive.count); i++) {
     for (int j = i + 1; j < archive.count; j++) {
       if (archive.images[indices[j]].len > archive.images[indices[i]].len) {
@@ -470,31 +502,62 @@ void autonomousApiCheck(int archIdx) {
 
   int framesToSend = min(API_FRAMES_PER_BURST, archive.count);
   archive.apiCallMs = millis();
-  archive.apiPreyDetected = 0; // default: no prey
+  archive.apiPreyDetected = 0;
 
-  Serial.printf("API: autonomous check, sending %d/%d frames from archive %d (gen %d)\n",
+  Serial.printf("API: autonomous check, %d/%d frames, archive %d (gen %d)\n",
     framesToSend, archive.count, archIdx, archive.generation);
 
+  // Ensure TLS is connected before first call
+  ensureTlsConnection();
+
+  // Crop and send each frame sequentially (keeps TLS connection warm)
   for (int i = 0; i < framesToSend; i++) {
     int fIdx = indices[i];
     if (!archive.images[fIdx].buf) continue;
 
-    Serial.printf("API: frame %d (%u bytes)...\n", fIdx, archive.images[fIdx].len);
-    int result = callPreyApi(archive.images[fIdx].buf, archive.images[fIdx].len);
+    unsigned long frameT0 = millis();
+
+    // Crop this frame
+    unsigned long ct0 = millis();
+    size_t croppedLen = 0;
+    uint8_t *cropped = cropJpegForApi(archive.images[fIdx].buf, archive.images[fIdx].len, &croppedLen);
+    unsigned long cropDt = millis() - ct0;
+
+    // Send immediately (connection still warm)
+    ApiTiming timing = {0, 0, 0};
+    int result = callPreyApi(archive.images[fIdx].buf, archive.images[fIdx].len,
+                             cropped, croppedLen, &timing);
+    unsigned long frameDt = millis() - frameT0;
+
+    if (cropped) free(cropped);
+
     archive.apiResults[fIdx] = result;
+    archive.cropMs[i] = cropDt;
+    archive.b64Ms[i] = timing.b64Ms;
+    archive.tlsMs[i] = timing.tlsMs;
+    archive.postMs[i] = timing.postMs;
+    archive.totalMs[i] = frameDt;
     archive.apiFramesSent++;
+
+    Serial.printf("API: frame[%d] crop=%lums b64=%lums tls=%lums post=%lums total=%lums result=%d\n",
+      fIdx, cropDt, timing.b64Ms, timing.tlsMs, timing.postMs, frameDt, result);
 
     if (result == 1) {
       archive.apiPreyDetected = 1;
       Serial.println("API: *** PREY DETECTED ***");
     }
-
-    // Small delay between calls to not overload
-    if (i < framesToSend - 1) vTaskDelay(500 / portTICK_PERIOD_MS);
   }
 
   Serial.printf("API: done. %d frames sent, prey=%d\n",
     archive.apiFramesSent, archive.apiPreyDetected);
+  archive.apiDoneMs = millis();
+}
+
+// FreeRTOS task wrapper for autonomousApiCheck
+static void apiCheckTask(void *param) {
+  int archIdx = (int)(intptr_t)param;
+  autonomousApiCheck(archIdx);
+  vTaskDelete(NULL);
 }
 
 // ===== HTML page =====
@@ -908,7 +971,7 @@ static esp_err_t burstmeta_handler(httpd_req_t *req) {
   }
   strlcat(frameBuf, "]", sizeof(frameBuf));
 
-  char json[768];
+  char json[1280];
   // API results per frame
   char apiBuf[80] = "[";
   for (int i = 0; i < archive.count; i++) {
@@ -918,12 +981,30 @@ static esp_err_t burstmeta_handler(httpd_req_t *req) {
   }
   strlcat(apiBuf, "]", sizeof(apiBuf));
 
+  // Per-frame timing arrays (up to apiFramesSent entries)
+  char cropBuf[80] = "[", b64Buf[80] = "[", tlsBuf2[80] = "[", postBuf[80] = "[", totBuf[80] = "[";
+  for (int i = 0; i < archive.apiFramesSent; i++) {
+    char tmp[16];
+    snprintf(tmp, sizeof(tmp), "%s%lu", i > 0 ? "," : "", archive.cropMs[i]); strlcat(cropBuf, tmp, sizeof(cropBuf));
+    snprintf(tmp, sizeof(tmp), "%s%lu", i > 0 ? "," : "", archive.b64Ms[i]);  strlcat(b64Buf, tmp, sizeof(b64Buf));
+    snprintf(tmp, sizeof(tmp), "%s%lu", i > 0 ? "," : "", archive.tlsMs[i]);  strlcat(tlsBuf2, tmp, sizeof(tlsBuf2));
+    snprintf(tmp, sizeof(tmp), "%s%lu", i > 0 ? "," : "", archive.postMs[i]); strlcat(postBuf, tmp, sizeof(postBuf));
+    snprintf(tmp, sizeof(tmp), "%s%lu", i > 0 ? "," : "", archive.totalMs[i]);strlcat(totBuf, tmp, sizeof(totBuf));
+  }
+  strlcat(cropBuf, "]", sizeof(cropBuf));
+  strlcat(b64Buf, "]", sizeof(b64Buf));
+  strlcat(tlsBuf2, "]", sizeof(tlsBuf2));
+  strlcat(postBuf, "]", sizeof(postBuf));
+  strlcat(totBuf, "]", sizeof(totBuf));
+
   snprintf(json, sizeof(json),
     "{\"archive\":%d,\"generation\":%d,\"count\":%d,\"triggerMs\":%lu,\"archiveMs\":%lu,\"firstFrameMs\":%lu,\"lastFrameMs\":%lu,\"frameCaptureMs\":%s,"
-    "\"apiPreyDetected\":%d,\"apiFramesSent\":%d,\"apiCallMs\":%lu,\"apiResults\":%s,\"uptimeMs\":%lu}",
+    "\"apiPreyDetected\":%d,\"apiFramesSent\":%d,\"apiCallMs\":%lu,\"apiResults\":%s,"
+    "\"cropMs\":%s,\"b64Ms\":%s,\"tlsMs\":%s,\"postMs\":%s,\"totalMs\":%s,\"apiDoneMs\":%lu,\"uptimeMs\":%lu}",
     archIdx, archive.generation, archive.count, archive.triggerMs, archive.timestamp,
     archive.firstFrameMs, archive.lastFrameMs, frameBuf,
-    archive.apiPreyDetected, archive.apiFramesSent, archive.apiCallMs, apiBuf, millis());
+    archive.apiPreyDetected, archive.apiFramesSent, archive.apiCallMs, apiBuf,
+    cropBuf, b64Buf, tlsBuf2, postBuf, totBuf, archive.apiDoneMs, millis());
   httpd_resp_set_type(req, "application/json");
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
   return httpd_resp_send(req, json, strlen(json));
@@ -947,9 +1028,18 @@ static esp_err_t apitest_handler(httpd_req_t *req) {
   unsigned long apiMs = millis() - t1;
   esp_camera_fb_return(fb);
 
+  // Escape quotes in apiResponseBuf for valid JSON embedding
+  char escapedResp[384];
+  int ei = 0;
+  for (int i = 0; apiResponseBuf[i] && ei < (int)sizeof(escapedResp) - 2; i++) {
+    if (apiResponseBuf[i] == '"') { escapedResp[ei++] = '\\'; }
+    escapedResp[ei++] = apiResponseBuf[i];
+  }
+  escapedResp[ei] = 0;
+
   snprintf(json, sizeof(json),
     "{\"result\":%d,\"origLen\":%u,\"apiMs\":%lu,\"freePsram\":%u,\"espErr\":\"0x%x\",\"httpStatus\":%d,\"apiResponse\":\"%s\"}",
-    result, origLen, apiMs, ESP.getFreePsram(), lastApiEspErr, lastApiHttpStatus, apiResponseBuf);
+    result, origLen, apiMs, ESP.getFreePsram(), lastApiEspErr, lastApiHttpStatus, escapedResp);
   httpd_resp_set_type(req, "application/json");
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
   return httpd_resp_send(req, json, strlen(json));
@@ -1337,6 +1427,17 @@ void loop() {
     tofWriteReg(0x0015, 0x07); // clear interrupts
   }
 
+  // === TLS pre-connect: keep connection warm when laptop absent ===
+  static unsigned long lastTlsCheck = 0;
+  if (!burstCapturing && now - lastTlsCheck >= 10000) {
+    lastTlsCheck = now;
+    bool laptopHere = (lastLaptopContactMs > 0) &&
+                      (now - lastLaptopContactMs < LAPTOP_TIMEOUT_MS);
+    if (!laptopHere && !tlsConnected) {
+      ensureTlsConnection();
+    }
+  }
+
   // Continuously fill ring buffer with JPEG frames (HDR gain+exposure bracketing)
   static unsigned long lastRing = 0;
   static int hdrIdx = 0;  // cycles through HDR_STEPS[]
@@ -1386,7 +1487,10 @@ void loop() {
             bool laptopPresent = (lastLaptopContactMs > 0) &&
                                  (millis() - lastLaptopContactMs < LAPTOP_TIMEOUT_MS);
             if (!laptopPresent && burstArchiveCount > 0) {
-              autonomousApiCheck(burstArchiveCount - 1);
+              // Run API check on core 0 (WiFi core) with same priority as httpd
+              xTaskCreatePinnedToCore(apiCheckTask, "apiCheck",
+                16384, (void *)(intptr_t)(burstArchiveCount - 1),
+                tskIDLE_PRIORITY + 5, NULL, 0);
             }
           }
         }

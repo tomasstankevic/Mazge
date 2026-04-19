@@ -43,3 +43,4 @@ models/*.onnx
 models/*.pt
 captures/
 API_key_prey_detector.txt
+test_jpeg_crop
