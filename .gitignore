@@ -9,6 +9,7 @@ venv/
 *.egg
 
 API_key_prey_detector.txt
+src/secrets.h
 
 # Jupyter
 .ipynb_checkpoints/

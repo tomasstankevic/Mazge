@@ -1,0 +1,15 @@
+[project]
+name = "mazge"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.14"
+dependencies = [
+    "aiohttp>=3.13.5",
+    "certifi>=2026.2.25",
+    "ncnn>=1.0.20260114",
+    "numpy>=2.4.4",
+    "opencv-python-headless>=4.13.0.92",
+    "pillow>=12.2.0",
+    "scikit-image>=0.26.0",
+    "ultralytics>=8.4.39",
+]
