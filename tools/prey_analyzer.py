@@ -73,6 +73,23 @@ if not PREY_API_KEY:
 # COCO class 15 = cat
 CAT_CLASS_ID = 15
 BIRD_CLASS_ID = 14
+
+# ESP32 callback — notify result so it doesn't fall back to autonomous mode
+ESP32_IP = os.environ.get("ESP32_IP", "192.168.0.41")
+
+async def notify_esp32_result(signal: str, archive_index: int | None) -> None:
+    """POST prey result back to ESP32 so it can skip autonomous API check."""
+    if archive_index is None:
+        log.warning("No archive_index — cannot notify ESP32")
+        return
+    prey_val = 1 if signal == "red" else 0
+    url = f"http://{ESP32_IP}/cmd?result={prey_val}&a={archive_index}"
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=2)) as s:
+            async with s.get(url) as r:
+                log.info("ESP32 notified: %s → %d (HTTP %d)", signal, prey_val, r.status)
+    except Exception as exc:
+        log.warning("Failed to notify ESP32: %s", exc)
 # Classes we care about detecting
 CLASSES_OF_INTEREST = {CAT_CLASS_ID: "cat", BIRD_CLASS_ID: "bird"}
 CAT_CONF_THRESHOLD = 0.15  # very low — our ESP32 IR images are grainy/overexposed
@@ -827,6 +844,10 @@ async def _run_decision_phase(
         log.info("GREEN light for %s", burst_dir.name)
     elif batch_signal == "red":
         log.warning("RED light for %s", burst_dir.name)
+
+    # Notify ESP32 immediately (before slow annotation saving)
+    if burst_meta and batch_signal in ("green", "red"):
+        await notify_esp32_result(batch_signal, burst_meta.get("archive_index"))
 
     total_ms = result["detector_ms"] + result["motion_ms"] + result.get("api_latency_ms", 0)
     result["total_ms"] = round(total_ms, 1)

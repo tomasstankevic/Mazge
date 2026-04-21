@@ -91,6 +91,7 @@ def build_timing_manifest(base_url: str, stats: dict, stats_req: dict, meta: dic
         "archive_index": meta.get("archive"),
         "frame_count": meta.get("count"),
         "distance_mm": stats.get("distance"),
+        "frame_distance_mm": meta.get("distanceMm", []),
         "stats_request": stats_req,
         "burstmeta_request": meta_req,
         "esp32_clock": {
@@ -127,16 +128,11 @@ def main():
 
     last_gen = 0
     last_archive_count = 0
+    estimated_boot_epoch = None  # estimated ESP32 boot time (wall-clock seconds)
     use_long_poll = True  # try /burst_wait first, fall back to /stats
     print(f"Watching {base_url} for new bursts... (saving to {args.dir}/)")
 
-    # Get initial state
-    try:
-        stats, _ = fetch_json(f"{base_url}/stats", timeout=3)
-        last_gen = stats.get("burstGen", 0)
-        last_archive_count = stats.get("burstArchives", 0)
-    except Exception:
-        pass
+    # Don't skip existing archives — leave last_gen=0 so first poll downloads them
 
     while True:
         try:
@@ -161,16 +157,33 @@ def main():
             archives = stats.get("burstArchives", 0)
             counts = stats.get("burstCounts", [])
             dist = stats.get("distance", -1)
+            uptime = stats.get("uptimeMs", 0)
+
+            # Detect reboot by checking if estimated boot time shifted.
+            # Boot epoch = wall_clock - uptime. Stays ~constant during normal
+            # operation, but jumps when the board reboots.
+            rebooted = False
+            if uptime > 0:
+                new_boot_epoch = time.time() - uptime / 1000
+                if estimated_boot_epoch is not None and abs(new_boot_epoch - estimated_boot_epoch) > 30:
+                    rebooted = True
+                    print(f"\n  Reboot detected (boot time shifted by {abs(new_boot_epoch - estimated_boot_epoch):.0f}s)")
+                estimated_boot_epoch = new_boot_epoch
 
             # Detect new bursts: gen changed, or archive count grew
             new_bursts = 0
             if gen != last_gen and gen > 0 and archives > 0:
-                if gen < last_gen:
-                    # Board rebooted (gen reset), download all archives
+                if rebooted or gen < last_gen:
+                    # Board rebooted — download all archives
+                    print(f"  Downloading all {archives} archives")
                     new_bursts = archives
                 else:
                     new_bursts = gen - last_gen
                     new_bursts = min(new_bursts, archives)  # can't exceed what's stored
+            elif rebooted and archives > 0:
+                # gen == last_gen but board rebooted — these are new archives
+                print(f"  Downloading all {archives} archives (gen unchanged but rebooted)")
+                new_bursts = archives
 
             if new_bursts > 0:
                 # Download the newest `new_bursts` archives (oldest first)

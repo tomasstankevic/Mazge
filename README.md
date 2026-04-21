@@ -8,9 +8,10 @@ Live MJPEG camera stream from a **Freenove ESP32-S3 WROOM CAM** board with a bro
 - **Web control panel** on port 80 — adjust quality, FPS cap, brightness, contrast, saturation, gain ceiling, night mode, greyscale
 - **Software 2×2 pixel binning** — captures YUV422 at SVGA (800×600), extracts luminance (Y channel), averages 2×2 blocks → 400×300 greyscale JPEG. Improves low-light sensitivity by ~4× compared to single-pixel readout
 - **Direct JPEG mode** — hardware JPEG at SVGA (800×600), default mode
-- **PIR motion sensor** on GPIO 14 — real-time motion indicator on the web page
-- **VL6180X ToF distance sensor** on I2C (SDA=GPIO 47, SCL=GPIO 21) — live distance readout in mm on the web page
-- **Burst capture** — automatically takes 5 VGA JPEG photos when ToF distance < 220mm, stored in PSRAM, viewable in a gallery on the web page (5s cooldown between triggers)
+- **VL6180X ToF distance sensor** on I2C (SDA=GPIO 47, SCL=GPIO 21) — live distance readout in mm, triggers burst capture
+- **Burst capture** — ring buffer of 10 HDR-bracketed frames. Triggered by ToF distance < 500mm (configurable). 8 pre-trigger + 2 post-trigger frames stored in PSRAM, downloadable via HTTP. 15s cooldown between triggers
+- **Camera AEC probe** — reads OV2640 auto-exposure registers every 2s when idle, used as base for HDR bracket scaling
+- **Persistent event log** — up to 50 events stored in NVS flash, survive reboots. Tracks burst generation, frame count, API result, distance range
 - **ArduinoOTA** — wireless firmware updates (throttled to reduce WiFi contention)
 - **Performance tuned** — WiFi power save disabled, TCP_NODELAY, 16 KB send buffer, FPS capping, esp_http_server RTOS tasks
 
@@ -24,29 +25,16 @@ Live MJPEG camera stream from a **Freenove ESP32-S3 WROOM CAM** board with a bro
 | Flash | 8 MB (QIO) |
 | Camera | OV2640 |
 | USB | Two USB-C ports — OTG (left), TTL/UART (right) |
-| PIR sensor | Any 3.3V digital PIR module (e.g. HC-SR501 with 3.3V mod, AM312) → GPIO 14 |
-| ToF sensor | VL6180X (I2C addr 0x29) → SDA=GPIO 47, SCL=GPIO 21 |
+| ToF sensor | VL6180X (I2C addr 0x29) → SDA=GPIO 47, SCL=GPIO 21 — burst trigger + distance tracking |
 
 ### Wiring
 
 | Sensor | Pin | ESP32 GPIO | Notes |
 |--------|-----|------------|-------|
-| PIR | OUT | 14 | Digital HIGH = motion. Long wires pick up WiFi EMI — keep short or add 100nF cap on signal + 10µF on VCC at sensor end |
-| PIR | VCC | 3.3V | |
-| PIR | GND | GND | |
-| VL6180X | SDA | 47 | I2C, internal pull-ups used |
-| VL6180X | SCL | 21 | I2C, internal pull-ups used |
+| VL6180X | SDA | 47 | I2C bit-bang, internal pull-ups |
+| VL6180X | SCL | 21 | I2C bit-bang, internal pull-ups |
 | VL6180X | VIN | 3.3V | |
 | VL6180X | GND | GND | |
-
-### PIR noise troubleshooting
-
-The ESP32 WiFi radio can cause false PIR triggers, especially with long wires:
-- Add a **10µF electrolytic + 100nF ceramic** cap between PIR VCC and GND at the sensor end
-- Add a **100nF ceramic** cap between PIR signal and GND at the ESP32 end
-- Keep wires short and away from the antenna area
-- Turn down the sensitivity potentiometer on the PIR module
-- Software debounce can be added as a further mitigation
 
 ## Build & Flash
 
@@ -81,7 +69,7 @@ pio run -e ota -t upload
    - **On** — SVGA 800×600 → 2×2 binned 400×300 greyscale (better in low light)
 5. Use **Stop Stream / Start Stream** to toggle the video feed
 6. When stream is off, distance and motion update at 5Hz (200ms) instead of 1Hz
-7. **Burst capture** triggers automatically when an object is < 220mm from the ToF sensor — 5 VGA images appear in the gallery below the controls (click to view full-size)
+7. **Burst capture** triggers automatically when ToF distance < 500mm — 10 HDR-bracketed frames (8 pre-trigger + 2 post-trigger) appear in the gallery
 
 ## Web UI Endpoints
 
@@ -89,9 +77,13 @@ pio run -e ota -t upload
 |------|-------------|
 | `/` | Main page with stream, controls, sensor readouts, burst gallery |
 | `/stream` (port 81) | Raw MJPEG stream |
-| `/stats` | JSON telemetry: FPS, frame size, motion, distance, burst count |
+| `/stats` | JSON telemetry: FPS, frame size, distance, AEC, burst count |
 | `/cmd?key=val` | Camera/stream settings (quality, fps, brightness, contrast, etc.) |
-| `/burst?i=N` | Serve burst image N (0–4) as JPEG |
+| `/burst?a=N&i=M` | Serve frame M from burst archive N as JPEG |
+| `/burstmeta?a=N` | JSON per-archive metadata (timing, distances, API results) |
+| `/burststream?a=N` | MJPEG stream of all frames in archive N |
+| `/burst_wait?gen=N` | Long-poll — blocks until burst generation > N |
+| `/getevents` | JSON array of persistent event log entries |
 
 ## Project Structure
 
