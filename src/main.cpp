@@ -1123,9 +1123,9 @@ bool initCamera() {
 
   sensor_t *s = esp_camera_sensor_get();
   if (s) {
-    s->set_exposure_ctrl(s, 0);  // DISABLE auto exposure — we bracket manually
+    s->set_exposure_ctrl(s, 0);  // DISABLE auto exposure — we control manually
     s->set_aec2(s, 0);           // disable DSP auto exposure
-    s->set_gain_ctrl(s, 0);      // DISABLE auto gain — we bracket manually
+    s->set_gain_ctrl(s, 0);      // DISABLE auto gain — we control manually
     s->set_aec_value(s, aecLow); // start with short exposure
     s->set_agc_gain(s, 0);       // start at low gain
     s->set_gainceiling(s, (gainceiling_t)6); // 128x max gain ceiling
@@ -2061,35 +2061,28 @@ void loop() {
     tofCloseCount = 0;
   }
 
-  // === Auto-exposure probe: use camera's AEC to determine base exposure ===
-  // The VL6180X ALS doesn't work (always 0) due to continuous ranging mode.
-  // Instead, periodically enable camera AEC, let it settle, read back the
-  // auto-determined exposure value, then return to manual HDR bracketing.
+  // === Auto-exposure probe: periodically sample camera's AEC to detect day/night ===
   static unsigned long aecProbeStart = 0;
-  static uint8_t aecProbeState = 0; // 0=manual bracket mode, 1=AEC settling
+  static uint8_t aecProbeState = 0; // 0=manual mode, 1=AEC settling
   if (!burstCapturing && postTriggerRemaining == 0) {
     if (aecProbeState == 0 && now - aecProbeStart >= 2000) {
-      // Enable AEC to let camera auto-determine exposure
       sensor_t *s = esp_camera_sensor_get();
       if (s) {
-        s->set_exposure_ctrl(s, 1); // enable auto exposure
-        s->set_gain_ctrl(s, 1);     // enable auto gain
+        s->set_exposure_ctrl(s, 1);
+        s->set_gain_ctrl(s, 1);
       }
       aecProbeState = 1;
       aecProbeStart = now;
     }
     else if (aecProbeState == 1 && now - aecProbeStart >= 500) {
-      // AEC has settled (~5 frames at 10fps), read back exposure value
       sensor_t *s = esp_camera_sensor_get();
       if (s) {
-        // Read AEC from OV2640 sensor registers (bank 1 = sensor)
-        s->set_reg(s, 0xFF, 0xFF, 0x01); // select sensor register bank
-        int aec_hi  = s->get_reg(s, 0x45, 0x3F); // AEC[15:10]
-        int aec_mid = s->get_reg(s, 0x10, 0xFF); // AEC[9:2]
-        int aec_lo  = s->get_reg(s, 0x04, 0x03); // AEC[1:0]
+        s->set_reg(s, 0xFF, 0xFF, 0x01);
+        int aec_hi  = s->get_reg(s, 0x45, 0x3F);
+        int aec_mid = s->get_reg(s, 0x10, 0xFF);
+        int aec_lo  = s->get_reg(s, 0x04, 0x03);
         int readAec = (aec_hi << 10) | (aec_mid << 2) | aec_lo;
         if (readAec >= 4) autoBaseAec = readAec;
-        // Disable AEC, return to manual bracketing
         s->set_exposure_ctrl(s, 0);
         s->set_gain_ctrl(s, 0);
       }
@@ -2097,7 +2090,6 @@ void loop() {
       aecProbeStart = now;
     }
   } else if (aecProbeState == 1) {
-    // Burst triggered during probe — abort probe, return to manual immediately
     sensor_t *s = esp_camera_sensor_get();
     if (s) {
       s->set_exposure_ctrl(s, 0);
@@ -2118,57 +2110,47 @@ void loop() {
     }
   }
 
-  // Continuously fill ring buffer with JPEG frames (HDR gain+exposure bracketing)
+  // Continuously fill ring buffer with JPEG frames
   static unsigned long lastRing = 0;
-  static int hdrIdx = 0;  // cycles through hdrSteps[]
   if (!burstCapturing && now - lastRing >= 100) { // ~10 fps ring buffer
     lastRing = now;
 
-    // Set gain + exposure for this frame (skip during AEC probe — camera is auto-adjusting)
+    // Set exposure based on distance (night mode) or HDR bracket (day mode)
     sensor_t *s = esp_camera_sensor_get();
     int appliedGain = -1, appliedAec = -1;
     if (s && aecProbeState == 0) {
-      int step = hdrIdx % HDR_STEP_COUNT;
-      int gain = hdrSteps[step].gain;
-      int rawAec = hdrSteps[step].aec;
-      // Scale exposure relative to camera's auto-determined base.
-      // hdrSteps aec values are relative brackets: AEC_LOW_DEFAULT (100) maps to autoBaseAec.
-      // So step with aec=100 → autoBaseAec, step with aec=300 → autoBaseAec*3.
-      int aec = (int)((long)autoBaseAec * rawAec / AEC_LOW_DEFAULT);
-
-      // Night/IR mode: when background is dark, autoBaseAec is high.
-      // IR LEDs illuminate close objects (cat) but not background, so the
-      // auto-brightness (which only sees background) massively overexposes
-      // the cat.
-      // Pre-trigger frames (ring buffer): cap exposure uniformly — we can't
-      // predict which HDR step will end up in the burst.
-      // Post-trigger frames: ramp exposure DOWN since the cat is approaching
-      // and IR reflection gets stronger. POST_TRIGGER_FRAMES=5, so:
-      //   post-trigger ramps from ~83% down to ~17% of nightExposureCap
       if (autoBaseAec > nightAecThreshold) {
-        int nightAec = nightExposureCap;
-        if (postTriggerRemaining > 0) {
-          // Non-linear ramp: keep exposure high while cat is far, drop
-          // aggressively as cat gets close and IR reflection intensifies.
-          // remaining: 5→4→3→2→1  (counts down)
-          // ratio:   100%→90%→70%→45%→20% of nightExposureCap
-          // With cap=300: 300→270→210→135→60
-          int r = postTriggerRemaining;
-          nightAec = nightExposureCap * r * r / (POST_TRIGGER_FRAMES * POST_TRIGGER_FRAMES);
-          if (nightAec < 4) nightAec = 4;
+        // Night/IR mode: distance-based exposure.
+        // IR reflection follows inverse-square law: closer = brighter.
+        // Scale exposure proportional to distance² relative to trigger distance.
+        int gain = nightGainCap;
+        int aec = nightExposureCap;
+        if (tofDistance >= TOF_MIN_MM && tofDistance <= burstTriggerMm) {
+          // d²/triggerDist² — e.g. at 240/480 → 0.25, at 120/480 → 0.0625
+          long d = tofDistance;
+          long trig = burstTriggerMm;
+          aec = (int)(nightExposureCap * d * d / (trig * trig));
+          if (aec < 4) aec = 4;
         }
-        if (aec > nightAec) aec = nightAec;
-        if (gain > nightGainCap) gain = nightGainCap;
+        s->set_agc_gain(s, gain);
+        s->set_aec_value(s, aec);
+        appliedGain = gain;
+        appliedAec = aec;
+      } else {
+        // Day mode: use HDR bracket cycling
+        static int hdrIdx = 0;
+        int step = hdrIdx % HDR_STEP_COUNT;
+        int gain = hdrSteps[step].gain;
+        int aec = (int)((long)autoBaseAec * hdrSteps[step].aec / AEC_LOW_DEFAULT);
+        if (aec > 1200) aec = 1200;
+        if (aec < 4) aec = 4;
+        s->set_agc_gain(s, gain);
+        s->set_aec_value(s, aec);
+        appliedGain = gain;
+        appliedAec = aec;
+        hdrIdx++;
       }
-
-      if (aec > 1200) aec = 1200; // absolute cap to prevent motion blur
-      if (aec < 4) aec = 4;       // absolute minimum
-      s->set_agc_gain(s, gain);
-      s->set_aec_value(s, aec);
-      appliedGain = gain;
-      appliedAec = aec;
     }
-    hdrIdx++;
 
     camera_fb_t *fb = esp_camera_fb_get();
     if (fb) {
