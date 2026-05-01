@@ -13,6 +13,7 @@ import json
 import os
 import time
 import urllib.request
+import urllib.parse
 from datetime import datetime
 from pathlib import Path
 from PIL import Image, ImageOps
@@ -114,17 +115,62 @@ def build_timing_manifest(base_url: str, stats: dict, stats_req: dict, meta: dic
     }
 
 
+def pull_sd(base_url: str, output_dir: Path):
+    """Download all files from the ESP32 SD card."""
+    print(f"Pulling SD card contents from {base_url} to {output_dir}/")
+    info, _ = fetch_json(f"{base_url}/sdinfo")
+    if not info.get("ok"):
+        print("ERROR: SD card not available")
+        return
+    print(f"  SD: {info['type']} {info['totalMB']}MB total, {info['usedMB']}MB used, {info['freeMB']}MB free")
+
+    listing, _ = fetch_json(f"{base_url}/sdlist")
+    if not listing.get("ok") or not listing.get("files"):
+        print("  No files on SD card.")
+        return
+
+    files = listing["files"]
+    print(f"  Found {len(files)} files to download")
+
+    downloaded = 0
+    skipped = 0
+    for i, f in enumerate(files):
+        # f is like "burst_000061_gen1/f00.jpg"
+        local_path = output_dir / f
+        if local_path.exists():
+            skipped += 1
+            continue
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        url = f"{base_url}/sdget?f={urllib.parse.quote(f)}"
+        try:
+            with urllib.request.urlopen(url, timeout=30) as r:
+                data = r.read()
+            local_path.write_bytes(data)
+            downloaded += 1
+            print(f"  [{i+1}/{len(files)}] {f} ({len(data)} bytes)")
+        except Exception as e:
+            print(f"  [{i+1}/{len(files)}] FAILED {f}: {e}")
+
+    print(f"\nDone: {downloaded} downloaded, {skipped} skipped (already exist)")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Auto-save ESP32-CAM burst captures")
     parser.add_argument("--ip", default="192.168.0.41", help="ESP32 IP address")
     parser.add_argument("--dir", default="captures", help="Output directory")
     parser.add_argument("--poll", type=float, default=1.0, help="Fallback poll interval (seconds)")
+    parser.add_argument("--pull-sd", action="store_true", help="Download all files from SD card and exit")
     args = parser.parse_args()
 
     base_url = f"http://{args.ip}"
-    stream_url = f"http://{args.ip}:81"  # /burst_wait is on stream server
     output_dir = Path(args.dir)
     output_dir.mkdir(exist_ok=True)
+
+    if args.pull_sd:
+        pull_sd(base_url, output_dir / "sd")
+        return
+
+    stream_url = f"http://{args.ip}:81"  # /burst_wait is on stream server
 
     last_gen = 0
     last_archive_count = 0

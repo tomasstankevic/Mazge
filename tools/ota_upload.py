@@ -1,18 +1,33 @@
 #!/usr/bin/env python3
 """Custom OTA uploader for ESP32 with auto-retry."""
-import socket, sys, time, os, hashlib
+import socket, sys, time, hashlib
+import urllib.request
+import urllib.error
 
 ESP_IP = "192.168.0.41"
 ESP_PORT = 3232
 FW_PATH = ".pio/build/ota/firmware.bin"
-CHUNK = 1024
+CHUNK = 8192
 FLASH = 0
 MAX_RETRIES = 30
+VERIFY_RETRIES = 8
+VERIFY_DELAY_S = 2
 
 fw = open(FW_PATH, "rb").read()
 fw_len = len(fw)
 fw_md5 = hashlib.md5(fw).hexdigest()
 print(f"Firmware: {fw_len} bytes ({fw_len/1024:.1f} KB), MD5: {fw_md5}")
+
+
+def verify_board_online():
+    """Check if board came back after upload/reboot."""
+    for _ in range(VERIFY_RETRIES):
+        try:
+            resp = urllib.request.urlopen(f"http://{ESP_IP}/stats", timeout=5).read()
+            return True, resp.decode(errors="replace")
+        except (urllib.error.URLError, TimeoutError, OSError):
+            time.sleep(VERIFY_DELAY_S)
+    return False, ""
 
 def attempt_upload(attempt_num):
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -47,7 +62,10 @@ def attempt_upload(attempt_num):
         srv.close()
         return -1, "No TCP connect-back"
 
+    # Keep a deeper send queue so short Wi-Fi hiccups don't immediately stall us.
+    conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 128 * 1024)
     conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    conn.settimeout(30)
 
     offset = 0
     start = time.time()
@@ -55,8 +73,6 @@ def attempt_upload(attempt_num):
         while offset < fw_len:
             end = min(offset + CHUNK, fw_len)
             conn.sendall(fw[offset:end])
-            conn.settimeout(120)
-            ack = conn.recv(32)
             offset = end
             pct = offset * 100 // fw_len
             elapsed = time.time() - start
@@ -69,10 +85,10 @@ def attempt_upload(attempt_num):
         srv.close()
         return offset, str(e)
 
-    # All data sent - wait for final result
+    # All data sent - wait for final result (some boards reset quickly and close socket)
     elapsed = time.time() - start
     print(f"\n  All data sent in {elapsed:.1f}s")
-    conn.settimeout(120)
+    conn.settimeout(30)
     try:
         while True:
             data = conn.recv(32)
@@ -90,7 +106,7 @@ def attempt_upload(attempt_num):
     except (socket.timeout, Exception) as e:
         conn.close()
         srv.close()
-        return fw_len, f"Result: {e}"
+        return fw_len, f"Result wait failed: {e}"
 
     conn.close()
     srv.close()
@@ -108,18 +124,23 @@ for i in range(1, MAX_RETRIES + 1):
     if transferred > best:
         best = transferred
 
-    if transferred == fw_len and result == "OK":
-        print(f"\n\nSUCCESS! Firmware uploaded.")
-        print("Waiting 15s for reboot...")
-        time.sleep(15)
-        # Verify
-        import urllib.request
-        try:
-            resp = urllib.request.urlopen(f"http://{ESP_IP}/stats", timeout=5).read()
-            print(f"Board stats: {resp.decode()}")
-        except:
-            print("Board not responding yet (may still be booting)")
-        sys.exit(0)
+    if transferred == fw_len and result in {"OK", "connection closed"}:
+        print(f"\n\nUpload finished ({result}). Verifying board reboot...")
+        ok, stats = verify_board_online()
+        if ok:
+            print("SUCCESS! Board online after OTA.")
+            print(f"Board stats: {stats}")
+            sys.exit(0)
+        print("Board not responding yet; treating this attempt as uncertain.")
+    elif transferred == fw_len and result.startswith("Result wait failed"):
+        # Common case: ESP32 reboots immediately after flashing and closes the socket.
+        print("\n\nUpload payload sent; final ack missing. Verifying board reboot...")
+        ok, stats = verify_board_online()
+        if ok:
+            print("SUCCESS! Board online after OTA.")
+            print(f"Board stats: {stats}")
+            sys.exit(0)
+        print("Board not responding yet; treating this attempt as uncertain.")
 
     print(f"\n  Failed at {transferred/1024:.0f}KB: {result}")
 

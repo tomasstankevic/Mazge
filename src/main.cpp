@@ -11,6 +11,7 @@
 #include <HTTPClient.h>
 #include "mbedtls/base64.h"
 #include <Preferences.h>
+#include "SD_MMC.h"
 #include "secrets.h"
 
 // ===== Freenove ESP32-S3 WROOM CAM pin map =====
@@ -30,6 +31,12 @@
 #define VSYNC_GPIO_NUM  6
 #define HREF_GPIO_NUM   7
 #define PCLK_GPIO_NUM  13
+
+// ===== SD card (1-bit SD_MMC on Freenove ESP32-S3 WROOM CAM) =====
+#define SD_CLK  39
+#define SD_CMD  38
+#define SD_D0   40
+bool sdReady = false;
 
 // ===== TOF050C / VL6180X ToF sensor (raw I2C, 16-bit registers) =====
 #define TOF_SDA 47
@@ -137,7 +144,6 @@ volatile int jpegQuality = 95;
 #define BURST_ARCHIVES 40
 
 // ===== Prey Detection API (autonomous mode) =====
-#define API_FRAMES_PER_BURST 3   // send up to 3 best frames per burst
 #define LAPTOP_TIMEOUT_MS 30000  // consider laptop absent after 30s no contact
 volatile unsigned long lastLaptopContactMs = 0;  // last /burst_wait or /burststream request
 
@@ -198,18 +204,20 @@ struct BurstArchive {
   int apiFramesSent;            // how many frames sent to API
   unsigned long apiCallMs;      // when API was called
   int8_t apiPreyDetected;       // -1=not checked, 0=no prey, 1=prey found
-  // Per-frame timing breakdown (up to API_FRAMES_PER_BURST)
+  // Per-frame timing breakdown (up to RING_SIZE entries)
   unsigned long cropMs[RING_SIZE];
   unsigned long b64Ms[RING_SIZE];
   unsigned long tlsMs[RING_SIZE];
   unsigned long postMs[RING_SIZE];
   unsigned long totalMs[RING_SIZE];
   unsigned long apiDoneMs;        // when autonomousApiCheck finished
+  char sdPath[48];                 // SD card directory path for this burst
 };
 BurstArchive burstArchives[BURST_ARCHIVES];
 volatile int burstArchiveCount = 0;
 volatile int burstGen = 0;  // increments on each new burst
 volatile bool burstCapturing = false;
+volatile bool postTriggerCapturing = false;  // true after freeze done, capture loop can append
 volatile bool otaInProgress = false;
 unsigned long burstCooldown = 0;
 unsigned long pendingBurstTriggerMs = 0;
@@ -252,37 +260,28 @@ void loadEventLog() {
   Serial.printf("Loaded %d events from NVS\n", eventCount);
 }
 
-// Classify distance trend from per-frame distances:
-// 1=entering (decreasing: far→close), 2=exiting (close→far), 3=passing, 0=unknown
+// Classify distance trend via linear regression slope on valid readings.
+// 1=entering (slope < -15 mm/frame), 2=exiting (slope > +15), 3=flat/passing, 0=unknown
 int classifyDistTrend(BurstArchive &archive) {
-  // Find first and last valid distance readings
-  int first = -1, last = -1;
+  // Collect valid readings (>= 30mm) with their frame indices
+  int n = 0;
+  float sum_i = 0, sum_d = 0, sum_id = 0, sum_ii = 0;
   for (int i = 0; i < archive.count; i++) {
     int d = archive.images[i].distanceMm;
-    if (d >= 0) { if (first < 0) first = d; last = d; }
+    if (d >= 30) {
+      sum_i += i; sum_d += d;
+      sum_id += (float)i * d; sum_ii += (float)i * i;
+      n++;
+    }
   }
-  if (first < 0 || last < 0) return 0; // no valid readings
-
-  // Count frames that are close (<500mm) in first half vs second half
-  int half = archive.count / 2;
-  if (half < 1) half = 1;
-  int closeFirst = 0, closeLast = 0;
-  for (int i = 0; i < half; i++) {
-    int d = archive.images[i].distanceMm;
-    if (d >= 0 && d < 500) closeFirst++;
-  }
-  for (int i = archive.count - half; i < archive.count; i++) {
-    int d = archive.images[i].distanceMm;
-    if (d >= 0 && d < 500) closeLast++;
-  }
-
-  // Entering: first half mostly far, second half close (distance decreasing)
-  if (closeLast > closeFirst + 1) return 1; // entering
-  // Exiting: first half close, second half far (distance increasing)
-  if (closeFirst > closeLast + 1) return 2; // exiting
-  // Passing: close throughout
-  if (closeFirst > 0 && closeLast > 0) return 3; // passing through
-  return 0; // unknown
+  if (n < 3) return 0; // not enough data
+  float denom = n * sum_ii - sum_i * sum_i;
+  if (denom == 0) return 0;
+  float slope = (n * sum_id - sum_i * sum_d) / denom;
+  Serial.printf("ToF trend: n=%d slope=%.1f mm/frame\n", n, slope);
+  if (slope < -15) return 1; // entering (getting closer)
+  if (slope > 15)  return 2; // exiting (moving away)
+  return 3; // flat / passing (cat sitting at flap)
 }
 
 void addEvent(int gen, int frameCount, int result, int distMin, int distMax, int trend, bool autonomous) {
@@ -334,6 +333,7 @@ int ringCount = 0;
 
 void freezeRingToArchive() {
   burstCapturing = true;
+  vTaskDelay(pdMS_TO_TICKS(20));  // Let capture loop finish any in-progress frame write
   Serial.println("Burst: freezing ring buffer...");
 
   // Free image data from oldest archives if PSRAM is running low (keep metadata)
@@ -376,6 +376,7 @@ void freezeRingToArchive() {
   burstArchives[slot].apiPreyDetected = -1;
   burstArchives[slot].apiFramesSent = 0;
   burstArchives[slot].apiCallMs = 0;
+  burstArchives[slot].sdPath[0] = '\0';
   for (int i = 0; i < RING_SIZE; i++) burstArchives[slot].apiResults[i] = -1;
 
   // Save ring frames (oldest first), skip blown-out frames
@@ -418,20 +419,93 @@ void freezeRingToArchive() {
   burstGen++;
   pendingBurstTriggerMs = 0;
 
-  // Free remaining ring frames and reset
-  for (int i = 0; i < RING_SIZE; i++) {
-    if (ringBuf[i].buf) { free(ringBuf[i].buf); ringBuf[i].buf = NULL; }
-    ringBuf[i].len = 0;
-    ringBuf[i].captureMs = 0;
-    ringBuf[i].distanceMm = -2;
+  // Free remaining ring frames and reset (only if no post-trigger phase pending)
+  if (postTriggerRemaining == 0) {
+    for (int i = 0; i < RING_SIZE; i++) {
+      if (ringBuf[i].buf) { free(ringBuf[i].buf); ringBuf[i].buf = NULL; }
+      ringBuf[i].len = 0;
+      ringBuf[i].captureMs = 0;
+      ringBuf[i].distanceMm = -2;
+    }
+    ringCount = 0;
+    ringHead = 0;
+    burstCapturing = false;
+    burstCooldown = millis();
   }
-  ringCount = 0;
-  ringHead = 0;
+  Serial.printf("Burst archived: %d frames (archive %d/%d), postTrigger=%d\n",
+    burstArchives[slot].count, burstArchiveCount, BURST_ARCHIVES, postTriggerRemaining);
+}
 
-  burstCapturing = false;
-  burstCooldown = millis();
-  Serial.printf("Burst archived: %d frames (archive %d/%d)\n",
-    burstArchives[slot].count, burstArchiveCount, BURST_ARCHIVES);
+// Save burst archive to SD card (called after API analysis is complete)
+void saveBurstToSd(int archIdx) {
+  if (!sdReady || archIdx < 0 || archIdx >= burstArchiveCount) return;
+  BurstArchive &arch = burstArchives[archIdx];
+  if (arch.count == 0) return;
+
+  char dirPath[48];
+  time_t now;
+  time(&now);
+  struct tm ti;
+  localtime_r(&now, &ti);
+  if (now > 1000000000) {
+    snprintf(dirPath, sizeof(dirPath), "/%04d%02d%02d_%02d%02d%02d_gen%d",
+      ti.tm_year+1900, ti.tm_mon+1, ti.tm_mday, ti.tm_hour, ti.tm_min, ti.tm_sec,
+      arch.generation);
+  } else {
+    unsigned long sec = arch.timestamp / 1000;
+    snprintf(dirPath, sizeof(dirPath), "/burst_%06lu_gen%d", sec, arch.generation);
+  }
+  SD_MMC.mkdir(dirPath);
+  strlcpy(arch.sdPath, dirPath, sizeof(arch.sdPath));
+
+  for (int i = 0; i < arch.count; i++) {
+    if (!arch.images[i].buf) continue;
+    char fpath[64];
+    snprintf(fpath, sizeof(fpath), "%s/f%02d.jpg", dirPath, i);
+    File f = SD_MMC.open(fpath, FILE_WRITE);
+    if (f) {
+      f.write(arch.images[i].buf, arch.images[i].len);
+      f.close();
+    }
+  }
+
+  // Save metadata JSON (includes API results if available)
+  char metaPath[64];
+  snprintf(metaPath, sizeof(metaPath), "%s/meta.json", dirPath);
+  File mf = SD_MMC.open(metaPath, FILE_WRITE);
+  if (mf) {
+    mf.printf("{\"gen\":%d,\"frames\":%d,\"triggerMs\":%lu,\"firstMs\":%lu,\"lastMs\":%lu,\"uptimeMs\":%lu,\"epoch\":%ld,"
+      "\"apiResult\":%d,\"apiFramesSent\":%d,\"apiCallMs\":%lu,\"apiDoneMs\":%lu,",
+      arch.generation, arch.count, arch.triggerMs, arch.firstFrameMs,
+      arch.lastFrameMs, arch.timestamp, (long)now,
+      arch.apiPreyDetected, arch.apiFramesSent, arch.apiCallMs, arch.apiDoneMs);
+    mf.print("\"apiResults\":[");
+    for (int i = 0; i < arch.count; i++) {
+      if (i > 0) mf.print(",");
+      mf.printf("%d", arch.apiResults[i]);
+    }
+    mf.print("],\"cropMs\":[");
+    for (int i = 0; i < arch.count; i++) {
+      if (i > 0) mf.print(",");
+      mf.printf("%lu", arch.cropMs[i]);
+    }
+    mf.print("],\"totalMs\":[");
+    for (int i = 0; i < arch.count; i++) {
+      if (i > 0) mf.print(",");
+      mf.printf("%lu", arch.totalMs[i]);
+    }
+    mf.print("],\"images\":[");
+    for (int i = 0; i < arch.count; i++) {
+      if (i > 0) mf.print(",");
+      mf.printf("{\"f\":\"f%02d.jpg\",\"bytes\":%u,\"dist\":%d,\"gain\":%d,\"aec\":%d,\"ms\":%lu}",
+        i, (unsigned)arch.images[i].len,
+        arch.images[i].distanceMm, arch.images[i].gainApplied,
+        arch.images[i].aecApplied, arch.images[i].captureMs);
+    }
+    mf.print("]}");
+    mf.close();
+  }
+  Serial.printf("SD: saved %d frames + meta to %s\n", arch.count, dirPath);
 }
 
 // ===== Autonomous prey API call (when laptop absent) =====
@@ -441,7 +515,145 @@ static int apiResponseLen = 0;
 static int lastApiEspErr = 0;
 static int lastApiHttpStatus = 0;
 
-// ===== Persistent TLS connection for prey API =====
+// ===== Concurrent API infrastructure =====
+#define API_CONCURRENT 1  // Disabled concurrent — use sequential only for debugging
+
+static EventGroupHandle_t apiEventGroup = NULL;
+#define API_PREY_BIT   BIT0  // Any task found prey
+#define API_DONE_BIT1  BIT1  // Task 0 done
+#define API_DONE_BIT2  BIT2  // Task 1 done
+#define API_DONE_BIT3  BIT3  // Task 2 done
+#define API_ALL_DONE   (API_DONE_BIT1 | API_DONE_BIT2 | API_DONE_BIT3)
+
+struct ApiTaskParam {
+  int frameIdx;         // index into archive.images[]
+  int archIdx;          // archive index
+  uint8_t *prepBuf;    // preprocessed JPEG (caller allocates, task frees)
+  size_t prepLen;
+  int result;           // -1=error, 0=no prey, 1=prey
+  unsigned long cropMs;
+  unsigned long b64Ms;
+  unsigned long tlsMs;
+  unsigned long postMs;
+  unsigned long totalMs;
+  EventBits_t doneBit;  // which bit to set when done
+};
+
+// Independent API call — each task creates its own TLS connection
+static void concurrentApiTask(void *param) {
+  ApiTaskParam *p = (ApiTaskParam *)param;
+  unsigned long t0 = millis();
+  p->result = -1;
+
+  // Check if another task already found prey
+  if (xEventGroupGetBits(apiEventGroup) & API_PREY_BIT) {
+    if (p->prepBuf) free(p->prepBuf);
+    p->totalMs = millis() - t0;
+    xEventGroupSetBits(apiEventGroup, p->doneBit);
+    vTaskDelete(NULL);
+    return;
+  }
+
+  // Create independent TLS connection
+  WiFiClientSecure *client = new WiFiClientSecure();
+  if (!client) {
+    Serial.printf("API[%d]: client alloc failed\n", p->frameIdx);
+    if (p->prepBuf) free(p->prepBuf);
+    p->totalMs = millis() - t0;
+    xEventGroupSetBits(apiEventGroup, p->doneBit);
+    vTaskDelete(NULL);
+    return;
+  }
+  client->setInsecure();
+
+  HTTPClient *http = new HTTPClient();
+  http->setReuse(false);  // single-use connection
+  if (!http->begin(*client, PREY_API_URL)) {
+    Serial.printf("API[%d]: begin failed\n", p->frameIdx);
+    delete http; delete client;
+    if (p->prepBuf) free(p->prepBuf);
+    p->totalMs = millis() - t0;
+    xEventGroupSetBits(apiEventGroup, p->doneBit);
+    vTaskDelete(NULL);
+    return;
+  }
+  char authHeader[128];
+  snprintf(authHeader, sizeof(authHeader), "Bearer %s", PREY_API_KEY);
+  http->addHeader("Content-Type", "application/json");
+  http->addHeader("Authorization", authHeader);
+  http->setTimeout(15000);
+  unsigned long tt1 = millis();
+  p->tlsMs = tt1 - t0;
+
+  // Base64 encode
+  unsigned long tb0 = millis();
+  size_t b64Len = 0;
+  mbedtls_base64_encode(NULL, 0, &b64Len, p->prepBuf, p->prepLen);
+  char *b64Buf = (char *)ps_malloc(b64Len + 1);
+  if (!b64Buf) {
+    Serial.printf("API[%d]: b64 malloc failed\n", p->frameIdx);
+    http->end(); delete http; delete client;
+    free(p->prepBuf); p->prepBuf = NULL;
+    p->totalMs = millis() - t0;
+    xEventGroupSetBits(apiEventGroup, p->doneBit);
+    vTaskDelete(NULL);
+    return;
+  }
+  mbedtls_base64_encode((unsigned char *)b64Buf, b64Len + 1, &b64Len, p->prepBuf, p->prepLen);
+  b64Buf[b64Len] = 0;
+  free(p->prepBuf); p->prepBuf = NULL;
+
+  // Build JSON
+  size_t jsonLen = b64Len + 32;
+  char *jsonBody = (char *)ps_malloc(jsonLen);
+  if (!jsonBody) {
+    Serial.printf("API[%d]: json malloc failed\n", p->frameIdx);
+    free(b64Buf);
+    http->end(); delete http; delete client;
+    p->totalMs = millis() - t0;
+    xEventGroupSetBits(apiEventGroup, p->doneBit);
+    vTaskDelete(NULL);
+    return;
+  }
+  snprintf(jsonBody, jsonLen, "{\"image_base64\":\"%s\"}", b64Buf);
+  free(b64Buf);
+  unsigned long tb1 = millis();
+  p->b64Ms = tb1 - tb0;
+
+  // POST
+  unsigned long startMs = millis();
+  int httpCode = http->POST((uint8_t *)jsonBody, strlen(jsonBody));
+  free(jsonBody);
+  p->postMs = millis() - startMs;
+
+  if (httpCode == 200) {
+    String response = http->getString();
+    if (strstr(response.c_str(), "\"detected\":true") ||
+        strstr(response.c_str(), "\"detected\": true")) {
+      p->result = 1;
+      xEventGroupSetBits(apiEventGroup, API_PREY_BIT);
+      Serial.printf("API[%d]: *** PREY DETECTED *** (post=%lums)\n", p->frameIdx, p->postMs);
+    } else {
+      p->result = 0;
+    }
+  } else {
+    Serial.printf("API[%d]: HTTP %d (post=%lums)\n", p->frameIdx, httpCode, p->postMs);
+    p->result = -1;
+  }
+
+  http->end();
+  delete http;
+  client->stop();
+  delete client;
+
+  p->totalMs = millis() - t0;
+  Serial.printf("API[%d]: done b64=%lums tls=%lums post=%lums total=%lums result=%d\n",
+    p->frameIdx, p->b64Ms, p->tlsMs, p->postMs, p->totalMs, p->result);
+  xEventGroupSetBits(apiEventGroup, p->doneBit);
+  vTaskDelete(NULL);
+}
+
+// ===== Persistent TLS connection for prey API (used for sequential fallback) =====
 static WiFiClientSecure *tlsClient = NULL;
 static HTTPClient *httpApi = NULL;
 static bool tlsConnected = false;
@@ -617,55 +829,117 @@ static int callPreyApi(const uint8_t *jpgBuf, size_t jpgLen,
   return 0;
 }
 
-// Pick best N frames, crop+send each sequentially (keeps TLS warm between calls)
+// Send frames in priority order with concurrent first batch.
+// First API_CONCURRENT frames sent in parallel, then sequential if no prey found.
 void autonomousApiCheck(int archIdx) {
   if (archIdx < 0 || archIdx >= burstArchiveCount) return;
   BurstArchive &archive = burstArchives[archIdx];
   if (archive.count == 0) return;
 
-  // Sort frame indices by JPEG size descending (pick largest = most detail)
-  int indices[RING_SIZE];
-  for (int i = 0; i < archive.count; i++) indices[i] = i;
-  for (int i = 0; i < min(API_FRAMES_PER_BURST, archive.count); i++) {
-    for (int j = i + 1; j < archive.count; j++) {
-      if (archive.images[indices[j]].len > archive.images[indices[i]].len) {
-        int tmp = indices[i]; indices[i] = indices[j]; indices[j] = tmp;
-      }
-    }
-  }
-
-  int framesToSend = min(API_FRAMES_PER_BURST, archive.count);
   archive.apiCallMs = millis();
   archive.apiPreyDetected = 0;
 
-  Serial.printf("API: autonomous check, %d/%d frames, archive %d (gen %d)\n",
-    framesToSend, archive.count, archIdx, archive.generation);
+  Serial.printf("API: autonomous check, %d frames ready, archive %d (gen %d)\n",
+    archive.count, archIdx, archive.generation);
 
-  // Ensure TLS is connected before first call
-  ensureTlsConnection();
+  // Build frame order: prioritize f03-f07 (near trigger, cat closest), then remaining
+  int order[RING_SIZE];
+  int orderCount = 0;
+  for (int i = 3; i <= 7; i++) order[orderCount++] = i;
+  for (int i = 8; i < RING_SIZE; i++) order[orderCount++] = i;
+  for (int i = 2; i >= 0; i--) order[orderCount++] = i;
 
-  // Crop and send each frame sequentially (keeps TLS connection warm)
-  for (int i = 0; i < framesToSend; i++) {
-    int fIdx = indices[i];
-    if (!archive.images[fIdx].buf) continue;
+  // Create event group for concurrent signaling
+  if (!apiEventGroup) apiEventGroup = xEventGroupCreate();
+  xEventGroupClearBits(apiEventGroup, 0xFF);
 
-    unsigned long frameT0 = millis();
+  // === Phase 1: Concurrent batch (first API_CONCURRENT available frames) ===
+  ApiTaskParam taskParams[API_CONCURRENT];
+  int concurrentCount = 0;
+  int orderIdx = 0;
+  EventBits_t doneBits[] = {API_DONE_BIT1, API_DONE_BIT2, API_DONE_BIT3};
 
-    // Crop this frame
+  // Preprocess up to API_CONCURRENT frames (only immediately available — no waiting)
+  for (; orderIdx < orderCount && concurrentCount < API_CONCURRENT; orderIdx++) {
+    int i = order[orderIdx];
+    // Skip frames not yet available (post-trigger frames arrive later)
+    if (i >= archive.count || !archive.images[i].buf) continue;
+
     unsigned long ct0 = millis();
     size_t croppedLen = 0;
-    uint8_t *cropped = cropJpegForApi(archive.images[fIdx].buf, archive.images[fIdx].len, &croppedLen);
+    uint8_t *cropped = cropJpegForApi(archive.images[i].buf, archive.images[i].len, &croppedLen);
+    unsigned long cropDt = millis() - ct0;
+    if (!cropped) continue;
+
+    taskParams[concurrentCount].frameIdx = i;
+    taskParams[concurrentCount].archIdx = archIdx;
+    taskParams[concurrentCount].prepBuf = cropped;
+    taskParams[concurrentCount].prepLen = croppedLen;
+    taskParams[concurrentCount].result = -1;
+    taskParams[concurrentCount].cropMs = cropDt;
+    taskParams[concurrentCount].b64Ms = 0;
+    taskParams[concurrentCount].tlsMs = 0;
+    taskParams[concurrentCount].postMs = 0;
+    taskParams[concurrentCount].totalMs = 0;
+    taskParams[concurrentCount].doneBit = doneBits[concurrentCount];
+    concurrentCount++;
+  }
+
+  Serial.printf("API: launching %d concurrent calls, freeHeap=%u freePSRAM=%u\n",
+    concurrentCount, ESP.getFreeHeap(), ESP.getFreePsram());
+
+  // TEMPORARY: Skip concurrent tasks for debugging — free prep buffers, go sequential
+  for (int t = 0; t < concurrentCount; t++) {
+    if (taskParams[t].prepBuf) { free(taskParams[t].prepBuf); taskParams[t].prepBuf = NULL; }
+  }
+  orderIdx = 0;  // Reset so sequential processes all frames
+  concurrentCount = 0;
+
+  // Wait for all concurrent tasks to finish (or prey found)
+  // (skipped — concurrent disabled for debugging)
+
+  // Record results from concurrent batch
+  for (int t = 0; t < concurrentCount; t++) {
+    int i = taskParams[t].frameIdx;
+    archive.apiResults[i] = taskParams[t].result;
+    archive.cropMs[i] = taskParams[t].cropMs;
+    archive.b64Ms[i] = taskParams[t].b64Ms;
+    archive.tlsMs[i] = taskParams[t].tlsMs;
+    archive.postMs[i] = taskParams[t].postMs;
+    archive.totalMs[i] = taskParams[t].totalMs;
+    archive.apiFramesSent++;
+    if (taskParams[t].result == 1) archive.apiPreyDetected = 1;
+  }
+
+  if (archive.apiPreyDetected) {
+    Serial.println("API: *** PREY in concurrent batch — done ***");
+    goto api_done;
+  }
+
+  // === Phase 2: Sequential remaining frames (reuse single TLS connection) ===
+  ensureTlsConnection();
+  for (; orderIdx < orderCount; orderIdx++) {
+    int i = order[orderIdx];
+    int waitMs = 0;
+    while (i >= archive.count && waitMs < 2000) {
+      vTaskDelay(50 / portTICK_PERIOD_MS);
+      waitMs += 50;
+    }
+    if (i >= archive.count || !archive.images[i].buf) continue;
+
+    unsigned long frameT0 = millis();
+    unsigned long ct0 = millis();
+    size_t croppedLen = 0;
+    uint8_t *cropped = cropJpegForApi(archive.images[i].buf, archive.images[i].len, &croppedLen);
     unsigned long cropDt = millis() - ct0;
 
-    // Send immediately (connection still warm)
     ApiTiming timing = {0, 0, 0};
-    int result = callPreyApi(archive.images[fIdx].buf, archive.images[fIdx].len,
+    int result = callPreyApi(archive.images[i].buf, archive.images[i].len,
                              cropped, croppedLen, &timing);
     unsigned long frameDt = millis() - frameT0;
-
     if (cropped) free(cropped);
 
-    archive.apiResults[fIdx] = result;
+    archive.apiResults[i] = result;
     archive.cropMs[i] = cropDt;
     archive.b64Ms[i] = timing.b64Ms;
     archive.tlsMs[i] = timing.tlsMs;
@@ -673,18 +947,24 @@ void autonomousApiCheck(int archIdx) {
     archive.totalMs[i] = frameDt;
     archive.apiFramesSent++;
 
-    Serial.printf("API: frame[%d] crop=%lums b64=%lums tls=%lums post=%lums total=%lums result=%d\n",
-      fIdx, cropDt, timing.b64Ms, timing.tlsMs, timing.postMs, frameDt, result);
+    Serial.printf("API: frame[%d] crop=%lums total=%lums result=%d\n",
+      i, cropDt, frameDt, result);
 
     if (result == 1) {
       archive.apiPreyDetected = 1;
-      Serial.println("API: *** PREY DETECTED ***");
+      Serial.println("API: *** PREY DETECTED *** — stopping early");
+      break;
     }
   }
 
+api_done:
   Serial.printf("API: done. %d frames sent, prey=%d\n",
     archive.apiFramesSent, archive.apiPreyDetected);
   archive.apiDoneMs = millis();
+
+  // Save all frames + meta to SD (deferred from freeze time)
+  saveBurstToSd(archIdx);
+
   // Persist event to NVS
   int dMin = 9999, dMax = -9999;
   for (int i = 0; i < archive.count; i++) {
@@ -703,11 +983,11 @@ static void apiCheckTask(void *param) {
   vTaskDelete(NULL);
 }
 
-// Fallback task: wait for laptop to process, then run autonomous
+// Fallback task: wait briefly for laptop, then run autonomous immediately
 static void apiFallbackTask(void *param) {
   int archIdx = (int)(intptr_t)param;
   unsigned long t0 = millis();
-  // Wait up to 15s, checking every 500ms if laptop has set a result
+  // Wait up to apiFallbackMs for laptop to process first
   while (millis() - t0 < (unsigned long)apiFallbackMs) {
     if (archIdx < 0 || archIdx >= burstArchiveCount) { vTaskDelete(NULL); return; }
     if (burstArchives[archIdx].apiPreyDetected != -1) {
@@ -718,7 +998,7 @@ static void apiFallbackTask(void *param) {
     }
     vTaskDelay(500 / portTICK_PERIOD_MS);
   }
-  // Laptop didn't process in time — run autonomous check
+  // Laptop didn't process in time — run autonomous check on ALL frames
   if (archIdx >= 0 && archIdx < burstArchiveCount &&
       burstArchives[archIdx].apiPreyDetected == -1) {
     Serial.printf("API fallback: laptop timeout, running autonomous check on archive %d\n", archIdx);
@@ -767,6 +1047,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   <button id="toggle-stream" onclick="toggleStream()" style="margin:0 0 8px;padding:8px 20px;font-size:1em;cursor:pointer;border-radius:6px;border:none;background:#a44;color:#fff;">Start Stream</button>
   <button onclick="fetch('/cmd?trigger=1')" style="margin:0 0 8px 8px;padding:8px 20px;font-size:1em;cursor:pointer;border-radius:6px;border:none;background:#c80;color:#fff;">Fake Trigger</button>
   <a href="/settings" style="margin-left:8px;padding:8px 16px;font-size:0.9em;border-radius:6px;background:#335;color:#8af;text-decoration:none;display:inline-block;">⚙ Settings</a>
+  <a href="/sd" style="margin-left:8px;padding:8px 16px;font-size:0.9em;border-radius:6px;background:#253;color:#8fa;text-decoration:none;display:inline-block;">💾 SD Card</a>
   <div id="stream-wrap"><img id="stream" src="" onload="var w=this.naturalHeight,h=this.naturalWidth;this.parentElement.style.width=w+'px';this.parentElement.style.height=h+'px';this.style.width=h+'px';" /></div>
   <div id="events-section" style="width:100%;max-width:700px;margin-top:16px;">
     <h2 style="font-size:1.1em;margin:0 0 6px;">Events Log</h2>
@@ -874,11 +1155,19 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     async function loadPersistedEvents() {
       try {
         const r = await fetch('/getevents');
-        const events = await r.json();
+        const data = await r.json();
+        const events = data.events || data;
+        const bootEpoch = data.epoch ? (data.epoch - data.uptimeMs/1000) : null;
         const el = document.getElementById('events-log');
         for (let i = events.length - 1; i >= 0; i--) {
           const e = events[i];
-          const agoSec = (e.ago / 1000).toFixed(0);
+          let timeStr;
+          if (bootEpoch && e.t) {
+            const d = new Date((bootEpoch + e.t/1000) * 1000);
+            timeStr = d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'});
+          } else {
+            timeStr = (e.ago / 1000).toFixed(0) + 's ago';
+          }
           let mode, modeColor;
           if (e.mode === 1) { mode = '\u{1F916} AUTO'; modeColor = '#fc4'; }
           else { mode = '\u{1F4BB} LAPTOP'; modeColor = '#4f4'; }
@@ -893,11 +1182,15 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
           const div = document.createElement('div');
           div.id = 'pev-' + e.t;
           div.style.cssText = 'padding:3px 0;border-bottom:1px solid #222;opacity:0.7;';
-          div.innerHTML = '<span style="color:#666">' + agoSec + 's ago</span> ' +
+          const trendLabels = ['\u2753','\u27A1\uFE0F IN','\u2B05\uFE0F OUT','\u21C6 FLAT'];
+          const trendColors = ['#666','#4f4','#f84','#fc4'];
+          const tl = e.trend >= 0 && e.trend <= 3 ? e.trend : 0;
+          div.innerHTML = '<span style="color:#666">' + timeStr + '</span> ' +
             '<b style="color:#aaa">gen' + e.gen + '</b> ' +
             '<span style="color:#6af">' + e.nf + 'f</span> ' +
             '<span style="color:' + modeColor + '">' + mode + '</span> ' +
             '<span style="color:#4cf">' + distStr + '</span> ' +
+            '<span style="color:' + trendColors[tl] + '">' + trendLabels[tl] + '</span> ' +
             '<span style="color:' + resColor + '">' + resStr + '</span>';
           el.appendChild(div);
         }
@@ -1377,7 +1670,7 @@ static esp_err_t burstmeta_handler(httpd_req_t *req) {
   strlcat(gainBuf, "]", sizeof(gainBuf));
   strlcat(aecBuf, "]", sizeof(aecBuf));
 
-  char json[1792];
+  char json[2560];
   // API results per frame
   char apiBuf[80] = "[";
   for (int i = 0; i < archive.count; i++) {
@@ -1388,7 +1681,7 @@ static esp_err_t burstmeta_handler(httpd_req_t *req) {
   strlcat(apiBuf, "]", sizeof(apiBuf));
 
   // Per-frame timing arrays (up to apiFramesSent entries)
-  char cropBuf[80] = "[", b64Buf[80] = "[", tlsBuf2[80] = "[", postBuf[80] = "[", totBuf[80] = "[";
+  char cropBuf[160] = "[", b64Buf[160] = "[", tlsBuf2[160] = "[", postBuf[160] = "[", totBuf[160] = "[";
   for (int i = 0; i < archive.apiFramesSent; i++) {
     char tmp[16];
     snprintf(tmp, sizeof(tmp), "%s%lu", i > 0 ? "," : "", archive.cropMs[i]); strlcat(cropBuf, tmp, sizeof(cropBuf));
@@ -1470,9 +1763,24 @@ static esp_err_t cmd_handler(httpd_req_t *req) {
   } else if (httpd_query_key_value(buf, "trigger", val, sizeof(val)) == ESP_OK) {
     // Fake trigger: simulate ToF detection for testing
     if (!burstCapturing && postTriggerRemaining == 0) {
+      burstCapturing = true;  // Block capture loop BEFORE setting postTrigger
       pendingBurstTriggerMs = millis();
-      postTriggerRemaining = POST_TRIGGER_FRAMES;
+      postTriggerRemaining = 0;  // DEBUG: skip post-trigger for now
+      // Immediately freeze pre-trigger frames and start API
+      freezeRingToArchive();
+      if (burstArchiveCount > 0) {
+        int archIdx = burstArchiveCount - 1;
+        xTaskCreatePinnedToCore(apiCheckTask, "apiCheck",
+          16384, (void *)(intptr_t)archIdx,
+          tskIDLE_PRIORITY + 3, NULL, 0);
+      }
       Serial.println("Fake trigger from web UI");
+    } else {
+      Serial.printf("Fake trigger REJECTED: burstCapturing=%d postTrigger=%d\n",
+        burstCapturing, postTriggerRemaining);
+      httpd_resp_set_type(req, "text/plain");
+      httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+      return httpd_resp_send(req, "BUSY", 4);
     }
   } else if (httpd_query_key_value(buf, "brightness", val, sizeof(val)) == ESP_OK) {
     s->set_brightness(s, atoi(val));
@@ -1517,6 +1825,34 @@ static esp_err_t cmd_handler(httpd_req_t *req) {
     httpd_resp_send(req, "Rebooting...", 12);
     delay(500);
     ESP.restart();
+  } else if (httpd_query_key_value(buf, "formatsd", val, sizeof(val)) == ESP_OK) {
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    if (!sdReady) {
+      return httpd_resp_send(req, "SD not mounted", 14);
+    }
+    // Remove all files recursively
+    File root = SD_MMC.open("/");
+    File entry = root.openNextFile();
+    while (entry) {
+      if (!entry.isDirectory()) {
+        SD_MMC.remove(entry.path());
+      } else {
+        // Remove files in subdirectory then the dir
+        File sub = SD_MMC.open(entry.path());
+        File sf = sub.openNextFile();
+        while (sf) {
+          SD_MMC.remove(sf.path());
+          sf = sub.openNextFile();
+        }
+        sub.close();
+        SD_MMC.rmdir(entry.path());
+      }
+      entry = root.openNextFile();
+    }
+    root.close();
+    Serial.println("SD card formatted (all files removed)");
+    return httpd_resp_send(req, "SD formatted", 12);
   }
 
   httpd_resp_set_type(req, "text/plain");
@@ -1615,24 +1951,232 @@ static esp_err_t burst_handler(httpd_req_t *req) {
                          burstArchives[archIdx].images[imgIdx].len);
 }
 
+// ===== SD card browser HTML page =====
+static esp_err_t sdbrowser_handler(httpd_req_t *req) {
+  httpd_resp_set_type(req, "text/html");
+  const char *html = R"rawhtml(
+<!DOCTYPE html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
+<title>SD Card Browser</title>
+<style>
+body{font-family:monospace;margin:1em;background:#1a1a2e;color:#e0e0e0;font-size:14px}
+h1{color:#0f9;font-size:1.2em;margin:0 0 4px}
+.info{color:#888;margin:0 0 8px;font-size:0.85em}
+.act{margin-bottom:12px}
+.act button{background:#0f9;color:#000;border:none;padding:5px 12px;border-radius:3px;cursor:pointer;margin-right:6px;font-family:monospace}
+.act button.danger{background:#f44}
+table{width:100%;border-collapse:collapse;font-size:0.9em}
+th{text-align:left;border-bottom:1px solid #444;padding:4px 8px;color:#8af}
+td{padding:3px 8px;border-bottom:1px solid #222}
+tr:hover{background:#222}
+a{color:#4cf;text-decoration:none}
+a:hover{text-decoration:underline}
+.dl-btn{color:#0f9;cursor:pointer;margin-left:6px}
+.dl-btn:hover{color:#4f4}
+.folder-row td{color:#adf}
+.meta{color:#888;font-size:0.8em}
+#progress{display:none;margin:8px 0;padding:6px;background:#16213e;border-radius:4px;font-size:0.85em}
+</style></head><body>
+<h1>SD Card Browser</h1>
+<div class='info' id='info'>Loading...</div>
+<div class='act'>
+<button class='danger' onclick='formatSD()'>Format SD</button>
+<button onclick='loadAll()'>Refresh</button>
+<button onclick='downloadAll()'>Download All</button>
+</div>
+<div id='progress'></div>
+<div id='content'></div>
+<script>
+const B='http://'+location.hostname;
+async function loadAll(){
+  let r=await fetch(B+'/sdinfo');let info=await r.json();
+  document.getElementById('info').textContent=info.ok?`${info.type} | ${info.totalMB}MB total | ${info.usedMB}MB used | ${info.freeMB}MB free`:'SD not mounted';
+  r=await fetch(B+'/sdlist');let d=await r.json();
+  if(!d.ok){document.getElementById('content').innerHTML='<p>SD not available</p>';return;}
+  let folders={};
+  d.files.forEach(f=>{
+    let parts=f.split('/');
+    let dir=parts.length>1?parts.slice(0,-1).join('/'):'(root)';
+    if(!folders[dir])folders[dir]=[];
+    folders[dir].push(parts[parts.length-1]);
+  });
+  let html='<table><tr><th></th><th>Folder</th><th>Files</th><th>Date/Time</th><th></th></tr>';
+  Object.keys(folders).sort().reverse().forEach(dir=>{
+    let timeStr=dir;
+    let m=dir.match(/(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})_gen(\d+)/);
+    if(m){timeStr=`${m[1]}-${m[2]}-${m[3]} ${m[4]}:${m[5]}:${m[6]} UTC  gen${m[7]}`;}
+    let m2=dir.match(/burst_(\d+)_gen(\d+)/);
+    if(m2){let s=parseInt(m2[1]);let h=Math.floor(s/3600);let mn=Math.floor((s%3600)/60);let sc=s%60;timeStr=`${h}h ${mn}m ${sc}s uptime  gen${m2[2]}`;}
+    let n=folders[dir].length;
+    let jpgs=folders[dir].filter(f=>f.endsWith('.jpg')).length;
+    let hasMeta=folders[dir].includes('meta.json');
+    html+=`<tr class='folder-row'><td>📁</td><td><a href='#' onclick='toggleFolder("${dir}");return false'>${dir}</a></td><td>${jpgs} img${hasMeta?' +meta':''}</td><td>${timeStr}</td><td><span class='dl-btn' onclick='downloadFolder("${dir}",[${folders[dir].map(f=>'"'+f+'"').join(',')}])'>⬇ Download</span></td></tr>`;
+    html+=`<tr id='detail_${dir.replace(/[^a-z0-9]/gi,'_')}' style='display:none'><td></td><td colspan='4'><table>`;
+    folders[dir].forEach(f=>{
+      let url=B+'/sdget?f='+encodeURIComponent(dir+'/'+f);
+      html+=`<tr><td><a href='${url}' target='_blank'>${f}</a></td></tr>`;
+    });
+    html+='</table></td></tr>';
+  });
+  html+='</table>';
+  document.getElementById('content').innerHTML=html||'<p>No files</p>';
+}
+function toggleFolder(dir){let el=document.getElementById('detail_'+dir.replace(/[^a-z0-9]/gi,'_'));if(el)el.style.display=el.style.display==='none'?'':'none';}
+async function downloadFolder(dir,files){
+  let prog=document.getElementById('progress');prog.style.display='block';
+  prog.textContent='Downloading '+dir+'...';
+  for(let i=0;i<files.length;i++){
+    prog.textContent=`Downloading ${dir}: ${i+1}/${files.length}`;
+    let url=B+'/sdget?f='+encodeURIComponent(dir+'/'+files[i]);
+    let r=await fetch(url);let blob=await r.blob();
+    let a=document.createElement('a');a.href=URL.createObjectURL(blob);
+    a.download=dir+'_'+files[i];a.click();URL.revokeObjectURL(a.href);
+    await new Promise(r=>setTimeout(r,200));
+  }
+  prog.textContent='Done!';setTimeout(()=>{prog.style.display='none';},2000);
+}
+async function downloadAll(){
+  let r=await fetch(B+'/sdlist');let d=await r.json();
+  if(!d.ok||!d.files.length){alert('No files');return;}
+  let prog=document.getElementById('progress');prog.style.display='block';
+  for(let i=0;i<d.files.length;i++){
+    prog.textContent=`Downloading all: ${i+1}/${d.files.length}`;
+    let url=B+'/sdget?f='+encodeURIComponent(d.files[i]);
+    let r2=await fetch(url);let blob=await r2.blob();
+    let fname=d.files[i].replace(/\//g,'_');
+    let a=document.createElement('a');a.href=URL.createObjectURL(blob);
+    a.download=fname;a.click();URL.revokeObjectURL(a.href);
+    await new Promise(r=>setTimeout(r,200));
+  }
+  prog.textContent='All done!';setTimeout(()=>{prog.style.display='none';},2000);
+}
+async function formatSD(){if(!confirm('Delete ALL files on SD card?'))return;await fetch(B+'/cmd?formatsd=1');loadAll();}
+loadAll();
+</script></body></html>
+)rawhtml";
+  httpd_resp_sendstr(req, html);
+  return ESP_OK;
+}
+
+// ===== SD card file listing =====
+static esp_err_t sdlist_handler(httpd_req_t *req) {
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  if (!sdReady) {
+    httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"SD not mounted\"}");
+    return ESP_OK;
+  }
+  httpd_resp_send_chunk(req, "{\"ok\":true,\"files\":[", -1);
+  File root = SD_MMC.open("/");
+  bool first = true;
+  char entry_buf[128];
+  File entry = root.openNextFile();
+  while (entry) {
+    if (entry.isDirectory()) {
+      File sub = SD_MMC.open(entry.path());
+      File sf = sub.openNextFile();
+      while (sf) {
+        if (!sf.isDirectory()) {
+          int len = snprintf(entry_buf, sizeof(entry_buf), "%s\"%s/%s\"",
+            first ? "" : ",", entry.name(), sf.name());
+          httpd_resp_send_chunk(req, entry_buf, len);
+          first = false;
+        }
+        sf = sub.openNextFile();
+      }
+      sub.close();
+    } else {
+      int len = snprintf(entry_buf, sizeof(entry_buf), "%s\"%s\"",
+        first ? "" : ",", entry.name());
+      httpd_resp_send_chunk(req, entry_buf, len);
+      first = false;
+    }
+    entry = root.openNextFile();
+  }
+  root.close();
+  httpd_resp_send_chunk(req, "]}", -1);
+  httpd_resp_send_chunk(req, NULL, 0);
+  return ESP_OK;
+}
+
+// ===== SD card file download =====
+static esp_err_t sdget_handler(httpd_req_t *req) {
+  if (!sdReady) { httpd_resp_send_404(req); return ESP_FAIL; }
+  char query[128];
+  int qlen = httpd_req_get_url_query_len(req) + 1;
+  if (qlen <= 1 || qlen > (int)sizeof(query)) { httpd_resp_send_404(req); return ESP_FAIL; }
+  httpd_req_get_url_query_str(req, query, sizeof(query));
+  char filepath[96];
+  if (httpd_query_key_value(query, "f", filepath, sizeof(filepath)) != ESP_OK) {
+    httpd_resp_send_404(req); return ESP_FAIL;
+  }
+  // Ensure path starts with /
+  char fullpath[128];
+  if (filepath[0] == '/') {
+    snprintf(fullpath, sizeof(fullpath), "%s", filepath);
+  } else {
+    snprintf(fullpath, sizeof(fullpath), "/%s", filepath);
+  }
+  File f = SD_MMC.open(fullpath);
+  if (!f || f.isDirectory()) { httpd_resp_send_404(req); return ESP_FAIL; }
+  // Set content type based on extension
+  const char *ct = "application/octet-stream";
+  if (strstr(fullpath, ".jpg") || strstr(fullpath, ".jpeg")) ct = "image/jpeg";
+  else if (strstr(fullpath, ".json")) ct = "application/json";
+  httpd_resp_set_type(req, ct);
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  uint8_t buf[4096];
+  size_t bytesRead;
+  while ((bytesRead = f.read(buf, sizeof(buf))) > 0) {
+    httpd_resp_send_chunk(req, (const char *)buf, bytesRead);
+  }
+  f.close();
+  httpd_resp_send_chunk(req, NULL, 0);
+  return ESP_OK;
+}
+
 // ===== Persistent events API =====
+static esp_err_t sdinfo_handler(httpd_req_t *req) {
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  char json[256];
+  if (!sdReady) {
+    snprintf(json, sizeof(json), "{\"ok\":false,\"error\":\"SD card not mounted\"}");
+  } else {
+    uint64_t total = SD_MMC.totalBytes();
+    uint64_t used = SD_MMC.usedBytes();
+    uint64_t cardSize = SD_MMC.cardSize();
+    uint8_t type = SD_MMC.cardType();
+    const char *typeStr = (type == 1) ? "MMC" : (type == 2) ? "SDSC" : (type == 3) ? "SDHC" : "UNKNOWN";
+    snprintf(json, sizeof(json),
+      "{\"ok\":true,\"type\":\"%s\",\"cardMB\":%llu,\"totalMB\":%llu,\"usedMB\":%llu,\"freeMB\":%llu}",
+      typeStr, cardSize / (1024*1024), total / (1024*1024), used / (1024*1024), (total - used) / (1024*1024));
+  }
+  httpd_resp_sendstr(req, json);
+  return ESP_OK;
+}
+
 static esp_err_t getevents_handler(httpd_req_t *req) {
   // Stream JSON array of persisted events
   httpd_resp_set_type(req, "application/json");
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-  httpd_resp_send_chunk(req, "[", 1);
+  // Send object with epoch for real-time calculation
+  char hdr[96];
+  time_t nowEpoch;
+  time(&nowEpoch);
+  unsigned long nowMs = millis();
+  int hdrLen = snprintf(hdr, sizeof(hdr), "{\"epoch\":%ld,\"uptimeMs\":%lu,\"events\":[", (long)nowEpoch, nowMs);
+  httpd_resp_send_chunk(req, hdr, hdrLen);
   char buf[128];
-  unsigned long now = millis();
   for (int i = 0; i < eventCount; i++) {
     EventEntry &e = eventLog[i];
     int len = snprintf(buf, sizeof(buf),
       "%s{\"t\":%lu,\"ago\":%lu,\"gen\":%d,\"nf\":%d,\"res\":%d,\"dMin\":%d,\"dMax\":%d,\"mode\":%d,\"trend\":%d}",
       i > 0 ? "," : "",
-      e.uptimeMs, (now > e.uptimeMs) ? (now - e.uptimeMs) : 0,
+      e.uptimeMs, (nowMs > e.uptimeMs) ? (nowMs - e.uptimeMs) : 0,
       e.gen, e.frameCount, e.result, e.distMin, e.distMax, e.mode, e.trend);
     httpd_resp_send_chunk(req, buf, len);
   }
-  httpd_resp_send_chunk(req, "]", 1);
+  httpd_resp_send_chunk(req, "]}", 2);
   httpd_resp_send_chunk(req, NULL, 0);
   return ESP_OK;
 }
@@ -1833,7 +2377,7 @@ void startUIServer() {
   config.server_port = 80;
   config.ctrl_port = 32768;
   config.stack_size = 16384;
-  config.max_uri_handlers = 16;
+  config.max_uri_handlers = 20;
 
   httpd_uri_t index_uri = {
     .uri = "/",
@@ -1897,6 +2441,14 @@ void startUIServer() {
     httpd_register_uri_handler(ui_httpd, &setsettings_uri);
     httpd_uri_t getevents_uri = { .uri = "/getevents", .method = HTTP_GET, .handler = getevents_handler, .user_ctx = NULL };
     httpd_register_uri_handler(ui_httpd, &getevents_uri);
+    httpd_uri_t sdinfo_uri = { .uri = "/sdinfo", .method = HTTP_GET, .handler = sdinfo_handler, .user_ctx = NULL };
+    httpd_register_uri_handler(ui_httpd, &sdinfo_uri);
+    httpd_uri_t sdlist_uri = { .uri = "/sdlist", .method = HTTP_GET, .handler = sdlist_handler, .user_ctx = NULL };
+    httpd_register_uri_handler(ui_httpd, &sdlist_uri);
+    httpd_uri_t sdget_uri = { .uri = "/sdget", .method = HTTP_GET, .handler = sdget_handler, .user_ctx = NULL };
+    httpd_register_uri_handler(ui_httpd, &sdget_uri);
+    httpd_uri_t sdbrowser_uri = { .uri = "/sd", .method = HTTP_GET, .handler = sdbrowser_handler, .user_ctx = NULL };
+    httpd_register_uri_handler(ui_httpd, &sdbrowser_uri);
     Serial.println("UI server started on port 80");
   }
 }
@@ -1921,6 +2473,16 @@ void setup() {
     Serial.println("TOF050C not found on I2C");
   }
 
+  // SD card init (1-bit mode)
+  SD_MMC.setPins(SD_CLK, SD_CMD, SD_D0);
+  if (SD_MMC.begin("/sdcard", true)) { // true = 1-bit mode
+    sdReady = true;
+    uint64_t cardSize = SD_MMC.cardSize() / (1024 * 1024);
+    Serial.printf("SD card ready: %llu MB, type %d\n", cardSize, SD_MMC.cardType());
+  } else {
+    Serial.println("SD card mount failed");
+  }
+
   if (!initCamera()) {
     Serial.println("Camera init failed \u2013 restarting in 5 s");
     delay(5000);
@@ -1935,6 +2497,24 @@ void setup() {
     Serial.print(".");
   }
   Serial.printf("\nConnected! IP: %s\n", WiFi.localIP().toString().c_str());
+
+  // NTP time sync
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+  Serial.print("Waiting for NTP time");
+  time_t now = 0;
+  for (int i = 0; i < 20 && now < 1000000000; i++) {
+    delay(500);
+    time(&now);
+    Serial.print(".");
+  }
+  if (now > 1000000000) {
+    struct tm ti;
+    localtime_r(&now, &ti);
+    Serial.printf("\nNTP synced: %04d-%02d-%02d %02d:%02d:%02d UTC\n",
+      ti.tm_year+1900, ti.tm_mon+1, ti.tm_mday, ti.tm_hour, ti.tm_min, ti.tm_sec);
+  } else {
+    Serial.println("\nNTP sync failed, using uptime");
+  }
 
   // FIX 2: Disable WiFi power save mode.
   // Default is WIFI_PS_MIN_MODEM — the radio sleeps between DTIM beacons
@@ -2056,9 +2636,27 @@ void loop() {
   }
   if (tofCloseCount >= 3 && !burstCapturing && postTriggerRemaining == 0
       && (now - burstCooldown > (unsigned long)burstCooldownMs)) {
+    burstCapturing = true;  // Block capture loop BEFORE setting postTrigger
     pendingBurstTriggerMs = now;
-    postTriggerRemaining = POST_TRIGGER_FRAMES;
+    postTriggerRemaining = 0;  // DEBUG: skip post-trigger for now
     tofCloseCount = 0;
+    // Immediately freeze pre-trigger frames and start API
+    freezeRingToArchive();
+    if (burstArchiveCount > 0) {
+      int archIdx = burstArchiveCount - 1;
+      bool laptopHere = (lastLaptopContactMs > 0) &&
+                        (now - lastLaptopContactMs < LAPTOP_TIMEOUT_MS);
+      if (laptopHere) {
+        xTaskCreatePinnedToCore(apiFallbackTask, "apiFallback",
+          16384, (void *)(intptr_t)archIdx,
+          tskIDLE_PRIORITY + 3, NULL, 0);
+      } else {
+        // No laptop: start API immediately on pre-trigger frames
+        xTaskCreatePinnedToCore(apiCheckTask, "apiCheck",
+          16384, (void *)(intptr_t)archIdx,
+          tskIDLE_PRIORITY + 3, NULL, 0);
+      }
+    }
   }
 
   // === Auto-exposure probe: periodically sample camera's AEC to detect day/night ===
@@ -2137,10 +2735,13 @@ void loop() {
         appliedGain = gain;
         appliedAec = aec;
       } else {
-        // Day mode: use HDR bracket cycling
+        // Day mode: use HDR bracket cycling with clamped gain
+        // In daylight, high gain blows out the image even with short exposure.
+        // Cap gain at 4 to keep usable dynamic range.
         static int hdrIdx = 0;
         int step = hdrIdx % HDR_STEP_COUNT;
         int gain = hdrSteps[step].gain;
+        if (gain > 4) gain = 4;  // clamp gain for daylight
         int aec = (int)((long)autoBaseAec * hdrSteps[step].aec / AEC_LOW_DEFAULT);
         if (aec > 1200) aec = 1200;
         if (aec < 4) aec = 4;
@@ -2170,18 +2771,47 @@ void loop() {
         ringBuf[ringHead].aecApplied = (int16_t)appliedAec;
         ringHead = (ringHead + 1) % RING_SIZE;
         if (ringCount < RING_SIZE) ringCount++;
-        // Count down post-trigger frames, freeze when done
+        // Post-trigger: capture remaining frames, append to archive on each one
         if (postTriggerRemaining > 0) {
           postTriggerRemaining--;
-          if (postTriggerRemaining == 0) {
-            freezeRingToArchive();
-            if (burstArchiveCount > 0) {
-              int archIdx = burstArchiveCount - 1;
-              // Always use fallback: wait 5s for laptop result, then autonomous
-              xTaskCreatePinnedToCore(apiFallbackTask, "apiFallback",
-                16384, (void *)(intptr_t)archIdx,
-                tskIDLE_PRIORITY + 3, NULL, 0);
+          // Append this frame to the active archive (already created at trigger time)
+          if (burstArchiveCount > 0) {
+            BurstArchive &arch = burstArchives[burstArchiveCount - 1];
+            int prevIdx = (ringHead + RING_SIZE - 1) % RING_SIZE;
+            if (arch.count < RING_SIZE && ringBuf[prevIdx].buf) {
+              if (!isFrameBlownOut(ringBuf[prevIdx].buf, ringBuf[prevIdx].len)) {
+                int slot = arch.count;
+                arch.images[slot].buf = ringBuf[prevIdx].buf;
+                arch.images[slot].len = ringBuf[prevIdx].len;
+                arch.images[slot].captureMs = ringBuf[prevIdx].captureMs;
+                arch.images[slot].distanceMm = ringBuf[prevIdx].distanceMm;
+                arch.images[slot].gainApplied = ringBuf[prevIdx].gainApplied;
+                arch.images[slot].aecApplied = ringBuf[prevIdx].aecApplied;
+                if (ringBuf[prevIdx].captureMs > arch.lastFrameMs)
+                  arch.lastFrameMs = ringBuf[prevIdx].captureMs;
+                ringBuf[prevIdx].buf = NULL;  // ownership transferred
+                ringBuf[prevIdx].len = 0;
+                arch.count++;
+              } else {
+                Serial.printf("Burst: post-trigger frame blown out, skipping\n");
+                free(ringBuf[prevIdx].buf);
+                ringBuf[prevIdx].buf = NULL;
+                ringBuf[prevIdx].len = 0;
+              }
             }
+          }
+          if (postTriggerRemaining == 0) {
+            postTriggerCapturing = false;
+            burstCapturing = false;
+            burstCooldown = millis();
+            // Clean up remaining ring buffer
+            for (int i = 0; i < RING_SIZE; i++) {
+              if (ringBuf[i].buf) { free(ringBuf[i].buf); ringBuf[i].buf = NULL; }
+              ringBuf[i].len = 0; ringBuf[i].captureMs = 0;
+            }
+            ringCount = 0; ringHead = 0;
+            Serial.printf("Burst: post-trigger complete, total %d frames\n",
+              burstArchives[burstArchiveCount - 1].count);
           }
         }
       }

@@ -347,14 +347,12 @@ async def analyze_api_candidate(
     burst_dir: Path,
     frame_idx: int,
     frame_bgr: np.ndarray,
-    crop_box: dict,
-    motion_box: tuple | None,
+    cat_det: dict | None = None,
     *,
     save_debug: bool,
-    bg_bgr: np.ndarray | None = None,
 ) -> dict:
     """Run the prey API for a single candidate frame."""
-    api_image = prepare_api_image(frame_bgr, crop_box, motion_box, bg_bgr=bg_bgr)
+    api_image = prepare_api_image(frame_bgr, cat_det)
 
     if save_debug:
         debug_dir = burst_dir / "debug"
@@ -369,15 +367,16 @@ async def analyze_api_candidate(
         "latency_ms": api_result.get("latency_ms", 0),
         "error": api_result.get("error"),
         "image_bytes": len(api_image),
-        "crop_box": crop_box,  # passed through for annotation
     }
 
 
 # ── Burst analyzer ────────────────────────────────────────────────────
 
 def load_burst_frames(burst_dir: Path) -> list[np.ndarray]:
-    """Load all frame_XX.jpg files from a burst directory, sorted."""
+    """Load all frame_XX.jpg or fXX.jpg files from a burst directory, sorted."""
     paths = sorted(burst_dir.glob("frame_*.jpg"))
+    if not paths:
+        paths = sorted(burst_dir.glob("f[0-9][0-9].jpg"))
     frames = []
     for p in paths:
         img = cv2.imread(str(p))
@@ -389,6 +388,8 @@ def load_burst_frames(burst_dir: Path) -> list[np.ndarray]:
 def load_burst_meta(burst_dir: Path) -> dict | None:
     """Load burst timing metadata saved by burst_saver, if present."""
     meta_path = burst_dir / "burst_meta.json"
+    if not meta_path.exists():
+        meta_path = burst_dir / "meta.json"
     if not meta_path.exists():
         return None
     try:
@@ -563,44 +564,34 @@ def _process_one_frame(
 
 def prepare_api_image(
     frame_bgr: np.ndarray,
-    cat_det: dict | None,
-    motion_box: tuple | None,
-    max_size: int = 384,
-    *,
-    bg_bgr: np.ndarray | None = None,
+    cat_det: dict | None = None,
+    crop_size: int = 384,
 ) -> bytes:
-    """Crop the best region and encode as JPEG for the API.
+    """Crop a 384×384 scene region and encode as JPEG for the API.
 
-    Priority: YOLO cat box > motion ROI > full frame.
-    Target: ≤384×384 JPEG.
-    If bg_bgr is supplied, pixels that haven't changed vs the background are
-    blacked out — the resulting image has lower entropy and compresses better.
+    Matches the Raspberry Pi pipeline: send a natural scene crop, not a tight
+    bounding-box cutout.  When a YOLO cat detection is available the crop is
+    centred on the cat; otherwise the frame centre is used.
     """
-    # Background subtraction: zero-out static pixels to lower JPEG entropy
-    if bg_bgr is not None:
-        diff = cv2.absdiff(
-            cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY),
-            cv2.cvtColor(bg_bgr, cv2.COLOR_BGR2GRAY),
-        )
-        kernel = np.ones((5, 5), np.uint8)
-        motion_mask = cv2.dilate((diff > 20).astype(np.uint8), kernel).astype(bool)
-        frame_for_crop = frame_bgr.copy()
-        frame_for_crop[~motion_mask] = 0
-    else:
-        frame_for_crop = frame_bgr
+    h, w = frame_bgr.shape[:2]
 
+    # Determine centre of crop
     if cat_det:
-        crop = crop_with_padding(frame_for_crop, cat_det["x"], cat_det["y"], cat_det["w"], cat_det["h"], pad=0.20)
-    elif motion_box:
-        crop = crop_with_padding(frame_for_crop, *motion_box, pad=0.10)
+        cx = cat_det["x"] + cat_det["w"] // 2
+        cy = cat_det["y"] + cat_det["h"] // 2
     else:
-        crop = frame_for_crop
+        cx, cy = w // 2, h // 2
 
-    # Resize proportionally to fit within max_size
-    h, w = crop.shape[:2]
-    scale = min(max_size / w, max_size / h, 1.0)
-    if scale < 1.0:
-        crop = cv2.resize(crop, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+    # Horizontal crop (384 from frame width)
+    half = crop_size // 2
+    x0 = max(0, min(cx - half, w - crop_size))
+    x1 = x0 + min(crop_size, w)
+
+    # Vertical crop (384 from frame height)
+    y0 = max(0, min(cy - half, h - crop_size))
+    y1 = y0 + min(crop_size, h)
+
+    crop = frame_bgr[y0:y1, x0:x1]
 
     _, buf = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 90])
     return buf.tobytes()
@@ -667,6 +658,33 @@ def save_annotated(
     img.save(out_path, quality=92)
 
 
+def classify_direction_tof(frame_distances: list[int], min_valid: int = 3, min_mm: int = 30) -> str:
+    """Classify entering/exiting from per-frame ToF distances.
+
+    Returns 'entering' (distances decreasing), 'exiting' (increasing),
+    or 'unknown' (not enough data).
+    """
+    valid = [(i, d) for i, d in enumerate(frame_distances) if d >= min_mm]
+    if len(valid) < min_valid:
+        return "unknown"
+    # Linear trend: positive slope = exiting (farther), negative = entering (closer)
+    indices, dists = zip(*valid)
+    n = len(dists)
+    mean_i = sum(indices) / n
+    mean_d = sum(dists) / n
+    num = sum((i - mean_i) * (d - mean_d) for i, d in zip(indices, dists))
+    den = sum((i - mean_i) ** 2 for i in indices)
+    if den == 0:
+        return "unknown"
+    slope = num / den
+    # Require meaningful slope (>15mm/frame) to classify
+    if slope < -15:
+        return "entering"
+    if slope > 15:
+        return "exiting"
+    return "unknown"  # flat — cat sitting at the flap
+
+
 async def _run_decision_phase(
     burst_dir: Path,
     frames_bgr: list[np.ndarray],
@@ -729,6 +747,13 @@ async def _run_decision_phase(
         result["direction"] = "unknown"  # extreme angle — no face / body visible
         log.info("No cat face or body detected → direction unknown (extreme angle?)")
 
+    # ── ToF distance-based direction label ──
+    if burst_meta and "frame_distance_mm" in burst_meta:
+        tof_direction = classify_direction_tof(burst_meta["frame_distance_mm"])
+        result["tof_direction"] = tof_direction
+        if tof_direction != "unknown":
+            log.info("ToF direction: %s (visual direction: %s)", tof_direction, result["direction"])
+
     # ── Stage 2: Motion ROI ──
     t0 = time.perf_counter()
     grays = [cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) for f in frames_bgr]
@@ -740,8 +765,6 @@ async def _run_decision_phase(
         log.info("Motion ROI: x=%d y=%d %dx%d", *mbox)
 
     # ── Stage 3: Prey API on candidate frames ──
-    # Use frame 0 as static background for JPEG entropy reduction
-    bg_bgr = frames_bgr[0] if len(frames_bgr) > 1 else None
     batch_signal = "none"
     completed: list[dict] = []
     result["prey_detected"] = None
@@ -776,11 +799,11 @@ async def _run_decision_phase(
             log.info("SSIM dedup: skipped %d duplicate frame(s), sending %d", skipped_ssim, len(deduped_idxs))
         for frame_idx in deduped_idxs:
             fc = next(f for f in frame_candidates if f["frame"] == frame_idx)
-            crop_box = fc["cats"][0] if fc["cats"] else fc["faces"][0]
+            cat_det = fc["cats"][0] if fc["cats"] else None
             result["api_frames_checked"].append(frame_idx)
             api_tasks.append(analyze_api_candidate(
-                burst_dir, frame_idx, frames_bgr[frame_idx], crop_box, mbox,
-                save_debug=save_debug, bg_bgr=bg_bgr,
+                burst_dir, frame_idx, frames_bgr[frame_idx], cat_det,
+                save_debug=save_debug,
             ))
 
         # Fallback for unknown direction: send 2 middle-ish frames (no detections available)
@@ -793,7 +816,7 @@ async def _run_decision_phase(
                 result["api_frames_checked"].append(frame_idx)
                 api_tasks.append(analyze_api_candidate(
                     burst_dir, frame_idx, frames_bgr[frame_idx],
-                    None, mbox, save_debug=save_debug, bg_bgr=bg_bgr,
+                    save_debug=save_debug,
                 ))
             log.info("Unknown direction: sending frames %s to API (no detections)", idxs)
 
@@ -886,10 +909,6 @@ async def _run_decision_phase(
                 x, y, w, h = int(d["x"]*sx), int(d["y"]*sy), int(d["w"]*sx), int(d["h"]*sy)
                 draw.rectangle([x, y, x+w, y+h], outline=color, width=2)
             api_item = frame_api.get(fi)
-            if api_item and api_item.get("crop_box"):
-                cb = api_item["crop_box"]
-                x, y, w, h = int(cb["x"]*sx), int(cb["y"]*sy), int(cb["w"]*sx), int(cb["h"]*sy)
-                draw.rectangle([x, y, x+w, y+h], outline="magenta", width=2)
             api_result_str = "?"
             if api_item:
                 api_result_str = "PREY" if api_item.get("detected") else ("clear" if api_item.get("detected") is False else "err")
@@ -1144,10 +1163,13 @@ async def main():
         return
 
     # Single burst or scan all
-    if (target / "frame_00.jpg").exists():
+    if (target / "frame_00.jpg").exists() or (target / "f00.jpg").exists():
         burst_dirs = [target]
     else:
-        burst_dirs = sorted(p for p in target.iterdir() if p.is_dir() and (p / "frame_00.jpg").exists())
+        burst_dirs = sorted(
+            p for p in target.iterdir()
+            if p.is_dir() and ((p / "frame_00.jpg").exists() or (p / "f00.jpg").exists())
+        )
 
     results = []
     for bd in burst_dirs:
