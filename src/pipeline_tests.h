@@ -24,6 +24,8 @@ extern "C" {
  *           'E' full decode + crop right 128px + rotate + encode (480x512)
  *           'F' same as B but quality=60
  *           'H' JPG_SCALE_2X decode + encode (320x240, no rotate) — isolate rotate cost
+ *           'P' existing jpeg_api_preprocess (decode + rotate + encode)
+ *           'R' lossless DCT crop+rotate+drop-chroma (no IDCT/DCT)
  *
  * jpg/jpgLen:  Input JPEG (assumed grayscale, 640x480)
  * outLen:      [out] Output JPEG length

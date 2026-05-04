@@ -7,6 +7,7 @@
 
 #include "pipeline_tests.h"
 #include "jpeg_lossless_crop.h"
+#include "jpeg_lossless_rotate.h"
 #include "jpeg_api_preprocess.h"
 #include <string.h>
 #include <stdlib.h>
@@ -215,6 +216,12 @@ uint8_t *pipeline_run(int variant, const uint8_t *jpg, size_t jpgLen, size_t *ou
         case 'P': {
             /* Original jpeg_api_preprocess: half-scale decode + rotate + encode */
             return jpeg_api_preprocess(jpg, jpgLen, outLen, 80);
+        }
+        case 'R': {
+            /* Lossless DCT crop + rotate + drop chroma — no IDCT/DCT */
+            return jpeg_lossless_crop_rotate_gray(jpg, jpgLen,
+                                                  CROP_X, CROP_Y, CROP_SZ, CROP_SZ,
+                                                  outLen);
         }
         default:
             return NULL;
