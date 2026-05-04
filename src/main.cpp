@@ -519,6 +519,30 @@ static int apiResponseLen = 0;
 static int lastApiEspErr = 0;
 static int lastApiHttpStatus = 0;
 
+// ===== Concurrent API infrastructure =====
+#define API_CONCURRENT 1  // Sequential only (concurrent disabled)
+
+static EventGroupHandle_t apiEventGroup = NULL;
+#define API_PREY_BIT   BIT0
+#define API_DONE_BIT1  BIT1
+#define API_DONE_BIT2  BIT2
+#define API_DONE_BIT3  BIT3
+#define API_ALL_DONE   (API_DONE_BIT1 | API_DONE_BIT2 | API_DONE_BIT3)
+
+struct ApiTaskParam {
+  int frameIdx;
+  int archIdx;
+  uint8_t *prepBuf;
+  size_t prepLen;
+  int result;
+  unsigned long cropMs;
+  unsigned long b64Ms;
+  unsigned long tlsMs;
+  unsigned long postMs;
+  unsigned long totalMs;
+  EventBits_t doneBit;
+};
+
 // ===== Persistent TLS connection for prey API =====
 static WiFiClientSecure *tlsClient = NULL;
 static HTTPClient *httpApi = NULL;
@@ -1845,7 +1869,6 @@ a:hover{text-decoration:underline}
 <h1>SD Card Browser</h1>
 <div class='info' id='info'>Loading...</div>
 <div class='act'>
-<button class='danger' onclick='formatSD()'>Format SD</button>
 <button onclick='loadAll()'>Refresh</button>
 <button onclick='downloadAll()'>Download All</button>
 </div>
@@ -1915,7 +1938,6 @@ async function downloadAll(){
   }
   prog.textContent='All done!';setTimeout(()=>{prog.style.display='none';},2000);
 }
-async function formatSD(){if(!confirm('Delete ALL files on SD card?'))return;await fetch(B+'/cmd?formatsd=1');loadAll();}
 loadAll();
 </script></body></html>
 )rawhtml";
