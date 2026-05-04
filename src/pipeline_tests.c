@@ -240,6 +240,26 @@ uint8_t *pipeline_run(int variant, const uint8_t *jpg, size_t jpgLen, size_t *ou
             free(cropped);
             return out;
         }
+        case 'Q': {
+            /* Simulated QVGA: full lossless rotate, no crop.
+             * Caller must POST a 320x240 (or other small) JPEG.
+             * Determines src dimensions from SOF0.
+             */
+            /* Find SOF0 to get dims */
+            int w = 0, h = 0;
+            for (size_t k = 0; k + 9 < jpgLen; k++) {
+                if (jpg[k] == 0xFF && jpg[k + 1] == 0xC0) {
+                    h = (jpg[k + 5] << 8) | jpg[k + 6];
+                    w = (jpg[k + 7] << 8) | jpg[k + 8];
+                    break;
+                }
+            }
+            if (w == 0 || h == 0) return NULL;
+            /* Round dims down to MCU boundary if needed */
+            int cw = (w / 16) * 16;
+            int ch = (h / 8) * 8;
+            return jpeg_lossless_crop_rotate_gray(jpg, jpgLen, 0, 0, cw, ch, outLen);
+        }
         default:
             return NULL;
     }

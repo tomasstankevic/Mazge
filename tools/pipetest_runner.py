@@ -54,16 +54,19 @@ def get_pipe_output(host, variant, jpg_bytes):
 
 
 def call_prey_api(jpg_bytes, api_key):
-    """POST processed JPEG to prey API. Returns (detected_bool, raw_response)."""
+    """POST processed JPEG to prey API. Returns (detected, raw_response, elapsed_ms)."""
     b64 = base64.b64encode(jpg_bytes).decode()
+    t0 = time.perf_counter()
     r = requests.post(API_URL,
                       headers={"Content-Type": "application/json",
                                "Authorization": f"Bearer {api_key}"},
                       json={"image_base64": b64},
                       timeout=20)
-    r.raise_for_status()
+    elapsed_ms = (time.perf_counter() - t0) * 1000
+    if r.status_code != 200:
+        return None, {"http": r.status_code, "text": r.text[:80]}, elapsed_ms
     j = r.json()
-    return bool(j.get("detected", False)), j
+    return bool(j.get("detected", False)), j, elapsed_ms
 
 
 def main():
@@ -80,6 +83,9 @@ def main():
                     help="Save processed JPEGs to this directory")
     ap.add_argument("--frames", default=None,
                     help="Comma-separated frame indices to test (default: all)")
+    ap.add_argument("--qvga-input", action="store_true",
+                    help="Pre-resize VGA frames to QVGA (320x240) on host "
+                         "before sending to ESP")
     args = ap.parse_args()
 
     burst = Path(args.burst)
@@ -111,13 +117,21 @@ def main():
 
     for f in frames:
         jpg = f.read_bytes()
+        if args.qvga_input:
+            from PIL import Image
+            import io as _io
+            img = Image.open(_io.BytesIO(jpg)).resize((320, 240))
+            buf = _io.BytesIO()
+            # subsampling=1 -> 4:2:2 to match OV2640 output
+            img.save(buf, format="JPEG", quality=80, subsampling=1)
+            jpg = buf.getvalue()
         print(f"=== {f.name} ({len(jpg)} bytes) ===")
         for v in variants:
             try:
                 rj = run_pipe(args.host, v, jpg, args.iters)
             except Exception as e:
                 print(f"  {v}: ERROR {e}")
-                results[v].append((f.name, None, None, None))
+                results[v].append((f.name, None, None, None, None))
                 continue
             times_us = rj["times_us"]
             out_len = rj["out_lens"][-1] if rj["out_lens"] else 0
@@ -125,6 +139,7 @@ def main():
             min_us = min(times_us)
 
             hit = None
+            api_ms = None
             if args.api_verify or save_dir:
                 try:
                     out_bytes, _ = get_pipe_output(args.host, v, jpg)
@@ -132,22 +147,22 @@ def main():
                         out_path = save_dir / f"{f.stem}_{v}.jpg"
                         out_path.write_bytes(out_bytes)
                     if args.api_verify:
-                        hit, _ = call_prey_api(out_bytes, api_key)
+                        hit, _, api_ms = call_prey_api(out_bytes, api_key)
                 except Exception as e:
                     print(f"  {v}: out/API error: {e}")
 
             hit_str = ""
             if hit is not None:
                 hit_str = f" hit={'YES' if hit else 'no'}"
-            print(f"  {v}: med={med_us/1000:7.1f}ms min={min_us/1000:7.1f}ms "
-                  f"out={out_len:6}B{hit_str}")
-            results[v].append((f.name, med_us, out_len, hit))
+            api_str = f" api={api_ms:6.0f}ms" if api_ms is not None else ""
+            print(f"  {v}: prep={med_us/1000:6.1f}ms{api_str} out={out_len:6}B{hit_str}")
+            results[v].append((f.name, med_us, out_len, hit, api_ms))
 
     print()
-    print("=" * 70)
+    print("=" * 80)
     print(f"Summary (median across {len(frames)} frames)")
-    print("=" * 70)
-    print(f"{'Pipe':<5} {'Med ms':>10} {'Min ms':>10} {'Max ms':>10} "
+    print("=" * 80)
+    print(f"{'Pipe':<5} {'Prep ms':>10} {'API ms':>10} {'E2E ms':>10} "
           f"{'OutB med':>10} {'Hits':>8}")
     for v in variants:
         rows = results[v]
@@ -157,14 +172,17 @@ def main():
             continue
         meds = [r[1] for r in valid]
         outs = [r[2] for r in valid]
-        med_med = statistics.median(meds) / 1000
-        min_med = min(meds) / 1000
-        max_med = max(meds) / 1000
+        api_times = [r[4] for r in valid if r[4] is not None]
+        prep_med = statistics.median(meds) / 1000
         out_med = statistics.median(outs)
+        api_med = statistics.median(api_times) if api_times else 0
+        e2e_med = prep_med + api_med if api_times else prep_med
         hits = sum(1 for r in valid if r[3] is True)
         total_with_hit = sum(1 for r in valid if r[3] is not None)
         hits_str = f"{hits}/{total_with_hit}" if total_with_hit else "n/a"
-        print(f"{v:<5} {med_med:>10.1f} {min_med:>10.1f} {max_med:>10.1f} "
+        api_str = f"{api_med:>10.1f}" if api_times else f"{'-':>10}"
+        e2e_str = f"{e2e_med:>10.1f}" if api_times else f"{'-':>10}"
+        print(f"{v:<5} {prep_med:>10.1f} {api_str} {e2e_str} "
               f"{out_med:>10.0f} {hits_str:>8}")
 
     return 0

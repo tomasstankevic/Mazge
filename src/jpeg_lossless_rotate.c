@@ -396,7 +396,6 @@ uint8_t *jpeg_lossless_crop_rotate_gray(
     size_t *outLen)
 {
     *outLen = 0;
-    if (cropW != cropH) return NULL;             /* must be square for 90deg */
     if ((cropX % 16) || (cropY % 8)) return NULL;
     if ((cropW % 16) || (cropH % 8)) return NULL;
 
@@ -515,13 +514,24 @@ done_parse:
     int crop_mcu_y = cropY / mcu_h_px;
     int crop_mcu_cols = cropW / mcu_w_px;
     int crop_mcu_rows = cropH / mcu_h_px;
-    int N = cropW / 8;  /* output Y block grid is N x N (square) */
+    /* Y block grid in INPUT coords (within crop region):
+     *   width  Y_W = 2 * crop_mcu_cols (each MCU has 2 Y blocks horizontally)
+     *   height Y_H = crop_mcu_rows
+     * After 90 CCW rotation, OUTPUT block grid:
+     *   width  Y_W' = Y_H, height Y_H' = Y_W
+     */
+    int Y_W = 2 * crop_mcu_cols;       /* input Y blocks wide */
+    int Y_H = crop_mcu_rows;           /* input Y blocks tall */
+    int OUT_W = Y_H;                   /* output Y blocks wide */
+    int OUT_H = Y_W;                   /* output Y blocks tall */
+    int out_pix_w = cropH;             /* output image width  in pixels */
+    int out_pix_h = cropW;             /* output image height in pixels */
 
     /* ---- Allocate Y coefficient buffer in PSRAM ----
-     * Layout: y_blocks[by * N + bx] = int16_t[64] in natural order.
-     * For 384x384, N=48 -> 48*48*64*2 = 294912 bytes (~288 KB).
+     * Layout: y_blocks[by * Y_W + bx] = int16_t[64] in natural order.
+     * For 384x384, Y_W=Y_H=48 -> 48*48*64*2 = 294912 bytes (~288 KB).
      */
-    size_t y_buf_count = (size_t)N * N;
+    size_t y_buf_count = (size_t)Y_W * Y_H;
     int16_t *y_blocks = (int16_t *)heap_caps_malloc(
         y_buf_count * 64 * sizeof(int16_t),
         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -549,12 +559,12 @@ done_parse:
 
             /* 2 Y blocks (left, right) */
             int16_t *slot0 = in_y
-                ? &y_blocks[(by_dst * N + bx_dst) * 64]
+                ? &y_blocks[(by_dst * Y_W + bx_dst) * 64]
                 : scratch;
             if (decode_block(&br, &dc_y, y_dc_ht, y_ac_ht, slot0) < 0) goto fail;
 
             int16_t *slot1 = in_y
-                ? &y_blocks[(by_dst * N + bx_dst + 1) * 64]
+                ? &y_blocks[(by_dst * Y_W + bx_dst + 1) * 64]
                 : scratch;
             if (decode_block(&br, &dc_y, y_dc_ht, y_ac_ht, slot1) < 0) goto fail;
 
@@ -591,22 +601,22 @@ done_parse:
         if (write_seg(out, out_cap, &op, M_DQT, pl, sizeof(pl)) < 0) goto fail2;
     }
 
-    /* SOF0: 1 component, swapped dims would be needed if non-square,
-     * but we enforce square crop so dimensions stay the same.
+    /* SOF0: 1 component. After 90 deg rotation, dimensions are swapped:
+     * output width = cropH (input height), output height = cropW (input width).
      * Payload: prec(1) H(2) W(2) Nf(1) [Ci(1) HV(1) Tq(1)]*Nf
      * For 1 component: 6 + 3 = 9 bytes total.
      */
     {
         uint8_t pl[9];
-        pl[0] = 8;                      /* precision */
-        pl[1] = (uint8_t)(cropH >> 8);  /* height */
-        pl[2] = (uint8_t)(cropH & 0xFF);
-        pl[3] = (uint8_t)(cropW >> 8);  /* width */
-        pl[4] = (uint8_t)(cropW & 0xFF);
-        pl[5] = 1;                      /* Nf */
-        pl[6] = (uint8_t)y_id;          /* component id */
-        pl[7] = 0x11;                   /* h=1 v=1 */
-        pl[8] = 0x00;                   /* qt=0 */
+        pl[0] = 8;                          /* precision */
+        pl[1] = (uint8_t)(out_pix_h >> 8);  /* height */
+        pl[2] = (uint8_t)(out_pix_h & 0xFF);
+        pl[3] = (uint8_t)(out_pix_w >> 8);  /* width */
+        pl[4] = (uint8_t)(out_pix_w & 0xFF);
+        pl[5] = 1;                          /* Nf */
+        pl[6] = (uint8_t)y_id;              /* component id */
+        pl[7] = 0x11;                       /* h=1 v=1 */
+        pl[8] = 0x00;                       /* qt=0 */
         if (write_seg(out, out_cap, &op, M_SOF0, pl, 9) < 0) goto fail2;
     }
 
@@ -646,12 +656,14 @@ done_parse:
     bw_init(&bw, out + op, out_cap - op - 2);  /* leave room for EOI */
     int dc_pred = 0;
     int16_t rot_blk[64];
-    for (int by = 0; by < N; by++) {
-        for (int bx = 0; bx < N; bx++) {
-            /* output (bx, by) <- source (src_bx = N-1-by, src_by = bx) */
-            int src_bx = N - 1 - by;
-            int src_by = bx;
-            const int16_t *src_blk = &y_blocks[(src_by * N + src_bx) * 64];
+    /* Walk OUTPUT block grid (OUT_W x OUT_H).
+     * For 90 CCW: output (out_bx, out_by) <- input (src_bx = Y_W-1-out_by, src_by = out_bx)
+     */
+    for (int out_by = 0; out_by < OUT_H; out_by++) {
+        for (int out_bx = 0; out_bx < OUT_W; out_bx++) {
+            int src_bx = Y_W - 1 - out_by;
+            int src_by = out_bx;
+            const int16_t *src_blk = &y_blocks[(src_by * Y_W + src_bx) * 64];
             rotate90ccw_block(src_blk, rot_blk);
             int new_dc = encode_block(rot_blk, dc_pred, &bw, y_dc_ht, y_ac_ht);
             if (new_dc <= -1000000) goto fail2;
