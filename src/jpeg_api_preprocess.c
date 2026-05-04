@@ -27,17 +27,20 @@ typedef struct {
 /* Reader callback for esp_jpg_decode */
 static size_t jpg_reader(void *arg, size_t index, uint8_t *buf, size_t len) {
     DecodeCtx *ctx = (DecodeCtx *)arg;
+    if (index >= ctx->input_len) return 0;
     if (index + len > ctx->input_len) {
         len = ctx->input_len - index;
     }
-    memcpy(buf, ctx->input + index, len);
+    if (buf) memcpy(buf, ctx->input + index, len);
     return len;
 }
 
 /* Writer callback — receives decoded pixels in RGB888 blocks.
  * For grayscale JPEG, the decoder outputs RGB888 (R=G=B=Y).
- * We take just the first byte (R channel = luminance). */
+ * We take just the first byte (R channel = luminance).
+ * data == NULL during init phase (after header parse) — return true. */
 static bool jpg_writer(void *arg, uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint8_t *data) {
+    if (!data) return true;
     DecodeCtx *ctx = (DecodeCtx *)arg;
     for (int row = 0; row < h; row++) {
         int dst_y = y + row;

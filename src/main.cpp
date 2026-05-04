@@ -598,6 +598,7 @@ static bool ensureTlsConnection() {
 #define CROP_SZ 384   // output 384x384
 
 #include "jpeg_lossless_crop.h"
+#include "pipeline_tests.h"
 
 static uint8_t *cropJpegForApi(const uint8_t *jpgBuf, size_t jpgLen, size_t *outLen) {
   unsigned long t0 = millis();
@@ -1636,6 +1637,149 @@ static esp_err_t apitest_handler(httpd_req_t *req) {
   return httpd_resp_send(req, json, strlen(json));
 }
 
+// ===== Pipeline test endpoint =====
+// POST /pipetest?pipe=A|B|C|D|E|F|H&iters=N&out=0|1
+// Body: raw JPEG bytes (640x480 grayscale expected)
+// Response: JSON with timings (out=0) or processed JPEG (out=1, last iter)
+
+// Run pipeline on a dedicated high-stack task to avoid httpd stack overflow
+struct PipeTaskArg {
+  int variant;
+  const uint8_t *jpg;
+  size_t jpgLen;
+  int iters;
+  unsigned long *times_us;
+  size_t *out_lens;
+  uint8_t **lastOut;
+  size_t *lastOutLen;
+  TaskHandle_t caller;
+};
+
+static void pipeTaskFn(void *arg) {
+  PipeTaskArg *a = (PipeTaskArg *)arg;
+  uint8_t *lastOut = NULL;
+  for (int i = 0; i < a->iters; i++) {
+    if (lastOut) { free(lastOut); lastOut = NULL; }
+    int64_t t0 = esp_timer_get_time();
+    size_t outLen = 0;
+    uint8_t *out = pipeline_run(a->variant, a->jpg, a->jpgLen, &outLen);
+    int64_t t1 = esp_timer_get_time();
+    a->times_us[i] = (unsigned long)(t1 - t0);
+    a->out_lens[i] = outLen;
+    lastOut = out;
+    if (!out) break;
+  }
+  *a->lastOut = lastOut;
+  if (lastOut) *a->lastOutLen = a->out_lens[a->iters - 1];
+  xTaskNotifyGive(a->caller);
+  vTaskDelete(NULL);
+}
+
+static esp_err_t pipetest_handler(httpd_req_t *req) {
+  char query[64];
+  char val[16];
+  int variant = 'A';
+  int iters = 1;
+  int wantOut = 0;
+  int qlen = httpd_req_get_url_query_len(req) + 1;
+  if (qlen > 1 && qlen <= (int)sizeof(query)) {
+    httpd_req_get_url_query_str(req, query, sizeof(query));
+    if (httpd_query_key_value(query, "pipe", val, sizeof(val)) == ESP_OK) {
+      variant = (int)val[0];
+    }
+    if (httpd_query_key_value(query, "iters", val, sizeof(val)) == ESP_OK) {
+      iters = atoi(val);
+      if (iters < 1) iters = 1;
+      if (iters > 20) iters = 20;
+    }
+    if (httpd_query_key_value(query, "out", val, sizeof(val)) == ESP_OK) {
+      wantOut = atoi(val);
+    }
+  }
+
+  // Receive POST body (JPEG)
+  int contentLen = req->content_len;
+  if (contentLen <= 0 || contentLen > 200 * 1024) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad content length");
+    return ESP_FAIL;
+  }
+  uint8_t *jpgBuf = (uint8_t *)heap_caps_malloc(contentLen, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!jpgBuf) {
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "no psram");
+    return ESP_FAIL;
+  }
+  int received = 0;
+  while (received < contentLen) {
+    int r = httpd_req_recv(req, (char *)(jpgBuf + received), contentLen - received);
+    if (r <= 0) {
+      free(jpgBuf);
+      httpd_resp_send_err(req, HTTPD_408_REQ_TIMEOUT, "recv fail");
+      return ESP_FAIL;
+    }
+    received += r;
+  }
+
+  // Run pipeline iters times
+  unsigned long times_us[20] = {0};
+  size_t out_lens[20] = {0};
+  uint8_t *lastOut = NULL;
+  size_t lastOutLen = 0;
+  uint32_t freeHeapBefore = ESP.getFreeHeap();
+  uint32_t freePsramBefore = ESP.getFreePsram();
+
+  PipeTaskArg pa = {variant, jpgBuf, (size_t)contentLen, iters,
+                    times_us, out_lens, &lastOut, &lastOutLen,
+                    xTaskGetCurrentTaskHandle()};
+  // Use a large stack — esp_jpg_decode + fmt2jpg need significant stack
+  TaskHandle_t th = NULL;
+  BaseType_t rc = xTaskCreatePinnedToCore(pipeTaskFn, "pipetest", 32768,
+                                          &pa, tskIDLE_PRIORITY + 2, &th, 0);
+  if (rc != pdPASS) {
+    free(jpgBuf);
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "task create fail");
+    return ESP_FAIL;
+  }
+  // Wait up to 30s for task to finish
+  ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(30000));
+
+  if (wantOut && lastOut) {
+    httpd_resp_set_type(req, "image/jpeg");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    char hdr[32];
+    snprintf(hdr, sizeof(hdr), "%lu", times_us[iters - 1]);
+    httpd_resp_set_hdr(req, "X-Pipe-Time-Us", hdr);
+    snprintf(hdr, sizeof(hdr), "%u", (unsigned)lastOutLen);
+    httpd_resp_set_hdr(req, "X-Pipe-Out-Len", hdr);
+    httpd_resp_send(req, (const char *)lastOut, lastOutLen);
+    free(lastOut);
+    free(jpgBuf);
+    return ESP_OK;
+  }
+
+  if (lastOut) free(lastOut);
+
+  // Build JSON response
+  char json[1024];
+  int n = snprintf(json, sizeof(json),
+    "{\"pipe\":\"%c\",\"iters\":%d,\"input_len\":%d,"
+    "\"free_heap_before\":%u,\"free_psram_before\":%u,"
+    "\"times_us\":[",
+    variant, iters, contentLen, freeHeapBefore, freePsramBefore);
+  for (int i = 0; i < iters; i++) {
+    n += snprintf(json + n, sizeof(json) - n, "%s%lu", i ? "," : "", times_us[i]);
+  }
+  n += snprintf(json + n, sizeof(json) - n, "],\"out_lens\":[");
+  for (int i = 0; i < iters; i++) {
+    n += snprintf(json + n, sizeof(json) - n, "%s%u", i ? "," : "", (unsigned)out_lens[i]);
+  }
+  n += snprintf(json + n, sizeof(json) - n, "]}");
+
+  free(jpgBuf);
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  return httpd_resp_send(req, json, n);
+}
+
 static esp_err_t cmd_handler(httpd_req_t *req) {
   char buf[64];
   int len = httpd_req_get_url_query_len(req) + 1;
@@ -2314,6 +2458,13 @@ void startUIServer() {
       .handler = apitest_handler,
     };
     httpd_register_uri_handler(ui_httpd, &apitest_uri);
+    httpd_uri_t pipetest_uri = {
+      .uri = "/pipetest",
+      .method = HTTP_POST,
+      .handler = pipetest_handler,
+      .user_ctx = NULL
+    };
+    httpd_register_uri_handler(ui_httpd, &pipetest_uri);
     httpd_uri_t burststream_uri = {
       .uri = "/burststream",
       .method = HTTP_GET,
