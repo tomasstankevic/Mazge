@@ -223,6 +223,23 @@ uint8_t *pipeline_run(int variant, const uint8_t *jpg, size_t jpgLen, size_t *ou
                                                   CROP_X, CROP_Y, CROP_SZ, CROP_SZ,
                                                   outLen);
         }
+        case 'S': {
+            /* Two-stage: lossless crop FIRST (drops out-of-region MCUs from
+             * bitstream), THEN lossless rotate (only decodes the 384x384 region).
+             * Should be faster than R since rotate skips ~75% wasted decode work.
+             */
+            size_t cropped_len = 0;
+            uint8_t *cropped = jpeg_lossless_crop(jpg, jpgLen,
+                                                  CROP_X, CROP_Y, CROP_SZ, CROP_SZ,
+                                                  &cropped_len);
+            if (!cropped) return NULL;
+            /* Rotate input is now 384x384 starting at (0,0) */
+            uint8_t *out = jpeg_lossless_crop_rotate_gray(cropped, cropped_len,
+                                                          0, 0, CROP_SZ, CROP_SZ,
+                                                          outLen);
+            free(cropped);
+            return out;
+        }
         default:
             return NULL;
     }
