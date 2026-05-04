@@ -461,7 +461,9 @@ void saveBurstToSd(int archIdx) {
   for (int i = 0; i < arch.count; i++) {
     if (!arch.images[i].buf) continue;
     char fpath[64];
-    snprintf(fpath, sizeof(fpath), "%s/f%02d.jpg", dirPath, i);
+    unsigned long offsetMs = (arch.images[i].captureMs >= arch.firstFrameMs) ?
+      (arch.images[i].captureMs - arch.firstFrameMs) : 0;
+    snprintf(fpath, sizeof(fpath), "%s/f%02d_%04lums.jpg", dirPath, i, offsetMs);
     File f = SD_MMC.open(fpath, FILE_WRITE);
     if (f) {
       f.write(arch.images[i].buf, arch.images[i].len);
@@ -497,10 +499,12 @@ void saveBurstToSd(int archIdx) {
     mf.print("],\"images\":[");
     for (int i = 0; i < arch.count; i++) {
       if (i > 0) mf.print(",");
-      mf.printf("{\"f\":\"f%02d.jpg\",\"bytes\":%u,\"dist\":%d,\"gain\":%d,\"aec\":%d,\"ms\":%lu}",
-        i, (unsigned)arch.images[i].len,
+      unsigned long offsetMs = (arch.images[i].captureMs >= arch.firstFrameMs) ?
+        (arch.images[i].captureMs - arch.firstFrameMs) : 0;
+      mf.printf("{\"f\":\"f%02d_%04lums.jpg\",\"bytes\":%u,\"dist\":%d,\"gain\":%d,\"aec\":%d,\"ms\":%lu,\"offsetMs\":%lu}",
+        i, offsetMs, (unsigned)arch.images[i].len,
         arch.images[i].distanceMm, arch.images[i].gainApplied,
-        arch.images[i].aecApplied, arch.images[i].captureMs);
+        arch.images[i].aecApplied, arch.images[i].captureMs, offsetMs);
     }
     mf.print("]}");
     mf.close();
@@ -515,145 +519,7 @@ static int apiResponseLen = 0;
 static int lastApiEspErr = 0;
 static int lastApiHttpStatus = 0;
 
-// ===== Concurrent API infrastructure =====
-#define API_CONCURRENT 1  // Disabled concurrent — use sequential only for debugging
-
-static EventGroupHandle_t apiEventGroup = NULL;
-#define API_PREY_BIT   BIT0  // Any task found prey
-#define API_DONE_BIT1  BIT1  // Task 0 done
-#define API_DONE_BIT2  BIT2  // Task 1 done
-#define API_DONE_BIT3  BIT3  // Task 2 done
-#define API_ALL_DONE   (API_DONE_BIT1 | API_DONE_BIT2 | API_DONE_BIT3)
-
-struct ApiTaskParam {
-  int frameIdx;         // index into archive.images[]
-  int archIdx;          // archive index
-  uint8_t *prepBuf;    // preprocessed JPEG (caller allocates, task frees)
-  size_t prepLen;
-  int result;           // -1=error, 0=no prey, 1=prey
-  unsigned long cropMs;
-  unsigned long b64Ms;
-  unsigned long tlsMs;
-  unsigned long postMs;
-  unsigned long totalMs;
-  EventBits_t doneBit;  // which bit to set when done
-};
-
-// Independent API call — each task creates its own TLS connection
-static void concurrentApiTask(void *param) {
-  ApiTaskParam *p = (ApiTaskParam *)param;
-  unsigned long t0 = millis();
-  p->result = -1;
-
-  // Check if another task already found prey
-  if (xEventGroupGetBits(apiEventGroup) & API_PREY_BIT) {
-    if (p->prepBuf) free(p->prepBuf);
-    p->totalMs = millis() - t0;
-    xEventGroupSetBits(apiEventGroup, p->doneBit);
-    vTaskDelete(NULL);
-    return;
-  }
-
-  // Create independent TLS connection
-  WiFiClientSecure *client = new WiFiClientSecure();
-  if (!client) {
-    Serial.printf("API[%d]: client alloc failed\n", p->frameIdx);
-    if (p->prepBuf) free(p->prepBuf);
-    p->totalMs = millis() - t0;
-    xEventGroupSetBits(apiEventGroup, p->doneBit);
-    vTaskDelete(NULL);
-    return;
-  }
-  client->setInsecure();
-
-  HTTPClient *http = new HTTPClient();
-  http->setReuse(false);  // single-use connection
-  if (!http->begin(*client, PREY_API_URL)) {
-    Serial.printf("API[%d]: begin failed\n", p->frameIdx);
-    delete http; delete client;
-    if (p->prepBuf) free(p->prepBuf);
-    p->totalMs = millis() - t0;
-    xEventGroupSetBits(apiEventGroup, p->doneBit);
-    vTaskDelete(NULL);
-    return;
-  }
-  char authHeader[128];
-  snprintf(authHeader, sizeof(authHeader), "Bearer %s", PREY_API_KEY);
-  http->addHeader("Content-Type", "application/json");
-  http->addHeader("Authorization", authHeader);
-  http->setTimeout(15000);
-  unsigned long tt1 = millis();
-  p->tlsMs = tt1 - t0;
-
-  // Base64 encode
-  unsigned long tb0 = millis();
-  size_t b64Len = 0;
-  mbedtls_base64_encode(NULL, 0, &b64Len, p->prepBuf, p->prepLen);
-  char *b64Buf = (char *)ps_malloc(b64Len + 1);
-  if (!b64Buf) {
-    Serial.printf("API[%d]: b64 malloc failed\n", p->frameIdx);
-    http->end(); delete http; delete client;
-    free(p->prepBuf); p->prepBuf = NULL;
-    p->totalMs = millis() - t0;
-    xEventGroupSetBits(apiEventGroup, p->doneBit);
-    vTaskDelete(NULL);
-    return;
-  }
-  mbedtls_base64_encode((unsigned char *)b64Buf, b64Len + 1, &b64Len, p->prepBuf, p->prepLen);
-  b64Buf[b64Len] = 0;
-  free(p->prepBuf); p->prepBuf = NULL;
-
-  // Build JSON
-  size_t jsonLen = b64Len + 32;
-  char *jsonBody = (char *)ps_malloc(jsonLen);
-  if (!jsonBody) {
-    Serial.printf("API[%d]: json malloc failed\n", p->frameIdx);
-    free(b64Buf);
-    http->end(); delete http; delete client;
-    p->totalMs = millis() - t0;
-    xEventGroupSetBits(apiEventGroup, p->doneBit);
-    vTaskDelete(NULL);
-    return;
-  }
-  snprintf(jsonBody, jsonLen, "{\"image_base64\":\"%s\"}", b64Buf);
-  free(b64Buf);
-  unsigned long tb1 = millis();
-  p->b64Ms = tb1 - tb0;
-
-  // POST
-  unsigned long startMs = millis();
-  int httpCode = http->POST((uint8_t *)jsonBody, strlen(jsonBody));
-  free(jsonBody);
-  p->postMs = millis() - startMs;
-
-  if (httpCode == 200) {
-    String response = http->getString();
-    if (strstr(response.c_str(), "\"detected\":true") ||
-        strstr(response.c_str(), "\"detected\": true")) {
-      p->result = 1;
-      xEventGroupSetBits(apiEventGroup, API_PREY_BIT);
-      Serial.printf("API[%d]: *** PREY DETECTED *** (post=%lums)\n", p->frameIdx, p->postMs);
-    } else {
-      p->result = 0;
-    }
-  } else {
-    Serial.printf("API[%d]: HTTP %d (post=%lums)\n", p->frameIdx, httpCode, p->postMs);
-    p->result = -1;
-  }
-
-  http->end();
-  delete http;
-  client->stop();
-  delete client;
-
-  p->totalMs = millis() - t0;
-  Serial.printf("API[%d]: done b64=%lums tls=%lums post=%lums total=%lums result=%d\n",
-    p->frameIdx, p->b64Ms, p->tlsMs, p->postMs, p->totalMs, p->result);
-  xEventGroupSetBits(apiEventGroup, p->doneBit);
-  vTaskDelete(NULL);
-}
-
-// ===== Persistent TLS connection for prey API (used for sequential fallback) =====
+// ===== Persistent TLS connection for prey API =====
 static WiFiClientSecure *tlsClient = NULL;
 static HTTPClient *httpApi = NULL;
 static bool tlsConnected = false;
@@ -2498,8 +2364,8 @@ void setup() {
   }
   Serial.printf("\nConnected! IP: %s\n", WiFi.localIP().toString().c_str());
 
-  // NTP time sync
-  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+  // NTP time sync (CET/CEST)
+  configTzTime("CET-1CEST,M3.5.0,M10.5.0/3", "pool.ntp.org", "time.nist.gov");
   Serial.print("Waiting for NTP time");
   time_t now = 0;
   for (int i = 0; i < 20 && now < 1000000000; i++) {
@@ -2510,7 +2376,7 @@ void setup() {
   if (now > 1000000000) {
     struct tm ti;
     localtime_r(&now, &ti);
-    Serial.printf("\nNTP synced: %04d-%02d-%02d %02d:%02d:%02d UTC\n",
+    Serial.printf("\nNTP synced: %04d-%02d-%02d %02d:%02d:%02d CET/CEST\n",
       ti.tm_year+1900, ti.tm_mon+1, ti.tm_mday, ti.tm_hour, ti.tm_min, ti.tm_sec);
   } else {
     Serial.println("\nNTP sync failed, using uptime");
