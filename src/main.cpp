@@ -593,30 +593,33 @@ static bool ensureTlsConnection() {
 // All offsets MCU-aligned (16x8 for 4:2:2 YCbCr).
 // Crop region in original image: x=64..448, y=48..432.
 // Returns new JPEG in PSRAM (caller must free). Sets outLen. NULL on failure.
+// Output: 384x384 grayscale JPEG, rotated 90 CCW (camera mounted sideways).
 #define CROP_X  64    // left margin (64px, MCU-aligned)
 #define CROP_Y  48    // top margin  (48px, MCU-aligned)
 #define CROP_SZ 384   // output 384x384
 
 #include "jpeg_lossless_crop.h"
+#include "jpeg_lossless_rotate.h"
 #include "pipeline_tests.h"
 
 static uint8_t *cropJpegForApi(const uint8_t *jpgBuf, size_t jpgLen, size_t *outLen) {
   unsigned long t0 = millis();
   *outLen = 0;
-  Serial.printf("Crop: freeHeap=%u freePSRAM=%u jpgLen=%u\n",
-    ESP.getFreeHeap(), ESP.getFreePsram(), jpgLen);
 
-  uint8_t *result = jpeg_lossless_crop(jpgBuf, jpgLen,
+  // Lossless DCT crop + 90 CCW rotate + drop chroma — single pass, no IDCT/DCT.
+  // Validated to produce 6/10 hits on prey burst vs 1/10 for crop-only baseline.
+  // ~70ms on ESP32-S3 (vs ~324ms for decode-and-re-encode pipeline).
+  uint8_t *result = jpeg_lossless_crop_rotate_gray(jpgBuf, jpgLen,
     CROP_X, CROP_Y, CROP_SZ, CROP_SZ, outLen);
 
   unsigned long t1 = millis();
 
   if (!result) {
-    Serial.println("Crop: lossless crop failed");
+    Serial.println("Crop+Rot: lossless rotate failed");
     return NULL;
   }
 
-  Serial.printf("Crop: 640x480→384x384 JPEG %uB→%uB (lossless %lums)\n",
+  Serial.printf("Crop+Rot: 640x480→384x384 grayscale JPEG %uB→%uB (lossless %lums)\n",
     jpgLen, *outLen, t1 - t0);
   return result;
 }
