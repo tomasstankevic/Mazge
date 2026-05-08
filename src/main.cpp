@@ -3012,11 +3012,17 @@ void loop() {
     sensor_t *s = esp_camera_sensor_get();
     int appliedGain = -1, appliedAec = -1;
     if (s && pendingFreezeAtMs != 0 && frozenAec >= 0) {
-      // Burst-shift: keep exposure constant
+      // Burst-shift: keep exposure constant, but HALVE aec because the cat
+      // typically moves directly UNDER the IR illuminator during the shift
+      // window (face is closer to IR than ToF distance suggests, so IR
+      // reflection is much stronger). Empirical: full locked aec produced
+      // overexposed faces in late frames.
+      int aec = frozenAec / 2;
+      if (aec < 4) aec = 4;
       s->set_agc_gain(s, frozenGain);
-      s->set_aec_value(s, frozenAec);
+      s->set_aec_value(s, aec);
       appliedGain = frozenGain;
-      appliedAec = frozenAec;
+      appliedAec = aec;
     } else if (s && aecProbeState == 0) {
       if (autoBaseAec > nightAecThreshold) {
         // Night/IR mode: distance-based exposure.
