@@ -50,6 +50,10 @@ bool sdReady = false;
 // During lockout, manual "open" requests are blocked.
 #define DOOR_PIN 14
 #define PREY_LOCKOUT_MS (15UL * 60UL * 1000UL)  // 15 minutes
+// After a no-prey verdict, give the cat a re-try window where the door
+// stays open and triggers are ignored (no analysis, no door close). Lets
+// the cat back off and try again without the 7-second analysis delay.
+#define GREEN_LIGHT_MS (60UL * 1000UL)          // 1 minute
 // Number of frames in a burst that must independently flag prey before
 // triggering the lockout. Tuned via threshold_analysis.py:
 //   N=1 (early-exit): 100% recall, 46% precision (13 false closures)
@@ -65,12 +69,19 @@ bool sdReady = false;
 #define MAX_API_FRAMES 5
 volatile bool doorOpen = true;
 volatile unsigned long preyLockoutUntilMs = 0;  // millis() value; 0 = no lockout
+volatile unsigned long greenLightUntilMs = 0;   // millis() value; 0 = no green light
 
 static inline bool doorLockoutActive() {
   unsigned long now = millis();
   // Handle millis() wraparound: only active if `until` is in future and within window
   return preyLockoutUntilMs != 0 &&
          (long)(preyLockoutUntilMs - now) > 0;
+}
+
+static inline bool greenLightActive() {
+  unsigned long now = millis();
+  return greenLightUntilMs != 0 &&
+         (long)(greenLightUntilMs - now) > 0;
 }
 
 static void doorOpenNow(const char *reason) {
@@ -938,6 +949,7 @@ api_done:
   if (preyConfirmed) {
     preyLockoutUntilMs = millis() + PREY_LOCKOUT_MS;
     if (preyLockoutUntilMs == 0) preyLockoutUntilMs = 1;  // avoid sentinel
+    greenLightUntilMs = 0;  // clear any pending green light
     char reason[80];
     snprintf(reason, sizeof(reason),
              "prey on %d frames (>= %d) — 15 min lockout",
@@ -953,6 +965,13 @@ api_done:
     } else {
       doorOpenNow(preyFrameCount == 0 ? "no prey detected" : "below prey threshold");
     }
+    // Start green-light window: cat may retry within GREEN_LIGHT_MS without
+    // any door close on trigger. Lets the cat back off + retry without the
+    // 7s analysis delay each time.
+    greenLightUntilMs = millis() + GREEN_LIGHT_MS;
+    if (greenLightUntilMs == 0) greenLightUntilMs = 1;  // avoid sentinel
+    Serial.printf("Green light: door stays open on next %lus of triggers\n",
+                  GREEN_LIGHT_MS / 1000);
   }
 
   // Save all frames + meta to SD (deferred from freeze time)
@@ -1979,7 +1998,12 @@ static esp_err_t cmd_handler(httpd_req_t *req) {
   } else if (httpd_query_key_value(buf, "trigger", val, sizeof(val)) == ESP_OK) {
     // Fake trigger: simulate ToF detection for testing
     if (!burstCapturing && postTriggerRemaining == 0 && pendingFreezeAtMs == 0) {
-      doorCloseNow("trigger (fake)");  // close door immediately on trigger
+      if (greenLightActive()) {
+        unsigned long remain = (greenLightUntilMs - millis()) / 1000;
+        Serial.printf("Fake trigger: GREEN LIGHT (%lus left) \u2014 not closing door, still capturing\n", remain);
+      } else {
+        doorCloseNow("trigger (fake)");
+      }
       pendingBurstTriggerMs = millis();
       // Lock current exposure for the shift window so post-trigger frames
       // don't auto-brighten when ToF object leaves range.
@@ -2908,7 +2932,12 @@ void loop() {
   if (tofCloseCount >= 3 && !burstCapturing && postTriggerRemaining == 0
       && pendingFreezeAtMs == 0
       && (now - burstCooldown > (unsigned long)burstCooldownMs)) {
-    doorCloseNow("trigger (ToF)");  // close door immediately on trigger
+    if (greenLightActive()) {
+      unsigned long remain = (greenLightUntilMs - now) / 1000;
+      Serial.printf("ToF trigger: GREEN LIGHT (%lus left) \u2014 not closing door, still capturing\n", remain);
+    } else {
+      doorCloseNow("trigger (ToF)");
+    }
     pendingBurstTriggerMs = now;
     tofCloseCount = 0;
     sensor_t *s = esp_camera_sensor_get();
