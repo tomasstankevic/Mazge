@@ -587,7 +587,10 @@ static int lastApiEspErr = 0;
 static int lastApiHttpStatus = 0;
 
 // ===== Concurrent API infrastructure =====
-#define API_CONCURRENT 1  // Sequential only (concurrent disabled)
+// Pool of N persistent TLS clients, each owned by one worker task.
+// Frame work items pushed to a FreeRTOS queue; workers pull and process.
+// N=3 caused crashes (TLS heap pressure). N=2 is stable and gives ~1.75x speedup.
+#define N_API_WORKERS 2
 
 static EventGroupHandle_t apiEventGroup = NULL;
 #define API_PREY_BIT   BIT0
@@ -609,6 +612,26 @@ struct ApiTaskParam {
   unsigned long totalMs;
   EventBits_t doneBit;
 };
+
+// Work item for the concurrent worker pool
+struct ApiWorkItem {
+  int frameIdx;          // ring index of source frame
+  uint8_t *prepBuf;      // preprocessed JPEG (worker frees)
+  size_t prepLen;
+  unsigned long enqueueMs;
+};
+struct ApiResultItem {
+  int frameIdx;
+  int result;            // -1 err, 0 no prey, 1 prey
+  unsigned long b64Ms;
+  unsigned long tlsMs;
+  unsigned long postMs;
+  unsigned long totalMs;
+};
+
+static QueueHandle_t apiWorkQueue = NULL;     // ApiWorkItem
+static QueueHandle_t apiResultQueue = NULL;   // ApiResultItem
+static volatile bool apiWorkersRunning = false;
 
 // ===== Persistent TLS connection for prey API =====
 static WiFiClientSecure *tlsClient = NULL;
@@ -697,6 +720,152 @@ struct ApiTiming {
   unsigned long tlsMs;
   unsigned long postMs;
 };
+
+// ===== Per-worker TLS client (one per concurrent worker) =====
+// Each worker keeps a persistent WiFiClientSecure + HTTPClient pair. Workers
+// use these directly (instead of the shared tlsClient/httpApi).
+struct ApiWorker {
+  WiFiClientSecure *tls;
+  HTTPClient *http;
+  bool connected;
+  TaskHandle_t task;
+  int id;
+};
+static ApiWorker apiWorkers[N_API_WORKERS];
+
+static bool ensureWorkerTls(ApiWorker *w) {
+  if (w->connected && w->tls && w->tls->connected()) return true;
+  if (w->http) { w->http->end(); delete w->http; w->http = NULL; }
+  if (w->tls)  { w->tls->stop(); delete w->tls;  w->tls  = NULL; }
+  w->connected = false;
+
+  w->tls = new WiFiClientSecure();
+  if (!w->tls) return false;
+  w->tls->setInsecure();
+
+  w->http = new HTTPClient();
+  w->http->setReuse(true);
+  if (!w->http->begin(*w->tls, PREY_API_URL)) {
+    delete w->http; w->http = NULL;
+    delete w->tls;  w->tls  = NULL;
+    return false;
+  }
+  char authHeader[128];
+  snprintf(authHeader, sizeof(authHeader), "Bearer %s", PREY_API_KEY);
+  w->http->addHeader("Content-Type", "application/json");
+  w->http->addHeader("Authorization", authHeader);
+  w->http->addHeader("Connection", "keep-alive");
+  w->http->setTimeout(15000);
+  w->connected = true;
+  return true;
+}
+
+// Worker variant: call API using the worker's own TLS client.
+// Returns: -1=error, 0=no prey, 1=prey. Frees prepBuf.
+static int callPreyApiWithWorker(ApiWorker *w,
+                                  uint8_t *prepBuf, size_t prepLen,
+                                  ApiTiming *timing) {
+  // Base64 encode (PSRAM)
+  unsigned long tb0 = millis();
+  size_t b64Len = 0;
+  mbedtls_base64_encode(NULL, 0, &b64Len, prepBuf, prepLen);
+  char *b64Buf = (char *)ps_malloc(b64Len + 1);
+  if (!b64Buf) { free(prepBuf); return -1; }
+  mbedtls_base64_encode((unsigned char *)b64Buf, b64Len + 1, &b64Len, prepBuf, prepLen);
+  b64Buf[b64Len] = 0;
+  free(prepBuf);
+  size_t jsonLen = b64Len + 32;
+  char *jsonBody = (char *)ps_malloc(jsonLen);
+  if (!jsonBody) { free(b64Buf); return -1; }
+  snprintf(jsonBody, jsonLen, "{\"image_base64\":\"%s\"}", b64Buf);
+  free(b64Buf);
+  unsigned long tb1 = millis();
+
+  unsigned long tt0 = millis();
+  if (!ensureWorkerTls(w)) { free(jsonBody); return -1; }
+  unsigned long tt1 = millis();
+
+  unsigned long startMs = millis();
+  int httpCode = w->http->POST((uint8_t *)jsonBody, strlen(jsonBody));
+  free(jsonBody);
+  unsigned long elapsed = millis() - startMs;
+
+  if (timing) {
+    timing->b64Ms = tb1 - tb0;
+    timing->tlsMs = tt1 - tt0;
+    timing->postMs = elapsed;
+  }
+
+  if (httpCode <= 0) {
+    Serial.printf("API[w%d]: POST failed err=%d (%lums)\n", w->id, httpCode, elapsed);
+    w->connected = false;
+    return -1;
+  }
+  String response = w->http->getString();
+  if (httpCode != 200) {
+    Serial.printf("API[w%d]: HTTP %d in %lums\n", w->id, httpCode, elapsed);
+    return -1;
+  }
+  bool prey = response.indexOf("\"detected\":true") >= 0 ||
+              response.indexOf("\"detected\": true") >= 0;
+  Serial.printf("API[w%d]: %lums result=%d\n", w->id, elapsed, prey ? 1 : 0);
+  return prey ? 1 : 0;
+}
+
+// Worker task: drains apiWorkQueue, posts results to apiResultQueue.
+static void apiWorkerTask(void *arg) {
+  ApiWorker *w = (ApiWorker *)arg;
+  Serial.printf("API worker %d started\n", w->id);
+  while (apiWorkersRunning) {
+    ApiWorkItem item;
+    // Wait up to 100ms for work (so we can check apiWorkersRunning)
+    if (xQueueReceive(apiWorkQueue, &item, pdMS_TO_TICKS(100)) != pdPASS) {
+      continue;
+    }
+    if (item.frameIdx < 0) {
+      // Sentinel: stop signal
+      break;
+    }
+    unsigned long t0 = millis();
+    ApiTiming timing = {0, 0, 0};
+    int res = callPreyApiWithWorker(w, item.prepBuf, item.prepLen, &timing);
+    unsigned long total = millis() - t0;
+    ApiResultItem r = {item.frameIdx, res, timing.b64Ms, timing.tlsMs,
+                       timing.postMs, total};
+    xQueueSend(apiResultQueue, &r, portMAX_DELAY);
+  }
+  Serial.printf("API worker %d exiting\n", w->id);
+  vTaskDelete(NULL);
+}
+
+static void startApiWorkers() {
+  if (!apiWorkQueue) {
+    apiWorkQueue   = xQueueCreate(16, sizeof(ApiWorkItem));
+    apiResultQueue = xQueueCreate(16, sizeof(ApiResultItem));
+  }
+  if (apiWorkersRunning) return;
+  apiWorkersRunning = true;
+  for (int i = 0; i < N_API_WORKERS; i++) {
+    apiWorkers[i].id = i;
+    apiWorkers[i].task = NULL;
+    char name[16];
+    snprintf(name, sizeof(name), "apiw%d", i);
+    xTaskCreatePinnedToCore(apiWorkerTask, name, 8192,
+                             &apiWorkers[i],
+                             tskIDLE_PRIORITY + 2, &apiWorkers[i].task,
+                             /*core*/ 0);
+  }
+}
+
+static void stopApiWorkers() {
+  if (!apiWorkersRunning) return;
+  apiWorkersRunning = false;
+  // Push sentinels so workers wake up and exit
+  ApiWorkItem stop = {-1, NULL, 0, 0};
+  for (int i = 0; i < N_API_WORKERS; i++) {
+    xQueueSend(apiWorkQueue, &stop, pdMS_TO_TICKS(100));
+  }
+}
 
 // Send a JPEG frame to the prey API. If croppedJpg/croppedLen provided, skip cropping.
 // Returns: -1=error, 0=no prey, 1=prey
@@ -810,123 +979,99 @@ void autonomousApiCheck(int archIdx) {
   // Trying high-hit frames first reduces average latency to first prey detection.
   static const int order[RING_SIZE] = {8, 7, 9, 5, 6, 3, 4, 2, 1, 0};
   int orderCount = RING_SIZE;
-
-  // Create event group for concurrent signaling
-  if (!apiEventGroup) apiEventGroup = xEventGroupCreate();
-  xEventGroupClearBits(apiEventGroup, 0xFF);
-
-  // === Phase 1: Concurrent batch (first API_CONCURRENT available frames) ===
-  ApiTaskParam taskParams[API_CONCURRENT];
-  int concurrentCount = 0;
   int orderIdx = 0;
-  EventBits_t doneBits[] = {API_DONE_BIT1, API_DONE_BIT2, API_DONE_BIT3};
 
-  // Preprocess up to API_CONCURRENT frames (only immediately available — no waiting)
-  for (; orderIdx < orderCount && concurrentCount < API_CONCURRENT; orderIdx++) {
-    int i = order[orderIdx];
-    // Skip frames not yet available (post-trigger frames arrive later)
-    if (i >= archive.count || !archive.images[i].buf) continue;
+  // === Phase 2: Concurrent worker pool ===
+  // N_API_WORKERS persistent TLS clients run in parallel. We push up to
+  // MAX_API_FRAMES preprocessed frames to a queue and collect results.
+  // Early-exit when PREY_FRAMES_THRESHOLD prey-flagged frames received.
+  startApiWorkers();
+  // Drain any stale items from previous runs
+  ApiWorkItem dummy;
+  while (xQueueReceive(apiResultQueue, &dummy, 0) == pdPASS) {}
+  while (xQueueReceive(apiWorkQueue,   &dummy, 0) == pdPASS) {}
 
-    unsigned long ct0 = millis();
-    size_t croppedLen = 0;
-    uint8_t *cropped = cropJpegForApi(archive.images[i].buf, archive.images[i].len, &croppedLen);
-    unsigned long cropDt = millis() - ct0;
-    if (!cropped) continue;
-
-    taskParams[concurrentCount].frameIdx = i;
-    taskParams[concurrentCount].archIdx = archIdx;
-    taskParams[concurrentCount].prepBuf = cropped;
-    taskParams[concurrentCount].prepLen = croppedLen;
-    taskParams[concurrentCount].result = -1;
-    taskParams[concurrentCount].cropMs = cropDt;
-    taskParams[concurrentCount].b64Ms = 0;
-    taskParams[concurrentCount].tlsMs = 0;
-    taskParams[concurrentCount].postMs = 0;
-    taskParams[concurrentCount].totalMs = 0;
-    taskParams[concurrentCount].doneBit = doneBits[concurrentCount];
-    concurrentCount++;
-  }
-
-  Serial.printf("API: launching %d concurrent calls, freeHeap=%u freePSRAM=%u\n",
-    concurrentCount, ESP.getFreeHeap(), ESP.getFreePsram());
-
-  // TEMPORARY: Skip concurrent tasks for debugging — free prep buffers, go sequential
-  for (int t = 0; t < concurrentCount; t++) {
-    if (taskParams[t].prepBuf) { free(taskParams[t].prepBuf); taskParams[t].prepBuf = NULL; }
-  }
-  orderIdx = 0;  // Reset so sequential processes all frames
-  concurrentCount = 0;
-
-  // Wait for all concurrent tasks to finish (or prey found)
-  // (skipped — concurrent disabled for debugging)
-
-  // Record results from concurrent batch
-  for (int t = 0; t < concurrentCount; t++) {
-    int i = taskParams[t].frameIdx;
-    archive.apiResults[i] = taskParams[t].result;
-    archive.cropMs[i] = taskParams[t].cropMs;
-    archive.b64Ms[i] = taskParams[t].b64Ms;
-    archive.tlsMs[i] = taskParams[t].tlsMs;
-    archive.postMs[i] = taskParams[t].postMs;
-    archive.totalMs[i] = taskParams[t].totalMs;
-    archive.apiFramesSent++;
-    if (taskParams[t].result == 1) archive.apiPreyDetected = 1;
-  }
-
-  if (archive.apiPreyDetected) {
-    Serial.println("API: *** PREY in concurrent batch — done ***");
-    goto api_done;
-  }
-
-  // === Phase 2: Sequential remaining frames (reuse single TLS connection) ===
-  ensureTlsConnection();
   {
   int preySoFar = 0;
   int sentSoFar = 0;
-  for (; orderIdx < orderCount; orderIdx++) {
-    int i = order[orderIdx];
-    int waitMs = 0;
-    while (i >= archive.count && waitMs < 2000) {
-      vTaskDelay(50 / portTICK_PERIOD_MS);
-      waitMs += 50;
-    }
-    if (i >= archive.count || !archive.images[i].buf) continue;
+  int receivedSoFar = 0;
+  int inFlight = 0;
 
-    unsigned long frameT0 = millis();
-    unsigned long ct0 = millis();
-    size_t croppedLen = 0;
-    uint8_t *cropped = cropJpegForApi(archive.images[i].buf, archive.images[i].len, &croppedLen);
-    unsigned long cropDt = millis() - ct0;
+  // Keep pushing frames as long as we have capacity, frames left, and no
+  // threshold met. Receive results between pushes.
+  while (true) {
+    bool haveCapacity = (inFlight < N_API_WORKERS);
+    bool moreToSend  = (sentSoFar < MAX_API_FRAMES) && (orderIdx < orderCount);
+    bool thresholdHit = (preySoFar >= PREY_FRAMES_THRESHOLD);
 
-    ApiTiming timing = {0, 0, 0};
-    int result = callPreyApi(archive.images[i].buf, archive.images[i].len,
-                             cropped, croppedLen, &timing);
-    unsigned long frameDt = millis() - frameT0;
-    if (cropped) free(cropped);
-
-    archive.apiResults[i] = result;
-    archive.cropMs[i] = cropDt;
-    archive.b64Ms[i] = timing.b64Ms;
-    archive.tlsMs[i] = timing.tlsMs;
-    archive.postMs[i] = timing.postMs;
-    archive.totalMs[i] = frameDt;
-    archive.apiFramesSent++;
-    sentSoFar++;
-
-    if (result == 1) preySoFar++;
-    Serial.printf("API: frame[%d] crop=%lums total=%lums result=%d (preySoFar=%d/%d sent=%d/%d)\n",
-      i, cropDt, frameDt, result, preySoFar, PREY_FRAMES_THRESHOLD,
-      sentSoFar, MAX_API_FRAMES);
-
-    // Early-exit: stop as soon as we have enough prey to declare lockout.
-    if (preySoFar >= PREY_FRAMES_THRESHOLD) {
+    if (thresholdHit) {
       Serial.println("API: threshold reached \u2014 stopping early");
       break;
     }
-    // Hard cap on frames sent (analysis shows MAX_API_FRAMES=5 yields same
-    // recall as 10 with the optimal priority order).
-    if (sentSoFar >= MAX_API_FRAMES) {
-      Serial.println("API: max frames reached \u2014 stopping");
+
+    // Push a new frame if we have capacity and frames to send
+    if (haveCapacity && moreToSend) {
+      int i = order[orderIdx++];
+      if (i >= archive.count || !archive.images[i].buf) continue;
+
+      unsigned long ct0 = millis();
+      size_t croppedLen = 0;
+      uint8_t *cropped = cropJpegForApi(archive.images[i].buf,
+                                         archive.images[i].len, &croppedLen);
+      unsigned long cropDt = millis() - ct0;
+      if (!cropped) continue;
+      archive.cropMs[i] = cropDt;
+
+      ApiWorkItem w = {i, cropped, croppedLen, millis()};
+      if (xQueueSend(apiWorkQueue, &w, pdMS_TO_TICKS(100)) == pdPASS) {
+        inFlight++;
+        sentSoFar++;
+        archive.apiFramesSent++;
+        Serial.printf("API: queued frame[%d] (inFlight=%d, sent=%d/%d)\n",
+                      i, inFlight, sentSoFar, MAX_API_FRAMES);
+      } else {
+        free(cropped);
+        Serial.println("API: queue full, dropping frame");
+      }
+      continue;  // try to push more before blocking on receive
+    }
+
+    // Nothing more to push. If nothing in flight, we're done.
+    if (inFlight == 0) break;
+
+    // Block waiting for a result
+    ApiResultItem r;
+    if (xQueueReceive(apiResultQueue, &r, pdMS_TO_TICKS(20000)) != pdPASS) {
+      Serial.println("API: result wait timed out");
+      break;
+    }
+    inFlight--;
+    receivedSoFar++;
+    if (r.frameIdx >= 0 && r.frameIdx < RING_SIZE) {
+      archive.apiResults[r.frameIdx] = r.result;
+      archive.b64Ms[r.frameIdx]    = r.b64Ms;
+      archive.tlsMs[r.frameIdx]    = r.tlsMs;
+      archive.postMs[r.frameIdx]   = r.postMs;
+      archive.totalMs[r.frameIdx]  = r.totalMs;
+    }
+    if (r.result == 1) preySoFar++;
+    Serial.printf("API: got frame[%d] result=%d (preySoFar=%d/%d, recv=%d, inFlight=%d)\n",
+      r.frameIdx, r.result, preySoFar, PREY_FRAMES_THRESHOLD,
+      receivedSoFar, inFlight);
+  }
+
+  // Clean up any results still in flight (don't leak buffers)
+  // The workers themselves free prepBuf inside callPreyApiWithWorker, so we
+  // just drain remaining results without acting on them.
+  while (inFlight > 0) {
+    ApiResultItem r;
+    if (xQueueReceive(apiResultQueue, &r, pdMS_TO_TICKS(20000)) == pdPASS) {
+      inFlight--;
+      // Optionally record late results (cheap to do)
+      if (r.frameIdx >= 0 && r.frameIdx < RING_SIZE && archive.apiResults[r.frameIdx] == -1) {
+        archive.apiResults[r.frameIdx] = r.result;
+      }
+    } else {
       break;
     }
   }
