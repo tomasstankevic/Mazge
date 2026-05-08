@@ -38,6 +38,40 @@
 #define SD_D0   40
 bool sdReady = false;
 
+// ===== Cat door control (transistor on GPIO 14) =====
+// Door is normally OPEN: pin HIGH = open (default), pin LOW = closed.
+// Default state on boot is HIGH (door open) — set BEFORE pinMode(OUTPUT) to
+// avoid a brief low pulse during init that would slam the door shut.
+//
+// On a trigger (ToF or fake) we IMMEDIATELY close the door. After API
+// analysis completes:
+//   - prey detected on any frame  -> stay closed for PREY_LOCKOUT_MS (15 min)
+//   - no prey on any frame        -> reopen the door
+// During lockout, manual "open" requests are blocked.
+#define DOOR_PIN 14
+#define PREY_LOCKOUT_MS (15UL * 60UL * 1000UL)  // 15 minutes
+volatile bool doorOpen = true;
+volatile unsigned long preyLockoutUntilMs = 0;  // millis() value; 0 = no lockout
+
+static inline bool doorLockoutActive() {
+  unsigned long now = millis();
+  // Handle millis() wraparound: only active if `until` is in future and within window
+  return preyLockoutUntilMs != 0 &&
+         (long)(preyLockoutUntilMs - now) > 0;
+}
+
+static void doorOpenNow(const char *reason) {
+  digitalWrite(DOOR_PIN, HIGH);
+  doorOpen = true;
+  Serial.printf("Door: OPEN (%s)\n", reason);
+}
+
+static void doorCloseNow(const char *reason) {
+  digitalWrite(DOOR_PIN, LOW);
+  doorOpen = false;
+  Serial.printf("Door: CLOSED (%s)\n", reason);
+}
+
 // ===== TOF050C / VL6180X ToF sensor (raw I2C, 16-bit registers) =====
 #define TOF_SDA 47
 #define TOF_SCL 21
@@ -856,6 +890,19 @@ api_done:
     archive.apiFramesSent, archive.apiPreyDetected);
   archive.apiDoneMs = millis();
 
+  // Door logic: prey on any frame -> 15-min lockout; otherwise reopen.
+  if (archive.apiPreyDetected == 1) {
+    preyLockoutUntilMs = millis() + PREY_LOCKOUT_MS;
+    if (preyLockoutUntilMs == 0) preyLockoutUntilMs = 1;  // avoid sentinel
+    doorCloseNow("prey detected — 15 min lockout");
+  } else {
+    if (doorLockoutActive()) {
+      Serial.println("Door: stay closed (lockout still active)");
+    } else {
+      doorOpenNow("no prey detected");
+    }
+  }
+
   // Save all frames + meta to SD (deferred from freeze time)
   saveBurstToSd(archIdx);
 
@@ -938,10 +985,14 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   <p id="stats">Connecting...</p>
   <p id="sensor-line" style="font-size:1.1em;font-weight:bold;margin:4px 0 8px;">Distance: <span id="dist-val" style="color:#888;">--</span> | AEC: <span id="aec-val" style="color:#888;">--</span></p>
   <p id="mode-line" style="font-size:1em;margin:2px 0 6px;">Mode: <span id="mode-val" style="padding:2px 10px;border-radius:4px;font-weight:bold;">--</span></p>
-  <button id="toggle-stream" onclick="toggleStream()" style="margin:0 0 8px;padding:8px 20px;font-size:1em;cursor:pointer;border-radius:6px;border:none;background:#a44;color:#fff;">Start Stream</button>
-  <button onclick="fetch('/cmd?trigger=1')" style="margin:0 0 8px 8px;padding:8px 20px;font-size:1em;cursor:pointer;border-radius:6px;border:none;background:#c80;color:#fff;">Fake Trigger</button>
-  <a href="/settings" style="margin-left:8px;padding:8px 16px;font-size:0.9em;border-radius:6px;background:#335;color:#8af;text-decoration:none;display:inline-block;">⚙ Settings</a>
-  <a href="/sd" style="margin-left:8px;padding:8px 16px;font-size:0.9em;border-radius:6px;background:#253;color:#8fa;text-decoration:none;display:inline-block;">💾 SD Card</a>
+  <div style="display:flex;flex-wrap:wrap;gap:8px;justify-content:center;margin:0 0 8px;">
+    <button id="toggle-stream" onclick="toggleStream()" style="padding:8px 20px;font-size:1em;cursor:pointer;border-radius:6px;border:none;background:#a44;color:#fff;">Start Stream</button>
+    <button onclick="fetch('/cmd?trigger=1')" style="padding:8px 20px;font-size:1em;cursor:pointer;border-radius:6px;border:none;background:#c80;color:#fff;">Fake Trigger</button>
+    <button onclick="fetch('/cmd?door=1')" style="padding:8px 20px;font-size:1em;cursor:pointer;border-radius:6px;border:none;background:#284;color:#fff;">Open Door</button>
+    <button onclick="fetch('/cmd?door=0')" style="padding:8px 20px;font-size:1em;cursor:pointer;border-radius:6px;border:none;background:#822;color:#fff;">Close Door</button>
+    <a href="/settings" style="padding:8px 16px;font-size:0.9em;border-radius:6px;background:#335;color:#8af;text-decoration:none;display:inline-block;">⚙ Settings</a>
+    <a href="/sd" style="padding:8px 16px;font-size:0.9em;border-radius:6px;background:#253;color:#8fa;text-decoration:none;display:inline-block;">💾 SD Card</a>
+  </div>
   <div id="stream-wrap"><img id="stream" src="" onload="var w=this.naturalHeight,h=this.naturalWidth;this.parentElement.style.width=w+'px';this.parentElement.style.height=h+'px';this.style.width=h+'px';" /></div>
   <div id="events-section" style="width:100%;max-width:700px;margin-top:16px;">
     <h2 style="font-size:1.1em;margin:0 0 6px;">Events Log</h2>
@@ -1797,9 +1848,23 @@ static esp_err_t cmd_handler(httpd_req_t *req) {
 
   if (httpd_query_key_value(buf, "quality", val, sizeof(val)) == ESP_OK) {
     jpegQuality = atoi(val);
+  } else if (httpd_query_key_value(buf, "door", val, sizeof(val)) == ESP_OK) {
+    // /cmd?door=0 -> close, /cmd?door=1 -> open (manually overrides lockout)
+    int v = atoi(val);
+    if (v) {
+      if (doorLockoutActive()) {
+        unsigned long remain = (preyLockoutUntilMs - millis()) / 1000;
+        Serial.printf("Door: manual OPEN overriding lockout (%lus remaining)\n", remain);
+        preyLockoutUntilMs = 0;  // clear lockout on manual override
+      }
+      doorOpenNow("manual");
+    } else {
+      doorCloseNow("manual");
+    }
   } else if (httpd_query_key_value(buf, "trigger", val, sizeof(val)) == ESP_OK) {
     // Fake trigger: simulate ToF detection for testing
     if (!burstCapturing && postTriggerRemaining == 0) {
+      doorCloseNow("trigger (fake)");  // close door immediately on trigger
       burstCapturing = true;  // Block capture loop BEFORE setting postTrigger
       pendingBurstTriggerMs = millis();
       postTriggerRemaining = 0;  // DEBUG: skip post-trigger for now
@@ -2500,6 +2565,19 @@ void setup() {
   Serial.begin(115200);
   Serial.println();
 
+  // Initialize door control IMMEDIATELY: drive HIGH (open) before pinMode
+  // so the brief glitch at boot doesn't close the door.
+  digitalWrite(DOOR_PIN, HIGH);
+  pinMode(DOOR_PIN, OUTPUT);
+  digitalWrite(DOOR_PIN, HIGH);
+  doorOpen = true;
+  Serial.println("Door: opened (boot default)");
+
+  // Drive on-board WS2812 RGB LED to OFF (GPIO 48) to keep it dark.
+  // (The red power LED is hardwired and cannot be disabled in firmware.)
+  pinMode(48, OUTPUT);
+  digitalWrite(48, LOW);
+
   loadEventLog();
 
   Wire.begin(TOF_SDA, TOF_SCL);
@@ -2678,6 +2756,7 @@ void loop() {
   }
   if (tofCloseCount >= 3 && !burstCapturing && postTriggerRemaining == 0
       && (now - burstCooldown > (unsigned long)burstCooldownMs)) {
+    doorCloseNow("trigger (ToF)");  // close door immediately on trigger
     burstCapturing = true;  // Block capture loop BEFORE setting postTrigger
     pendingBurstTriggerMs = now;
     postTriggerRemaining = 0;  // DEBUG: skip post-trigger for now
