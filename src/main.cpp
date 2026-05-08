@@ -271,6 +271,15 @@ unsigned long pendingBurstTriggerMs = 0;
 
 // Post-trigger: capture N more frames after trigger before freezing
 #define POST_TRIGGER_FRAMES 5
+// Burst-shift delay: after a trigger, keep filling the ring buffer for this
+// many ms (so the latest frames in the burst are post-trigger frames where
+// the cat's body and prey are most visible). Empirical: prey hits peak at
+// f08/f09 (head past camera). Adding 200ms shifts so we capture 2 extra
+// post-trigger frames overwriting the 2 oldest pre-trigger ones.
+#define BURST_SHIFT_MS 200
+volatile unsigned long pendingFreezeAtMs = 0;  // 0 = no pending freeze
+volatile int frozenAec = -1;                   // exposure to lock during shift
+volatile int frozenGain = -1;
 int postTriggerRemaining = 0;  // >0 means we're in post-trigger phase
 
 // ===== Persistent event log (NVS) =====
@@ -1969,23 +1978,26 @@ static esp_err_t cmd_handler(httpd_req_t *req) {
     }
   } else if (httpd_query_key_value(buf, "trigger", val, sizeof(val)) == ESP_OK) {
     // Fake trigger: simulate ToF detection for testing
-    if (!burstCapturing && postTriggerRemaining == 0) {
+    if (!burstCapturing && postTriggerRemaining == 0 && pendingFreezeAtMs == 0) {
       doorCloseNow("trigger (fake)");  // close door immediately on trigger
-      burstCapturing = true;  // Block capture loop BEFORE setting postTrigger
       pendingBurstTriggerMs = millis();
-      postTriggerRemaining = 0;  // DEBUG: skip post-trigger for now
-      // Immediately freeze pre-trigger frames and start API
-      freezeRingToArchive();
-      if (burstArchiveCount > 0) {
-        int archIdx = burstArchiveCount - 1;
-        xTaskCreatePinnedToCore(apiCheckTask, "apiCheck",
-          16384, (void *)(intptr_t)archIdx,
-          tskIDLE_PRIORITY + 3, NULL, 0);
+      // Lock current exposure for the shift window so post-trigger frames
+      // don't auto-brighten when ToF object leaves range.
+      sensor_t *s = esp_camera_sensor_get();
+      if (s) {
+        frozenAec  = s->status.aec_value;
+        frozenGain = s->status.agc_gain;
       }
-      Serial.println("Fake trigger from web UI");
+      // Schedule freeze BURST_SHIFT_MS in the future. The capture loop will
+      // continue filling the ring during this window (overwriting the 2
+      // oldest entries with 2 new post-trigger frames). The capture loop
+      // owns the actual freeze + apiCheckTask launch (see below).
+      pendingFreezeAtMs = millis() + BURST_SHIFT_MS;
+      Serial.printf("Fake trigger: deferring freeze by %d ms (locked aec=%d gain=%d)\n",
+                    BURST_SHIFT_MS, frozenAec, frozenGain);
     } else {
-      Serial.printf("Fake trigger REJECTED: burstCapturing=%d postTrigger=%d\n",
-        burstCapturing, postTriggerRemaining);
+      Serial.printf("Fake trigger REJECTED: burstCapturing=%d postTrigger=%d pendingFreeze=%lu\n",
+        burstCapturing, postTriggerRemaining, pendingFreezeAtMs);
       httpd_resp_set_type(req, "text/plain");
       httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
       return httpd_resp_send(req, "BUSY", 4);
@@ -2894,29 +2906,20 @@ void loop() {
     tofCloseCount = 0;
   }
   if (tofCloseCount >= 3 && !burstCapturing && postTriggerRemaining == 0
+      && pendingFreezeAtMs == 0
       && (now - burstCooldown > (unsigned long)burstCooldownMs)) {
     doorCloseNow("trigger (ToF)");  // close door immediately on trigger
-    burstCapturing = true;  // Block capture loop BEFORE setting postTrigger
     pendingBurstTriggerMs = now;
-    postTriggerRemaining = 0;  // DEBUG: skip post-trigger for now
     tofCloseCount = 0;
-    // Immediately freeze pre-trigger frames and start API
-    freezeRingToArchive();
-    if (burstArchiveCount > 0) {
-      int archIdx = burstArchiveCount - 1;
-      bool laptopHere = (lastLaptopContactMs > 0) &&
-                        (now - lastLaptopContactMs < LAPTOP_TIMEOUT_MS);
-      if (laptopHere) {
-        xTaskCreatePinnedToCore(apiFallbackTask, "apiFallback",
-          16384, (void *)(intptr_t)archIdx,
-          tskIDLE_PRIORITY + 3, NULL, 0);
-      } else {
-        // No laptop: start API immediately on pre-trigger frames
-        xTaskCreatePinnedToCore(apiCheckTask, "apiCheck",
-          16384, (void *)(intptr_t)archIdx,
-          tskIDLE_PRIORITY + 3, NULL, 0);
-      }
+    sensor_t *s = esp_camera_sensor_get();
+    if (s) {
+      frozenAec  = s->status.aec_value;
+      frozenGain = s->status.agc_gain;
     }
+    pendingFreezeAtMs = now + BURST_SHIFT_MS;
+    Serial.printf("ToF trigger: deferring freeze by %d ms (locked aec=%d gain=%d)\n",
+                  BURST_SHIFT_MS, frozenAec, frozenGain);
+    // Note: apiCheckTask is launched after the deferred freeze (see capture loop).
   }
 
   // === Auto-exposure probe: periodically sample camera's AEC to detect day/night ===
@@ -2973,10 +2976,19 @@ void loop() {
   if (!burstCapturing && now - lastRing >= 100) { // ~10 fps ring buffer
     lastRing = now;
 
-    // Set exposure based on distance (night mode) or HDR bracket (day mode)
+    // Set exposure based on distance (night mode) or HDR bracket (day mode).
+    // EXCEPTION: during the post-trigger shift window, lock to the trigger-time
+    // exposure so frames captured after the cat passes the ToF don't suddenly
+    // brighten (which would otherwise blow them out and add motion blur).
     sensor_t *s = esp_camera_sensor_get();
     int appliedGain = -1, appliedAec = -1;
-    if (s && aecProbeState == 0) {
+    if (s && pendingFreezeAtMs != 0 && frozenAec >= 0) {
+      // Burst-shift: keep exposure constant
+      s->set_agc_gain(s, frozenGain);
+      s->set_aec_value(s, frozenAec);
+      appliedGain = frozenGain;
+      appliedAec = frozenAec;
+    } else if (s && aecProbeState == 0) {
       if (autoBaseAec > nightAecThreshold) {
         // Night/IR mode: distance-based exposure.
         // IR reflection follows inverse-square law: closer = brighter.
@@ -3076,6 +3088,31 @@ void loop() {
         }
       }
       esp_camera_fb_return(fb);
+    }
+  }
+
+  // === Deferred freeze: trigger asked for burst-shift, time elapsed → freeze ===
+  if (pendingFreezeAtMs != 0 && now >= pendingFreezeAtMs) {
+    Serial.printf("Burst-shift complete after %lu ms — freezing ring\n",
+                  now - (pendingFreezeAtMs - BURST_SHIFT_MS));
+    burstCapturing = true;        // block ring fill during freeze
+    pendingFreezeAtMs = 0;        // clear pending
+    frozenAec = -1;               // release exposure lock
+    frozenGain = -1;
+    freezeRingToArchive();
+    if (burstArchiveCount > 0) {
+      int archIdx = burstArchiveCount - 1;
+      bool laptopHere = (lastLaptopContactMs > 0) &&
+                        (now - lastLaptopContactMs < LAPTOP_TIMEOUT_MS);
+      if (laptopHere) {
+        xTaskCreatePinnedToCore(apiFallbackTask, "apiFallback",
+          16384, (void *)(intptr_t)archIdx,
+          tskIDLE_PRIORITY + 3, NULL, 0);
+      } else {
+        xTaskCreatePinnedToCore(apiCheckTask, "apiCheck",
+          16384, (void *)(intptr_t)archIdx,
+          tskIDLE_PRIORITY + 3, NULL, 0);
+      }
     }
   }
 }
