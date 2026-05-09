@@ -728,13 +728,25 @@ struct ApiWorker {
   WiFiClientSecure *tls;
   HTTPClient *http;
   bool connected;
+  unsigned long connectedAtMs;  // when this TLS session was opened
   TaskHandle_t task;
   int id;
 };
 static ApiWorker apiWorkers[N_API_WORKERS];
 
+// Force a fresh TLS connection if the existing one is older than this.
+// Long-idle TLS connections often get silently dropped by the server but
+// the client still thinks they are alive. 5 minutes is a reasonable balance.
+#define WORKER_TLS_MAX_AGE_MS (5UL * 60UL * 1000UL)
+
 static bool ensureWorkerTls(ApiWorker *w) {
-  if (w->connected && w->tls && w->tls->connected()) return true;
+  unsigned long now = millis();
+  bool tooOld = w->connected && (now - w->connectedAtMs > WORKER_TLS_MAX_AGE_MS);
+  if (w->connected && !tooOld && w->tls && w->tls->connected()) return true;
+  if (tooOld) {
+    Serial.printf("API[w%d]: TLS aged out (%lus), reconnecting\n",
+                  w->id, (now - w->connectedAtMs) / 1000);
+  }
   if (w->http) { w->http->end(); delete w->http; w->http = NULL; }
   if (w->tls)  { w->tls->stop(); delete w->tls;  w->tls  = NULL; }
   w->connected = false;
@@ -757,6 +769,7 @@ static bool ensureWorkerTls(ApiWorker *w) {
   w->http->addHeader("Connection", "keep-alive");
   w->http->setTimeout(15000);
   w->connected = true;
+  w->connectedAtMs = millis();
   return true;
 }
 
