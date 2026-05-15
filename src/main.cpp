@@ -14,6 +14,10 @@
 #include "SD_MMC.h"
 #include "secrets.h"
 
+// Blynk IoT (template defines are in secrets.h, must precede this include)
+#define BLYNK_PRINT Serial
+#include <BlynkSimpleEsp32.h>
+
 // ===== Freenove ESP32-S3 WROOM CAM pin map =====
 #define PWDN_GPIO_NUM  -1
 #define RESET_GPIO_NUM -1
@@ -54,6 +58,11 @@ bool sdReady = false;
 // stays open and triggers are ignored (no analysis, no door close). Lets
 // the cat back off and try again without the 7-second analysis delay.
 #define GREEN_LIGHT_MS (60UL * 1000UL)          // 1 minute
+// Rate-limit triggers to prevent the API pipeline from being overwhelmed:
+//   - During green-light: NO triggers (cat just passed, no prey)
+//   - During lockout:     at most 1 trigger per LOCKOUT_TRIGGER_INTERVAL_MS
+// (cat is locked out anyway, repeated analysis is wasteful).
+#define LOCKOUT_TRIGGER_INTERVAL_MS (2UL * 60UL * 1000UL)  // 2 minutes
 // Number of frames in a burst that must independently flag prey before
 // triggering the lockout. Tuned via threshold_analysis.py:
 //   N=1 (early-exit): 100% recall, 46% precision (13 false closures)
@@ -70,6 +79,8 @@ bool sdReady = false;
 volatile bool doorOpen = true;
 volatile unsigned long preyLockoutUntilMs = 0;  // millis() value; 0 = no lockout
 volatile unsigned long greenLightUntilMs = 0;   // millis() value; 0 = no green light
+volatile bool blynkDoorChanged = false;         // flag for Blynk door state update
+volatile unsigned long lastBurstTriggerMs = 0;  // millis() of most recent accepted trigger
 
 static inline bool doorLockoutActive() {
   unsigned long now = millis();
@@ -87,12 +98,14 @@ static inline bool greenLightActive() {
 static void doorOpenNow(const char *reason) {
   digitalWrite(DOOR_PIN, HIGH);
   doorOpen = true;
+  blynkDoorChanged = true;
   Serial.printf("Door: OPEN (%s)\n", reason);
 }
 
 static void doorCloseNow(const char *reason) {
   digitalWrite(DOOR_PIN, LOW);
   doorOpen = false;
+  blynkDoorChanged = true;
   Serial.printf("Door: CLOSED (%s)\n", reason);
 }
 
@@ -297,6 +310,7 @@ int postTriggerRemaining = 0;  // >0 means we're in post-trigger phase
 #define MAX_EVENTS 50
 struct EventEntry {
   uint32_t uptimeMs;   // millis() when result finalized
+  int32_t  epochSec;   // Unix epoch seconds (real clock)
   int16_t  gen;        // burst generation
   int8_t   frameCount; // number of frames in burst
   int8_t   result;     // -1=pending, 0=no prey, 1=prey
@@ -304,7 +318,7 @@ struct EventEntry {
   int16_t  distMax;    // max distance mm (-1 = unknown)
   uint8_t  mode;       // 0=laptop, 1=autonomous
   int8_t   trend;      // 0=unknown, 1=entering (far→close), 2=exiting (close→far), 3=passing
-}; // 13 bytes per entry
+}; // 17 bytes per entry
 Preferences nvsPrefs;
 EventEntry eventLog[MAX_EVENTS];
 int eventCount = 0;
@@ -360,6 +374,9 @@ void addEvent(int gen, int frameCount, int result, int distMin, int distMax, int
   }
   EventEntry &e = eventLog[eventCount];
   e.uptimeMs = millis();
+  time_t nowEpoch;
+  time(&nowEpoch);
+  e.epochSec = (int32_t)nowEpoch;
   e.gen = (int16_t)gen;
   e.frameCount = (int8_t)frameCount;
   e.result = (int8_t)result;
@@ -397,6 +414,109 @@ bool isFrameBlownOut(const uint8_t *jpgBuf, size_t jpgLen) {
 BurstImage ringBuf[RING_SIZE];
 int ringHead = 0;
 int ringCount = 0;
+
+// ===== Blynk IoT telemetry (event-driven only, no periodic polling) =====
+// Virtual pins:
+//   V0  = Enter or Exit (Integer: 1 on trigger, 0 when green light expires)
+//   V1  = Prey frames (Integer: cumulative prey-positive frames during lockout, 0 after)
+//   V2  = Chart — prey events counter (Integer, cumulative all-time)
+//   V3  = Datetime (String: detailed event summary)
+//   V4  = Lockout timer (Integer: remaining lockout minutes)
+//   V14 = Door open (Integer: 1=open, 0=closed; also button input)
+volatile int blynkPreyTotal = 0;       // all-time cumulative prey events (for chart)
+volatile int blynkLockoutPreyFrames = 0; // prey frames accumulated during current lockout
+volatile bool blynkEventPending = false; // flag to push event data
+volatile int blynkPendingPrey = 0;
+volatile int blynkPendingPreyFrames = 0;
+volatile int blynkPendingTotalFrames = 0;
+volatile unsigned long blynkPendingLatencyMs = 0;
+volatile bool blynkV0Active = false;    // V0 is currently 1 (cat present)
+volatile bool blynkLockoutWasActive = false; // track lockout→expired transition
+
+// Blynk button handler: user presses door button on dashboard
+BLYNK_WRITE(V14) {
+  int val = param.asInt();
+  if (val == 1) {
+    if (doorLockoutActive()) {
+      Serial.println("Blynk: door open requested but lockout active — overriding");
+      preyLockoutUntilMs = 0;  // clear lockout
+    }
+    doorOpenNow("Blynk dashboard");
+  } else {
+    doorCloseNow("Blynk dashboard");
+  }
+}
+
+// Reset pulse pins on (re)connect
+BLYNK_CONNECTED() {
+  Blynk.virtualWrite(V0, blynkV0Active ? 1 : 0);
+  Blynk.virtualWrite(V1, blynkLockoutPreyFrames);
+  Blynk.virtualWrite(V14, doorOpen ? 1 : 0);
+  unsigned long now = millis();
+  Blynk.virtualWrite(V4, doorLockoutActive() ?
+    (int)((preyLockoutUntilMs - now) / 60000UL) + 1 : 0);
+}
+
+// Called from door open/close to update door state pin (1 write per event)
+void blynkSendDoorState() {
+  if (!Blynk.connected()) return;
+  Blynk.virtualWrite(V14, doorOpen ? 1 : 0);
+  unsigned long now = millis();
+  int lockoutMin = 0;
+  if (doorLockoutActive()) {
+    lockoutMin = (int)((preyLockoutUntilMs - now) / 60000UL) + 1;
+  }
+  Blynk.virtualWrite(V4, lockoutMin);
+}
+
+// Called on trigger to set V0=1 immediately
+void blynkSetTriggerActive() {
+  blynkV0Active = true;
+  if (Blynk.connected()) Blynk.virtualWrite(V0, 1);
+}
+
+// Called from API result path to push event
+void blynkPushEvent(int preyDetected, int preyFrames, int totalFrames, unsigned long latencyMs) {
+  blynkPendingPrey = preyDetected;
+  blynkPendingPreyFrames = preyFrames;
+  blynkPendingTotalFrames = totalFrames;
+  blynkPendingLatencyMs = latencyMs;
+  if (preyDetected) {
+    blynkPreyTotal++;
+    blynkLockoutPreyFrames += preyFrames;
+  }
+  blynkEventPending = true;
+}
+
+void blynkSendPendingEvent() {
+  if (!blynkEventPending) return;
+  if (!Blynk.connected()) return;  // keep pending, retry next loop
+  blynkEventPending = false;
+  Blynk.virtualWrite(V1, blynkLockoutPreyFrames);
+  Blynk.virtualWrite(V2, blynkPreyTotal);
+  // V3: detailed event summary string
+  time_t now;
+  time(&now);
+  struct tm ti;
+  localtime_r(&now, &ti);
+  char detailBuf[80];
+  if (blynkPendingPrey) {
+    snprintf(detailBuf, sizeof(detailBuf),
+      "%02d:%02d PREY %d/%d frames %.1fs",
+      ti.tm_hour, ti.tm_min,
+      blynkPendingPreyFrames, blynkPendingTotalFrames,
+      blynkPendingLatencyMs / 1000.0f);
+  } else {
+    snprintf(detailBuf, sizeof(detailBuf),
+      "%02d:%02d Clear %.1fs",
+      ti.tm_hour, ti.tm_min,
+      blynkPendingLatencyMs / 1000.0f);
+  }
+  Blynk.virtualWrite(V3, detailBuf);
+  Blynk.virtualWrite(V14, doorOpen ? 1 : 0);
+  Blynk.virtualWrite(V4, doorLockoutActive() ?
+    (int)((preyLockoutUntilMs - millis()) / 60000UL) + 1 : 0);
+}
 
 void freezeRingToArchive() {
   burstCapturing = true;
@@ -670,7 +790,7 @@ static bool ensureTlsConnection() {
   httpApi->addHeader("Content-Type", "application/json");
   httpApi->addHeader("Authorization", authHeader);
   httpApi->addHeader("Connection", "keep-alive");
-  httpApi->setTimeout(15000);
+  httpApi->setTimeout(10000);  // 10s — keep total burst latency bounded
 
   tlsConnected = true;
   lastTlsConnectMs = millis();
@@ -767,7 +887,7 @@ static bool ensureWorkerTls(ApiWorker *w) {
   w->http->addHeader("Content-Type", "application/json");
   w->http->addHeader("Authorization", authHeader);
   w->http->addHeader("Connection", "keep-alive");
-  w->http->setTimeout(15000);
+  w->http->setTimeout(10000);  // 10s per call — bounds worst-case latency
   w->connected = true;
   w->connectedAtMs = millis();
   return true;
@@ -972,6 +1092,11 @@ static int callPreyApi(const uint8_t *jpgBuf, size_t jpgLen,
   return 0;
 }
 
+// Forward decls for the API watchdog (full definitions further below).
+extern volatile bool apiAbandonRequested;
+extern volatile uint32_t apiAbandonCount;
+#define API_TASK_DEADLINE_MS 30000
+
 // Send frames in priority order with concurrent first batch.
 // First API_CONCURRENT frames sent in parallel, then sequential if no prey found.
 void autonomousApiCheck(int archIdx) {
@@ -981,6 +1106,7 @@ void autonomousApiCheck(int archIdx) {
 
   archive.apiCallMs = millis();
   archive.apiPreyDetected = 0;
+  apiAbandonRequested = false;  // fresh task, clear any stale abandon flag
 
   Serial.printf("API: autonomous check, %d frames ready, archive %d (gen %d)\n",
     archive.count, archIdx, archive.generation);
@@ -1012,13 +1138,23 @@ void autonomousApiCheck(int archIdx) {
 
   // Keep pushing frames as long as we have capacity, frames left, and no
   // threshold met. Receive results between pushes.
+  unsigned long apiTaskBeganMs = millis();
   while (true) {
     bool haveCapacity = (inFlight < N_API_WORKERS);
     bool moreToSend  = (sentSoFar < MAX_API_FRAMES) && (orderIdx < orderCount);
     bool thresholdHit = (preySoFar >= PREY_FRAMES_THRESHOLD);
+    bool deadlineHit = (millis() - apiTaskBeganMs) > API_TASK_DEADLINE_MS;
 
     if (thresholdHit) {
       Serial.println("API: threshold reached \u2014 stopping early");
+      break;
+    }
+    if (apiAbandonRequested || deadlineHit) {
+      Serial.printf("API: ABANDON (%s) after %lums (sent=%d, recv=%d, prey=%d)\n",
+                    apiAbandonRequested ? "watchdog" : "deadline",
+                    millis() - apiTaskBeganMs,
+                    sentSoFar, receivedSoFar, preySoFar);
+      apiAbandonCount++;
       break;
     }
 
@@ -1054,9 +1190,12 @@ void autonomousApiCheck(int archIdx) {
 
     // Block waiting for a result
     ApiResultItem r;
-    if (xQueueReceive(apiResultQueue, &r, pdMS_TO_TICKS(20000)) != pdPASS) {
-      Serial.println("API: result wait timed out");
-      break;
+    if (xQueueReceive(apiResultQueue, &r, pdMS_TO_TICKS(2000)) != pdPASS) {
+      // Don't error — just loop back so the deadline/abandon check fires.
+      // Workers may take up to setTimeout() (10s) per call.
+      if ((millis() - apiTaskBeganMs) > API_TASK_DEADLINE_MS) continue;
+      Serial.println("API: still waiting for worker result...");
+      continue;
     }
     inFlight--;
     receivedSoFar++;
@@ -1075,18 +1214,21 @@ void autonomousApiCheck(int archIdx) {
 
   // Clean up any results still in flight (don't leak buffers)
   // The workers themselves free prepBuf inside callPreyApiWithWorker, so we
-  // just drain remaining results without acting on them.
-  while (inFlight > 0) {
+  // just drain remaining results without acting on them. Bounded wait so a
+  // hung worker can't pin this task forever.
+  unsigned long drainStart = millis();
+  while (inFlight > 0 && (millis() - drainStart) < 5000) {
     ApiResultItem r;
-    if (xQueueReceive(apiResultQueue, &r, pdMS_TO_TICKS(20000)) == pdPASS) {
+    if (xQueueReceive(apiResultQueue, &r, pdMS_TO_TICKS(1000)) == pdPASS) {
       inFlight--;
       // Optionally record late results (cheap to do)
       if (r.frameIdx >= 0 && r.frameIdx < RING_SIZE && archive.apiResults[r.frameIdx] == -1) {
         archive.apiResults[r.frameIdx] = r.result;
       }
-    } else {
-      break;
     }
+  }
+  if (inFlight > 0) {
+    Serial.printf("API: %d worker(s) still in flight after drain \u2014 leaving for next loop\n", inFlight);
   }
   }  // end Phase 2 scope
 
@@ -1144,12 +1286,51 @@ api_done:
   if (dMin > dMax) { dMin = -1; dMax = -1; }
   int trend = classifyDistTrend(archive);
   addEvent(archive.generation, archive.count, archive.apiPreyDetected, dMin, dMax, trend, true);
+
+  // Blynk: push event telemetry (prey result + detail)
+  unsigned long latencyMs = archive.apiDoneMs - archive.apiCallMs;
+  blynkPushEvent(archive.apiPreyDetected == 1 ? 1 : 0, preyFrameCount, archive.count, latencyMs);
+}
+
+// Guard: only one API task at a time (timestamp-based, auto-expires).
+// On expiry the watchdog also requests the in-flight task to abandon.
+volatile unsigned long apiTaskStartMs = 0;
+volatile bool apiAbandonRequested = false;          // signal to in-flight task to stop early
+volatile uint32_t apiAbandonCount = 0;              // total abandons since boot
+// API_TASK_DEADLINE_MS forward-declared above near autonomousApiCheck
+#define API_TASK_HARD_RESET_AFTER 5                 // consecutive abandons before reboot
+static inline bool apiTaskBusy() {
+  unsigned long start = apiTaskStartMs;
+  if (start == 0) return false;
+  if ((millis() - start) > (API_TASK_DEADLINE_MS + 15000)) {
+    apiTaskStartMs = 0;  // ultimate safety: clear stuck flag after deadline + grace
+    Serial.println("API: task flag stuck >45s, force-clearing");
+    return false;
+  }
+  return true;
+}
+
+// Force-tear down both the legacy shared TLS client and per-worker TLS clients.
+// Used by the watchdog after abandoning an in-flight analysis. The next call
+// will reconnect from scratch.
+static void resetAllApiConnections(const char *reason) {
+  Serial.printf("API: resetting TLS connections (%s)\n", reason);
+  tlsConnected = false;
+  if (httpApi)   { httpApi->end();   delete httpApi;   httpApi   = NULL; }
+  if (tlsClient) { tlsClient->stop(); delete tlsClient; tlsClient = NULL; }
+  for (int i = 0; i < N_API_WORKERS; i++) {
+    apiWorkers[i].connected = false;
+    if (apiWorkers[i].http) { apiWorkers[i].http->end();  delete apiWorkers[i].http; apiWorkers[i].http = NULL; }
+    if (apiWorkers[i].tls)  { apiWorkers[i].tls->stop();  delete apiWorkers[i].tls;  apiWorkers[i].tls  = NULL; }
+  }
 }
 
 // FreeRTOS task wrapper for autonomousApiCheck
 static void apiCheckTask(void *param) {
   int archIdx = (int)(intptr_t)param;
   autonomousApiCheck(archIdx);
+  if (!apiAbandonRequested) apiAbandonCount = 0;  // healthy completion
+  apiTaskStartMs = 0;
   vTaskDelete(NULL);
 }
 
@@ -1159,10 +1340,11 @@ static void apiFallbackTask(void *param) {
   unsigned long t0 = millis();
   // Wait up to apiFallbackMs for laptop to process first
   while (millis() - t0 < (unsigned long)apiFallbackMs) {
-    if (archIdx < 0 || archIdx >= burstArchiveCount) { vTaskDelete(NULL); return; }
+    if (archIdx < 0 || archIdx >= burstArchiveCount) { apiTaskStartMs = 0; vTaskDelete(NULL); return; }
     if (burstArchives[archIdx].apiPreyDetected != -1) {
       Serial.printf("API fallback: archive %d already processed (prey=%d), skipping\n",
         archIdx, burstArchives[archIdx].apiPreyDetected);
+      apiTaskStartMs = 0;
       vTaskDelete(NULL);
       return;
     }
@@ -1174,6 +1356,8 @@ static void apiFallbackTask(void *param) {
     Serial.printf("API fallback: laptop timeout, running autonomous check on archive %d\n", archIdx);
     autonomousApiCheck(archIdx);
   }
+  if (!apiAbandonRequested) apiAbandonCount = 0;  // healthy completion
+  apiTaskStartMs = 0;
   vTaskDelete(NULL);
 }
 
@@ -1855,12 +2039,16 @@ static esp_err_t stats_handler(httpd_req_t *req) {
     "\"burstArchives\":%d,\"burstGen\":%d,\"burstCounts\":%s,\"apiResults\":%s,\"burstGens\":%s,"
     "\"apiSent\":%s,\"triggerMs\":%s,\"apiDoneMs\":%s,\"distMin\":%s,\"distMax\":%s,"
     "\"laptopPresent\":%s,\"freePsram\":%u,\"uptimeMs\":%lu,"
-    "\"doorOpen\":%s,\"lockoutMs\":%lu}",
+    "\"doorOpen\":%s,\"lockoutMs\":%lu,"
+    "\"apiBusy\":%s,\"apiTaskAgeMs\":%lu,\"apiAbandons\":%u,\"lastTriggerMs\":%lu}",
     streamFps, lastFrameBytes, lastFrameMs, frameCount,
     tofDistance, alsLux, autoBaseAec, burstArchiveCount, burstGen, archBuf,
     apiResBuf, genBuf, sentBuf, trigBuf, apiDoneBuf, distMinBuf, distMaxBuf,
     laptopPresent2 ? "true" : "false", ESP.getFreePsram(), nowMs,
-    doorOpen ? "true" : "false", lockoutMsRemaining);
+    doorOpen ? "true" : "false", lockoutMsRemaining,
+    apiTaskStartMs ? "true" : "false",
+    apiTaskStartMs ? (nowMs - apiTaskStartMs) : 0UL,
+    (unsigned)apiAbandonCount, lastBurstTriggerMs);
   httpd_resp_set_type(req, "application/json");
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
   return httpd_resp_send(req, json, strlen(json));
@@ -2154,36 +2342,41 @@ static esp_err_t cmd_handler(httpd_req_t *req) {
       doorCloseNow("manual");
     }
   } else if (httpd_query_key_value(buf, "trigger", val, sizeof(val)) == ESP_OK) {
-    // Fake trigger: simulate ToF detection for testing
-    if (!burstCapturing && postTriggerRemaining == 0 && pendingFreezeAtMs == 0) {
-      if (greenLightActive()) {
-        unsigned long remain = (greenLightUntilMs - millis()) / 1000;
-        Serial.printf("Fake trigger: GREEN LIGHT (%lus left) \u2014 not closing door, still capturing\n", remain);
-      } else {
-        doorCloseNow("trigger (fake)");
-      }
-      pendingBurstTriggerMs = millis();
-      // Lock current exposure for the shift window so post-trigger frames
-      // don't auto-brighten when ToF object leaves range.
-      sensor_t *s = esp_camera_sensor_get();
-      if (s) {
-        frozenAec  = s->status.aec_value;
-        frozenGain = s->status.agc_gain;
-      }
-      // Schedule freeze BURST_SHIFT_MS in the future. The capture loop will
-      // continue filling the ring during this window (overwriting the 2
-      // oldest entries with 2 new post-trigger frames). The capture loop
-      // owns the actual freeze + apiCheckTask launch (see below).
-      pendingFreezeAtMs = millis() + BURST_SHIFT_MS;
-      Serial.printf("Fake trigger: deferring freeze by %d ms (locked aec=%d gain=%d)\n",
-                    BURST_SHIFT_MS, frozenAec, frozenGain);
-    } else {
-      Serial.printf("Fake trigger REJECTED: burstCapturing=%d postTrigger=%d pendingFreeze=%lu\n",
-        burstCapturing, postTriggerRemaining, pendingFreezeAtMs);
+    // Fake trigger: simulate ToF detection for testing.
+    // Honor the same rate limit as the ToF path.
+    unsigned long nowMs = millis();
+    bool busy   = burstCapturing || postTriggerRemaining != 0 || pendingFreezeAtMs != 0;
+    bool greenL = greenLightActive();
+    bool apiBz  = apiTaskBusy();
+    bool lockRL = doorLockoutActive() && lastBurstTriggerMs != 0 &&
+                  (nowMs - lastBurstTriggerMs) < LOCKOUT_TRIGGER_INTERVAL_MS;
+    if (busy || greenL || apiBz || lockRL) {
+      Serial.printf("Fake trigger REJECTED: busy=%d green=%d api=%d lockoutRL=%d\n",
+                    busy, greenL, apiBz, lockRL);
       httpd_resp_set_type(req, "text/plain");
       httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-      return httpd_resp_send(req, "BUSY", 4);
+      const char *why = busy ? "BUSY" : greenL ? "GREEN_LIGHT" :
+                        apiBz ? "API_BUSY" : "LOCKOUT_RATE_LIMIT";
+      return httpd_resp_send(req, why, strlen(why));
     }
+    doorCloseNow("trigger (fake)");
+    blynkSetTriggerActive();
+    lastBurstTriggerMs = nowMs;
+    pendingBurstTriggerMs = nowMs;
+    // Lock current exposure for the shift window so post-trigger frames
+    // don't auto-brighten when ToF object leaves range.
+    sensor_t *s = esp_camera_sensor_get();
+    if (s) {
+      frozenAec  = s->status.aec_value;
+      frozenGain = s->status.agc_gain;
+    }
+    // Schedule freeze BURST_SHIFT_MS in the future. The capture loop will
+    // continue filling the ring during this window (overwriting the 2
+    // oldest entries with 2 new post-trigger frames). The capture loop
+    // owns the actual freeze + apiCheckTask launch (see below).
+    pendingFreezeAtMs = millis() + BURST_SHIFT_MS;
+    Serial.printf("Fake trigger: deferring freeze by %d ms (locked aec=%d gain=%d)\n",
+                  BURST_SHIFT_MS, frozenAec, frozenGain);
   } else if (httpd_query_key_value(buf, "brightness", val, sizeof(val)) == ESP_OK) {
     s->set_brightness(s, atoi(val));
   } else if (httpd_query_key_value(buf, "contrast", val, sizeof(val)) == ESP_OK) {
@@ -2500,32 +2693,74 @@ static esp_err_t sdlist_handler(httpd_req_t *req) {
     if (sub) sub.close();
   } else {
     File root = SD_MMC.open("/");
-    File entry = root.openNextFile();
-    while (entry) {
+    int dirCount = 0;
+    while (true) {
+      File entry = root.openNextFile();
+      if (!entry) break;
       if (entry.isDirectory()) {
-        File sub = SD_MMC.open(entry.path());
-        File sf = sub.openNextFile();
-        while (sf) {
-          if (!sf.isDirectory()) {
-            int len = snprintf(entry_buf, sizeof(entry_buf), "%s\"%s/%s\"",
-              first ? "" : ",", entry.name(), sf.name());
-            httpd_resp_send_chunk(req, entry_buf, len);
-            first = false;
+        const char *eName = entry.name();
+        char ePath[64];
+        snprintf(ePath, sizeof(ePath), "/%s", eName);
+        entry.close();
+        File sub = SD_MMC.open(ePath);
+        if (sub) {
+          while (true) {
+            File sf = sub.openNextFile();
+            if (!sf) break;
+            if (!sf.isDirectory()) {
+              int len = snprintf(entry_buf, sizeof(entry_buf), "%s\"%s/%s\"",
+                first ? "" : ",", eName, sf.name());
+              httpd_resp_send_chunk(req, entry_buf, len);
+              first = false;
+            }
+            sf.close();
           }
-          sf = sub.openNextFile();
+          sub.close();
         }
-        sub.close();
+        dirCount++;
+        if (dirCount % 10 == 0) vTaskDelay(1);  // yield to prevent WDT
       } else {
         int len = snprintf(entry_buf, sizeof(entry_buf), "%s\"%s\"",
           first ? "" : ",", entry.name());
         httpd_resp_send_chunk(req, entry_buf, len);
         first = false;
+        entry.close();
       }
-      entry = root.openNextFile();
     }
     root.close();
   }
 
+  httpd_resp_send_chunk(req, "]}", -1);
+  httpd_resp_send_chunk(req, NULL, 0);
+  return ESP_OK;
+}
+
+// Lightweight: return only top-level folder names (no file enumeration)
+static esp_err_t sdfolders_handler(httpd_req_t *req) {
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  if (!sdReady) {
+    httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"SD not mounted\"}");
+    return ESP_OK;
+  }
+  httpd_resp_send_chunk(req, "{\"ok\":true,\"folders\":[", -1);
+  File root = SD_MMC.open("/");
+  bool first = true;
+  char buf[80];
+  int count = 0;
+  while (true) {
+    File entry = root.openNextFile();
+    if (!entry) break;
+    if (entry.isDirectory()) {
+      int len = snprintf(buf, sizeof(buf), "%s\"%s\"", first ? "" : ",", entry.name());
+      httpd_resp_send_chunk(req, buf, len);
+      first = false;
+      count++;
+    }
+    entry.close();
+    if (count % 20 == 0) vTaskDelay(1);  // yield to prevent WDT
+  }
+  root.close();
   httpd_resp_send_chunk(req, "]}", -1);
   httpd_resp_send_chunk(req, NULL, 0);
   return ESP_OK;
@@ -2599,13 +2834,13 @@ static esp_err_t getevents_handler(httpd_req_t *req) {
   unsigned long nowMs = millis();
   int hdrLen = snprintf(hdr, sizeof(hdr), "{\"epoch\":%ld,\"uptimeMs\":%lu,\"events\":[", (long)nowEpoch, nowMs);
   httpd_resp_send_chunk(req, hdr, hdrLen);
-  char buf[128];
+  char buf[160];
   for (int i = 0; i < eventCount; i++) {
     EventEntry &e = eventLog[i];
     int len = snprintf(buf, sizeof(buf),
-      "%s{\"t\":%lu,\"ago\":%lu,\"gen\":%d,\"nf\":%d,\"res\":%d,\"dMin\":%d,\"dMax\":%d,\"mode\":%d,\"trend\":%d}",
+      "%s{\"t\":%lu,\"epoch\":%ld,\"ago\":%lu,\"gen\":%d,\"nf\":%d,\"res\":%d,\"dMin\":%d,\"dMax\":%d,\"mode\":%d,\"trend\":%d}",
       i > 0 ? "," : "",
-      e.uptimeMs, (nowMs > e.uptimeMs) ? (nowMs - e.uptimeMs) : 0,
+      e.uptimeMs, (long)e.epochSec, (nowMs > e.uptimeMs) ? (nowMs - e.uptimeMs) : 0,
       e.gen, e.frameCount, e.result, e.distMin, e.distMax, e.mode, e.trend);
     httpd_resp_send_chunk(req, buf, len);
   }
@@ -2885,6 +3120,8 @@ void startUIServer() {
     httpd_register_uri_handler(ui_httpd, &sdinfo_uri);
     httpd_uri_t sdlist_uri = { .uri = "/sdlist", .method = HTTP_GET, .handler = sdlist_handler, .user_ctx = NULL };
     httpd_register_uri_handler(ui_httpd, &sdlist_uri);
+    httpd_uri_t sdfolders_uri = { .uri = "/sdfolders", .method = HTTP_GET, .handler = sdfolders_handler, .user_ctx = NULL };
+    httpd_register_uri_handler(ui_httpd, &sdfolders_uri);
     httpd_uri_t sdget_uri = { .uri = "/sdget", .method = HTTP_GET, .handler = sdget_handler, .user_ctx = NULL };
     httpd_register_uri_handler(ui_httpd, &sdget_uri);
     httpd_uri_t sdbrowser_uri = { .uri = "/sd", .method = HTTP_GET, .handler = sdbrowser_handler, .user_ctx = NULL };
@@ -2978,6 +3215,18 @@ void setup() {
   // Value is in 0.25dBm units. 78 = 19.5dBm (near max of 20dBm).
   esp_wifi_set_max_tx_power(78);
 
+  // Blynk IoT: connect using already-established WiFi (no Blynk.begin!)
+  Blynk.config(BLYNK_AUTH_TOKEN);
+  Blynk.connect();
+  // Set initial states so dashboard doesn't show stale values
+  if (Blynk.connected()) {
+    Blynk.virtualWrite(V0, 0);
+    Blynk.virtualWrite(V1, 0);
+    Blynk.virtualWrite(V14, doorOpen ? 1 : 0);
+    Blynk.virtualWrite(V4, 0);
+  }
+  Serial.println("Blynk: configured (event-driven only)");
+
   // FIX 4: Both servers now use esp_http_server (own RTOS tasks)
   startUIServer();
   startStreamServer();
@@ -3039,6 +3288,66 @@ void loop() {
     lastOTA = now;
     ArduinoOTA.handle();
   }
+
+  // Blynk: run connection handler (non-blocking)
+  Blynk.run();
+  blynkSendPendingEvent();
+
+  // === API watchdog ============================================
+  // If an analysis task has been running >API_TASK_DEADLINE_MS without
+  // setting apiTaskStartMs back to 0, ask it to abandon and tear down all
+  // TLS connections so the next burst starts fresh. After
+  // API_TASK_HARD_RESET_AFTER consecutive abandons (TCP/TLS likely wedged),
+  // perform a soft reboot for a clean recovery.
+  {
+    unsigned long apiStart = apiTaskStartMs;
+    static unsigned long lastWatchdogActionMs = 0;
+    if (apiStart != 0 && (now - apiStart) > API_TASK_DEADLINE_MS &&
+        !apiAbandonRequested && (now - lastWatchdogActionMs) > 10000) {
+      Serial.printf("API WATCHDOG: task running %lums > %dms \u2014 requesting abandon\n",
+                    now - apiStart, API_TASK_DEADLINE_MS);
+      apiAbandonRequested = true;
+      lastWatchdogActionMs = now;
+      resetAllApiConnections("watchdog abandon");
+      if (apiAbandonCount >= API_TASK_HARD_RESET_AFTER) {
+        Serial.printf("API WATCHDOG: %u consecutive abandons \u2014 rebooting for clean recovery\n",
+                      (unsigned)apiAbandonCount);
+        delay(200);
+        ESP.restart();
+      }
+    }
+  }
+  // =============================================================
+
+  // Blynk: send door state on change
+  if (blynkDoorChanged) {
+    blynkDoorChanged = false;
+    blynkSendDoorState();
+  }
+
+  // Blynk: V0 — reset to 0 when green light expires (cat no longer "present")
+  if (blynkV0Active && !greenLightActive() && !burstCapturing && !apiTaskBusy() && !doorLockoutActive()) {
+    blynkV0Active = false;
+    if (Blynk.connected()) Blynk.virtualWrite(V0, 0);
+  }
+
+  // Blynk: V1 — reset prey frame count to 0 when lockout expires
+  if (blynkLockoutWasActive && !doorLockoutActive()) {
+    blynkLockoutWasActive = false;
+    if (Blynk.connected()) Blynk.virtualWrite(V1, 0);
+    blynkLockoutPreyFrames = 0;
+  }
+  if (doorLockoutActive()) blynkLockoutWasActive = true;
+
+  // Blynk: update lockout timer once per minute while active
+  static unsigned long lastBlynkLockout = 0;
+  if (doorLockoutActive() && now - lastBlynkLockout >= 60000) {
+    lastBlynkLockout = now;
+    if (Blynk.connected()) {
+      Blynk.virtualWrite(V4, (int)((preyLockoutUntilMs - now) / 60000UL) + 1);
+    }
+  }
+
   static unsigned long lastTof = 0;
   static unsigned long lastValidTof = now; // watchdog: last time we got a valid reading
   if (tofReady && now - lastTof >= 1) { // poll as fast as possible
@@ -3090,23 +3399,50 @@ void loop() {
   if (tofCloseCount >= 3 && !burstCapturing && postTriggerRemaining == 0
       && pendingFreezeAtMs == 0
       && (now - burstCooldown > (unsigned long)burstCooldownMs)) {
+    // Rate-limit gates: skip trigger entirely if green light is active or
+    // if API is still chewing on the previous burst, or if we're in lockout
+    // and the last trigger was less than LOCKOUT_TRIGGER_INTERVAL_MS ago.
     if (greenLightActive()) {
-      unsigned long remain = (greenLightUntilMs - now) / 1000;
-      Serial.printf("ToF trigger: GREEN LIGHT (%lus left) \u2014 not closing door, still capturing\n", remain);
+      static unsigned long lastGreenSkipLog = 0;
+      if (now - lastGreenSkipLog > 5000) {
+        unsigned long remain = (greenLightUntilMs - now) / 1000;
+        Serial.printf("ToF trigger SKIPPED: GREEN LIGHT (%lus left)\n", remain);
+        lastGreenSkipLog = now;
+      }
+      tofCloseCount = 0;  // reset so we don't immediately re-fire
+    } else if (apiTaskBusy()) {
+      static unsigned long lastApiSkipLog = 0;
+      if (now - lastApiSkipLog > 5000) {
+        Serial.println("ToF trigger SKIPPED: API analysis still in progress");
+        lastApiSkipLog = now;
+      }
+      tofCloseCount = 0;
+    } else if (doorLockoutActive() && lastBurstTriggerMs != 0 &&
+               (now - lastBurstTriggerMs) < LOCKOUT_TRIGGER_INTERVAL_MS) {
+      static unsigned long lastLockoutSkipLog = 0;
+      if (now - lastLockoutSkipLog > 10000) {
+        unsigned long sinceLast = (now - lastBurstTriggerMs) / 1000;
+        Serial.printf("ToF trigger SKIPPED: lockout rate-limit (last trigger %lus ago, min %lus)\n",
+                      sinceLast, LOCKOUT_TRIGGER_INTERVAL_MS / 1000);
+        lastLockoutSkipLog = now;
+      }
+      tofCloseCount = 0;
     } else {
       doorCloseNow("trigger (ToF)");
+      blynkSetTriggerActive();
+      lastBurstTriggerMs = now;
+      pendingBurstTriggerMs = now;
+      tofCloseCount = 0;
+      sensor_t *s = esp_camera_sensor_get();
+      if (s) {
+        frozenAec  = s->status.aec_value;
+        frozenGain = s->status.agc_gain;
+      }
+      pendingFreezeAtMs = now + BURST_SHIFT_MS;
+      Serial.printf("ToF trigger: deferring freeze by %d ms (locked aec=%d gain=%d)\n",
+                    BURST_SHIFT_MS, frozenAec, frozenGain);
+      // Note: apiCheckTask is launched after the deferred freeze (see capture loop).
     }
-    pendingBurstTriggerMs = now;
-    tofCloseCount = 0;
-    sensor_t *s = esp_camera_sensor_get();
-    if (s) {
-      frozenAec  = s->status.aec_value;
-      frozenGain = s->status.agc_gain;
-    }
-    pendingFreezeAtMs = now + BURST_SHIFT_MS;
-    Serial.printf("ToF trigger: deferring freeze by %d ms (locked aec=%d gain=%d)\n",
-                  BURST_SHIFT_MS, frozenAec, frozenGain);
-    // Note: apiCheckTask is launched after the deferred freeze (see capture loop).
   }
 
   // === Auto-exposure probe: periodically sample camera's AEC to detect day/night ===
@@ -3295,16 +3631,24 @@ void loop() {
     freezeRingToArchive();
     if (burstArchiveCount > 0) {
       int archIdx = burstArchiveCount - 1;
-      bool laptopHere = (lastLaptopContactMs > 0) &&
-                        (now - lastLaptopContactMs < LAPTOP_TIMEOUT_MS);
-      if (laptopHere) {
-        xTaskCreatePinnedToCore(apiFallbackTask, "apiFallback",
-          16384, (void *)(intptr_t)archIdx,
-          tskIDLE_PRIORITY + 3, NULL, 0);
+      if (apiTaskBusy()) {
+        Serial.printf("API: skipping archive %d (task already running)\n", archIdx);
+        burstArchives[archIdx].apiPreyDetected = 0;
+        burstArchives[archIdx].apiDoneMs = millis();
       } else {
-        xTaskCreatePinnedToCore(apiCheckTask, "apiCheck",
-          16384, (void *)(intptr_t)archIdx,
-          tskIDLE_PRIORITY + 3, NULL, 0);
+        apiTaskStartMs = millis();
+        if (apiTaskStartMs == 0) apiTaskStartMs = 1;
+        bool laptopHere = (lastLaptopContactMs > 0) &&
+                          (now - lastLaptopContactMs < LAPTOP_TIMEOUT_MS);
+        if (laptopHere) {
+          xTaskCreatePinnedToCore(apiFallbackTask, "apiFallback",
+            16384, (void *)(intptr_t)archIdx,
+            tskIDLE_PRIORITY + 3, NULL, 0);
+        } else {
+          xTaskCreatePinnedToCore(apiCheckTask, "apiCheck",
+            16384, (void *)(intptr_t)archIdx,
+            tskIDLE_PRIORITY + 3, NULL, 0);
+        }
       }
     }
   }
