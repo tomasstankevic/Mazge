@@ -52,6 +52,47 @@ PREY_FRAMES_THRESHOLD = 2
 # 0.4 means "40% as confident as a hard label" — use as sample weight in BCE.
 BURST_PROP_CONFIDENCE = 0.4
 
+
+def load_human_burst_labels(jsonl_path: Path) -> dict[str, dict]:
+    """Read labels.jsonl and collapse to per-burst human + YOLO verdicts.
+
+    Returns: {burst_id: {
+        "prey":      (label, confidence),
+        "direction": (label, confidence),
+        "subject":   (label, confidence),  # human override of YOLO
+        "yolo_subject_per_frame": {image_id: int},
+    }}
+    Last record per (burst, kind) wins. Confidence 0 means "unclear".
+    """
+    out: dict[str, dict] = {}
+    if not jsonl_path.exists():
+        return out
+    with jsonl_path.open() as f:
+        for line in f:
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            src = rec.get("source", "")
+            image_id = rec.get("image_id", "")
+            parts = image_id.split("/")
+            if len(parts) < 4 or parts[0] != "captures" or parts[1] != "sd":
+                continue
+            burst_id = parts[2]
+            entry = out.setdefault(burst_id, {})
+            if src.startswith("human:"):
+                kind = src.split(":")[-1]  # "burst_prey" / "burst_direction" / "burst_subject"
+                if kind == "burst_prey":
+                    entry["prey"] = (rec.get("label"), rec.get("confidence"))
+                elif kind == "burst_direction":
+                    entry["direction"] = (rec.get("label"), rec.get("confidence"))
+                elif kind == "burst_subject":
+                    entry["subject"] = (rec.get("label"), rec.get("confidence"))
+            elif src == "model:yolo11n_subject_v1":
+                yolo_map = entry.setdefault("yolo_subject_per_frame", {})
+                yolo_map[image_id] = rec.get("label")
+    return out
+
 # Train/val/test split ratios by burst (NOT by frame — frames in the same
 # burst are highly correlated and must stay together to avoid leakage).
 SPLIT_RATIOS = {"train": 0.80, "val": 0.10, "test": 0.10}
@@ -84,6 +125,30 @@ def load_json(p: Path) -> dict | None:
         return None
 
 
+def _majority_yolo_subject(yolo_per_frame: dict[str, int],
+                            images: list[dict],
+                            burst_id: str) -> str:
+    """Aggregate per-frame YOLO subject labels to a single burst-level value."""
+    SUBJ_STR_LOCAL = {0: "empty", 1: "cat", 2: "human", 3: "other"}
+    counts = {0: 0, 1: 0, 2: 0, 3: 0}
+    for img in images:
+        name = img.get("f")
+        if not name:
+            continue
+        iid = f"captures/sd/{burst_id}/{name}"
+        v = yolo_per_frame.get(iid)
+        if v in counts:
+            counts[v] += 1
+    nonempty = {k: v for k, v in counts.items() if k != 0 and v > 0}
+    if nonempty:
+        # Tie-break by priority: cat > human > other (lower id = higher priority)
+        best = max(nonempty.items(), key=lambda kv: (kv[1], -kv[0]))[0]
+        return SUBJ_STR_LOCAL[best]
+    if counts[0] > 0:
+        return SUBJ_STR_LOCAL[0]
+    return ""
+
+
 def is_night(meta_image: dict) -> bool:
     """Heuristic: high AEC (long exposure) + non-trivial gain == IR/night mode.
     Frames where the firmware locked exposure (aec=-1) inherit night status
@@ -97,11 +162,12 @@ def is_night(meta_image: dict) -> bool:
     return aec >= 150 and gain >= 8
 
 
-def build_frame_rows(burst_dir: Path) -> tuple[list[dict], dict | None, dict | None]:
-    """Return (frame_rows, burst_summary, raw_records_to_emit_to_labels_log).
+def build_frame_rows(burst_dir: Path,
+                     human: dict | None) -> tuple[list[dict], dict | None, list[dict]]:
+    """Return (frame_rows, burst_summary, label_records_to_emit).
 
-    raw_records is a list of (image_id, source, label, confidence, ts, notes)
-    tuples that should be appended to labels.jsonl if not already present.
+    `human` is the per-burst human verdict dict from load_human_burst_labels()
+    (or None if no human label exists for this burst).
     """
     burst_id = burst_dir.name
     meta = load_json(burst_dir / "meta.json")
@@ -130,6 +196,12 @@ def build_frame_rows(burst_dir: Path) -> tuple[list[dict], dict | None, dict | N
     split = burst_split(burst_id)
     rows: list[dict] = []
     label_records: list[dict] = []
+
+    # Pull YOLO per-frame subject map from the human dict early so the row
+    # loop below can attach it to each row.
+    yolo_subject_per_frame: dict[str, int] = (
+        (human or {}).get("yolo_subject_per_frame", {})
+    )
 
     for i, img in enumerate(images):
         fname = img.get("f")
@@ -187,6 +259,15 @@ def build_frame_rows(burst_dir: Path) -> tuple[list[dict], dict | None, dict | N
             #   weak_confidence  — sample weight: 1.0 for hard labels, 0.4 for propagated
             "weak_label": "",      # filled in below after the loop knows burst verdict
             "weak_confidence": "", # filled in below
+            # Human burst-level verdicts (filled in below):
+            "human_prey": "",          # "" / 0 / 1 / unclear
+            "human_direction": "",     # "" / entering / exiting / unclear
+            "human_subject": "",       # "" / empty / cat / human / other / unclear
+            # Per-frame YOLO subject auto-label (0 empty, 1 cat, 2 human, 3 other):
+            "yolo_subject": yolo_subject_per_frame.get(image_id, ""),
+            # Best-available subject label for THIS frame:
+            #   human burst-level (if confident) > YOLO per-frame > ""
+            "subject": "",  # filled in below
             "has_jpg": int(has_jpg),
             "split": split,
         })
@@ -211,32 +292,64 @@ def build_frame_rows(burst_dir: Path) -> tuple[list[dict], dict | None, dict | N
             })
 
     # === Determine the consolidated burst-level verdict ===========
-    # Prefer the laptop-side full reanalysis if available, otherwise the
-    # firmware decision. Used to (a) backfill weak_label for all frames
-    # of a confirmed-prey burst and (b) emit burst_propagated label records.
-    consolidated_burst_label = (
-        full_burst_label if full_burst_label is not None else fw_burst
-    )
+    # Priority: human > full-API > firmware. Human "unclear" (confidence 0)
+    # does NOT override automatic labels — it just records uncertainty.
+    human_prey = None  # 0 / 1 / "unclear" / None
+    human_dir = None   # 0 (entering) / 1 (exiting) / "unclear" / None
+    human_subj = None  # 0 empty / 1 cat / 2 human / 3 other / "unclear" / None
+    if human:
+        if "prey" in human:
+            lab, conf = human["prey"]
+            human_prey = "unclear" if (conf == 0.0) else lab
+        if "direction" in human:
+            lab, conf = human["direction"]
+            human_dir = "unclear" if (conf == 0.0) else lab
+        if "subject" in human:
+            lab, conf = human["subject"]
+            human_subj = "unclear" if (conf == 0.0) else lab
+
+    if human_prey in (0, 1):
+        consolidated_burst_label = human_prey
+    elif full_burst_label is not None:
+        consolidated_burst_label = full_burst_label
+    else:
+        consolidated_burst_label = fw_burst
 
     # Fill weak_label / weak_confidence on the rows we just built.
+    DIR_STR = {0: "entering", 1: "exiting", "unclear": "unclear"}
+    PREY_STR = {0: 0, 1: 1, "unclear": "unclear"}
+    SUBJ_STR = {0: "empty", 1: "cat", 2: "human", 3: "other", "unclear": "unclear"}
     for row in rows:
-        # Hard label wins: if any source already says prey/no-prey for this
-        # frame, use it at confidence 1.0.
+        # Stamp the human burst-level annotations on every frame of the burst.
+        if human_prey is not None:
+            row["human_prey"] = PREY_STR.get(human_prey, "")
+        if human_dir is not None:
+            row["human_direction"] = DIR_STR.get(human_dir, "")
+        if human_subj is not None:
+            row["human_subject"] = SUBJ_STR.get(human_subj, "")
+
+        # Per-frame `subject`: human burst override > YOLO per-frame > ""
+        if human_subj in (0, 1, 2, 3):
+            row["subject"] = SUBJ_STR[human_subj]
+        elif row["yolo_subject"] != "":
+            row["subject"] = SUBJ_STR.get(row["yolo_subject"], "")
+
+        # If a confident human label exists at burst level, that is the
+        # ground truth for ALL frames at full confidence (overrides API).
+        if human_prey in (0, 1):
+            row["weak_label"] = human_prey
+            row["weak_confidence"] = 1.0
+            continue
+
+        # Else fall back to existing logic (hard frame label > burst propagation).
         hard = row["best_label"]
         if hard != "":
             row["weak_label"] = hard
             row["weak_confidence"] = 1.0
         elif consolidated_burst_label == 1:
-            # Burst is confirmed prey but THIS frame was not analyzed (or
-            # was analyzed and came back 0 — in which case best_label != ""
-            # and we already took the hard branch). Propagate burst label
-            # at reduced confidence.
             row["weak_label"] = 1
             row["weak_confidence"] = BURST_PROP_CONFIDENCE
         elif consolidated_burst_label == 0:
-            # Burst confirmed no-prey: propagate label=0 to unanalyzed
-            # frames at full confidence (cat went through and was clean,
-            # so the absence of prey in unseen frames is reliable).
             row["weak_label"] = 0
             row["weak_confidence"] = 1.0
 
@@ -262,6 +375,11 @@ def build_frame_rows(burst_dir: Path) -> tuple[list[dict], dict | None, dict | N
         "fw_prey_count": sum(1 for r in fw_results if r == 1),
         "full_burst_label": "" if full_burst_label is None else full_burst_label,
         "full_prey_count": full_prey_count if full_results else "",
+        "human_prey": PREY_STR.get(human_prey, ""),
+        "human_direction": DIR_STR.get(human_dir, ""),
+        "human_subject": SUBJ_STR.get(human_subj, ""),
+        "yolo_subject_majority": _majority_yolo_subject(yolo_subject_per_frame, images, burst_id),
+        "consolidated_burst_label": consolidated_burst_label,
         "has_full_analysis": int(full is not None),
         "has_jpgs": int(any((burst_dir / img.get("f", "")).exists() for img in images)),
         "split": burst_split(burst_id),
@@ -318,6 +436,9 @@ def main() -> None:
         dt.datetime.strptime(args.since, "%Y%m%d").date() if args.since else None
     )
 
+    # Pre-load human burst labels so we can fold them into manifest in one pass.
+    human_by_burst = load_human_burst_labels(args.out / "labels.jsonl")
+
     burst_dirs = sorted(d for d in args.root.iterdir() if d.is_dir())
     if since_date:
         burst_dirs = [
@@ -325,13 +446,14 @@ def main() -> None:
             if (bd := burst_date(d.name)) and bd >= since_date
         ]
     print(f"Scanning {len(burst_dirs)} burst folders under {args.root}...")
+    print(f"  {len(human_by_burst)} bursts have human labels")
 
     all_frame_rows: list[dict] = []
     all_burst_rows: list[dict] = []
     all_label_records: list[dict] = []
 
     for d in burst_dirs:
-        rows, summary, labels = build_frame_rows(d)
+        rows, summary, labels = build_frame_rows(d, human_by_burst.get(d.name))
         all_frame_rows.extend(rows)
         if summary:
             all_burst_rows.append(summary)
