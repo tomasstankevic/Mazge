@@ -1565,16 +1565,38 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
         const data = await r.json();
         const events = data.events || data;
         const bootEpoch = data.epoch ? (data.epoch - data.uptimeMs/1000) : null;
+        // Force CET / Europe/Bratislava timezone so times match real-world clock
+        // regardless of which timezone the laptop happens to be in.
+        const TZ_OPTS = { timeZone: 'Europe/Bratislava' };
+        const FMT_TIME = new Intl.DateTimeFormat('sv-SE', {
+          ...TZ_OPTS, hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
+        const FMT_DATETIME = new Intl.DateTimeFormat('sv-SE', {
+          ...TZ_OPTS, year: 'numeric', month: '2-digit', day: '2-digit',
+          hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false });
+        const NOW_LOCAL_DATE = FMT_DATETIME.format(new Date()).slice(0, 10); // YYYY-MM-DD
+        function formatEventTime(ev) {
+          // Prefer per-event epoch (set by firmware at the moment the event
+          // was recorded -- survives reboots). Falls back to bootEpoch math
+          // only for events recorded before NTP synced.
+          let epochSec = null;
+          if (ev.epoch && ev.epoch > 1700000000) {  // sane Unix time
+            epochSec = ev.epoch;
+          } else if (bootEpoch && ev.t) {
+            epochSec = bootEpoch + ev.t / 1000;
+          }
+          if (!epochSec) {
+            return (ev.ago / 1000).toFixed(0) + 's ago';
+          }
+          const d = new Date(epochSec * 1000);
+          const full = FMT_DATETIME.format(d);            // "2026-05-15 23:22:03"
+          const datePart = full.slice(0, 10);
+          const timePart = full.slice(11);
+          return datePart === NOW_LOCAL_DATE ? timePart : full;
+        }
         const el = document.getElementById('events-log');
         for (let i = events.length - 1; i >= 0; i--) {
           const e = events[i];
-          let timeStr;
-          if (bootEpoch && e.t) {
-            const d = new Date((bootEpoch + e.t/1000) * 1000);
-            timeStr = d.toLocaleTimeString([], {hour:'2-digit',minute:'2-digit',second:'2-digit'});
-          } else {
-            timeStr = (e.ago / 1000).toFixed(0) + 's ago';
-          }
+          const timeStr = formatEventTime(e);
           let mode, modeColor;
           if (e.mode === 1) { mode = '\u{1F916} AUTO'; modeColor = '#fc4'; }
           else { mode = '\u{1F4BB} LAPTOP'; modeColor = '#4f4'; }
