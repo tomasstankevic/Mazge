@@ -43,6 +43,15 @@ DEFAULT_OUT = REPO / "dataset"
 # Documented in main.cpp PREY_FRAMES_THRESHOLD.
 PREY_FRAMES_THRESHOLD = 2
 
+# Confidence weight for burst-propagated weak labels: when a burst is
+# confirmed prey-positive (≥PREY_FRAMES_THRESHOLD frames flagged), we
+# propagate label=1 to all OTHER frames in that burst at this confidence.
+# Rationale: the cat is physically carrying prey throughout the burst, but
+# in early frames the prey is small/distant and the API may not see it.
+# These weak labels let a trained model learn distance-invariant features.
+# 0.4 means "40% as confident as a hard label" — use as sample weight in BCE.
+BURST_PROP_CONFIDENCE = 0.4
+
 # Train/val/test split ratios by burst (NOT by frame — frames in the same
 # burst are highly correlated and must stay together to avoid leakage).
 SPLIT_RATIOS = {"train": 0.80, "val": 0.10, "test": 0.10}
@@ -173,6 +182,11 @@ def build_frame_rows(burst_dir: Path) -> tuple[list[dict], dict | None, dict | N
             "full_label": "" if full_label is None else full_label,
             "full_burst_label": "" if full_burst_label is None else full_burst_label,
             "best_label": "" if best_label is None else best_label,
+            # Training-friendly columns:
+            #   weak_label       — label to use when training (incl. burst-propagated)
+            #   weak_confidence  — sample weight: 1.0 for hard labels, 0.4 for propagated
+            "weak_label": "",      # filled in below after the loop knows burst verdict
+            "weak_confidence": "", # filled in below
             "has_jpg": int(has_jpg),
             "split": split,
         })
@@ -195,6 +209,49 @@ def build_frame_rows(burst_dir: Path) -> tuple[list[dict], dict | None, dict | N
                 "confidence": None,
                 "notes": None,
             })
+
+    # === Determine the consolidated burst-level verdict ===========
+    # Prefer the laptop-side full reanalysis if available, otherwise the
+    # firmware decision. Used to (a) backfill weak_label for all frames
+    # of a confirmed-prey burst and (b) emit burst_propagated label records.
+    consolidated_burst_label = (
+        full_burst_label if full_burst_label is not None else fw_burst
+    )
+
+    # Fill weak_label / weak_confidence on the rows we just built.
+    for row in rows:
+        # Hard label wins: if any source already says prey/no-prey for this
+        # frame, use it at confidence 1.0.
+        hard = row["best_label"]
+        if hard != "":
+            row["weak_label"] = hard
+            row["weak_confidence"] = 1.0
+        elif consolidated_burst_label == 1:
+            # Burst is confirmed prey but THIS frame was not analyzed (or
+            # was analyzed and came back 0 — in which case best_label != ""
+            # and we already took the hard branch). Propagate burst label
+            # at reduced confidence.
+            row["weak_label"] = 1
+            row["weak_confidence"] = BURST_PROP_CONFIDENCE
+        elif consolidated_burst_label == 0:
+            # Burst confirmed no-prey: propagate label=0 to unanalyzed
+            # frames at full confidence (cat went through and was clean,
+            # so the absence of prey in unseen frames is reliable).
+            row["weak_label"] = 0
+            row["weak_confidence"] = 1.0
+
+    # Emit burst_propagated label records for frames where weak label
+    # differs from any hard label we already have.
+    if consolidated_burst_label == 1:
+        for row in rows:
+            if row["best_label"] != 1 and row["weak_label"] == 1:
+                label_records.append({
+                    "image_id": row["image_id"],
+                    "source": "burst_propagated",
+                    "label": 1,
+                    "confidence": BURST_PROP_CONFIDENCE,
+                    "notes": f"burst {burst_id} confirmed prey-positive",
+                })
 
     burst_summary = {
         "burst_id": burst_id,

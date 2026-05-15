@@ -35,7 +35,9 @@ uv run python tools/build_dataset.py
 | `fw_burst_label`    | Firmware burst-level verdict: `0` or `1`.                                            |
 | `full_label`        | Laptop-side full-frame reanalysis: `0`, `1`, empty = not analyzed.                   |
 | `full_burst_label`  | Burst-level verdict from full reanalysis (>=2 prey frames).                          |
-| `best_label`        | `full_label` if known, else `fw_label`. Used as default training label.              |
+| `best_label`        | `full_label` if known, else `fw_label`. Strict per-frame label (use for **eval**).   |
+| `weak_label`        | **Training label**: `best_label` if known, else burst-propagated. Always set.        |
+| `weak_confidence`   | Sample weight: `1.0` for hard labels, `0.4` for burst-propagated prey.               |
 | `has_jpg`           | `1` if the JPG file exists locally, `0` if only `meta.json` was pulled.              |
 | `split`             | `train` / `val` / `test`. Deterministic hash of `burst_id` (80/10/10).               |
 
@@ -114,18 +116,96 @@ Ratios are 80% / 10% / 10%. To re-split, change `SPLIT_RATIOS` in
 ## Class balance (current)
 
 ```
-prey:    80 frames  (1.5%)
-no-prey: 4211 frames (98.5%)
+HARD labels (per-frame, API-confirmed):
+  prey:    80 frames  (1.5%)
+  no-prey: 4211 frames (98.5%)
+
+WEAK labels (training-friendly, includes burst-propagated):
+  prey hard (conf 1.0):  80 frames
+  prey weak (conf 0.4):  132 frames     <- propagated from burst-positive
+  no-prey  (conf 1.0):   5381 frames
+  TOTAL:                 5593 frames    <- 100% coverage
 ```
 
-Severely imbalanced — typical for cat-flap data. For training:
+## The label-fidelity problem
 
-- Oversample prey or use weighted loss (`pos_weight ≈ 50` for BCE).
-- Hard-negative mining: most no-prey frames are trivially "empty flap"
-  shots; sample more aggressively from frames where firmware was uncertain
-  or where ToF distance was small (`distance_mm < 200`).
-- Add data augmentation: horizontal flip OK, vertical flip NOT (gravity
-  matters for prey appearance).
+When the cat carries prey, it carries it through **all 10 frames** of the
+burst. But the API only flags frames where prey is clearly visible (close,
+in focus, well-lit) — typically `f7`–`f9`. Earlier frames (`f0`–`f4`) show
+the same prey but at greater distance, often <20px wide, and the API
+reliably misses them.
+
+This matters for training: if you only train on per-frame API labels, the
+model learns "prey is a thing visible at <30cm" rather than
+"prey is *physically present* in this scene". The burst-level decision is
+what actually controls the door.
+
+### How we handle it
+
+We emit two kinds of labels:
+
+| Source             | Confidence | Origin                                                  |
+| ------------------ | ---------- | ------------------------------------------------------- |
+| `firmware`         | 1.0        | On-device API said this frame has prey (or not).        |
+| `api_full`         | 1.0        | Laptop reanalyzed all 10 frames, this frame's verdict.  |
+| `burst_propagated` | 0.4        | Burst is confirmed prey; this frame was not flagged but the cat is physically carrying prey. |
+| `human:<name>`     | 1.0        | Manual ground truth (future).                           |
+
+`weak_label` and `weak_confidence` in `manifest.csv` consolidate this:
+- If any source confidently labels the frame → use that label, weight 1.0.
+- Else if the burst is confirmed prey → label = 1, weight 0.4.
+- Else if the burst is confirmed no-prey → label = 0, weight 1.0
+  (cat passed clean, absence is reliable).
+
+### Recommended training/eval strategy
+
+**Training:** use `weak_label` with `weak_confidence` as the per-sample
+weight in BCE loss. PyTorch:
+
+```python
+import torch
+import torch.nn.functional as F
+
+logits = model(img)                        # (B,)
+target = batch["weak_label"].float()       # (B,) in {0, 1}
+weight = batch["weak_confidence"].float()  # (B,) in (0, 1]
+# Heavy class imbalance — also use pos_weight
+pos_weight = torch.tensor([50.0])  # ~5400 neg / ~210 pos
+loss = F.binary_cross_entropy_with_logits(
+    logits, target, weight=weight, pos_weight=pos_weight)
+```
+
+**Evaluation:** there are two complementary metrics:
+
+1. **Per-frame** (apples-to-apples with the API): filter `val`/`test` to
+   rows where `best_label != ""` (hard labels only) and compute
+   precision/recall on `best_label` vs `model_pred`.
+2. **Per-burst** (matches product behavior): for each test burst, run the
+   model on all frames, aggregate (e.g. `max(pred) > 0.5`), compare to
+   `bursts.csv`'s `full_burst_label`. **This is the metric you actually
+   care about** — false positives at frame level cancel out across the
+   burst, false negatives are usually compensated by other frames.
+
+## Class balance breakdown by split
+
+```
+ split   prey_hard   prey_weak      noprey
+ train          67         107        4379
+   val          10          13         512
+  test           3          12         490
+```
+
+Test has only 3 hard-prey frames, but 15 prey-positive frames once weak
+labels are included — enough for ~5 prey bursts. Add more by labelling
+bursts manually (`source: human:tomas` in `labels.jsonl`) when you collect
+more data.
+
+For training:
+
+- Class-balance via `pos_weight≈50` in BCE, or oversample positive bursts.
+- Hard-negative mining: sample more aggressively from frames where firmware
+  was uncertain (`fw_label == 0` but `distance_mm < 200` and `night == 1`).
+- Augmentation: horizontal flip OK, vertical flip NOT (gravity matters).
 
 ## How to extend
 
