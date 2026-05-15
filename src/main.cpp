@@ -341,28 +341,44 @@ void loadEventLog() {
   Serial.printf("Loaded %d events from NVS\n", eventCount);
 }
 
-// Classify distance trend via linear regression slope on valid readings.
-// 1=entering (slope < -15 mm/frame), 2=exiting (slope > +15), 3=flat/passing, 0=unknown
+// Classify burst direction from per-frame ToF readings already captured
+// in archive.images[i].distanceMm.
+//
+// Rule (validated on 155 human-labelled bursts, F1=0.872 for exiting):
+//   min_dist  = smallest valid (>=0 mm) reading across the burst
+//   first_dist = first valid reading in the burst
+//   if min_dist < 180mm AND first_dist < 230mm -> 2 EXITING
+//   else if any valid readings                  -> 1 ENTERING
+//   else                                        -> 0 UNKNOWN
+//
+// Encoding kept compatible with the existing event log (uint8 trend field):
+//   0 = unknown   1 = entering (far -> close)   2 = exiting (close)   3 = passing (unused)
+//
+// Calibration: 0/21 prey-positive bursts misclassified as exit
+// (see tools/check_exit_rule_safety.py). 90.3% accuracy overall.
+//
+// Stage 0 of the exit-detector rollout: this is decision-only — the value
+// is recorded in the event log + meta.json + web UI but does NOT yet skip
+// the API call. Future stages will add the ring buffer for richer signal.
+#define DIRECTION_EXIT_MIN_DIST_MM   180
+#define DIRECTION_EXIT_FIRST_DIST_MM 230
 int classifyDistTrend(BurstArchive &archive) {
-  // Collect valid readings (>= 30mm) with their frame indices
-  int n = 0;
-  float sum_i = 0, sum_d = 0, sum_id = 0, sum_ii = 0;
+  int min_dist = -1;
+  int first_dist = -1;
+  int n_valid = 0;
   for (int i = 0; i < archive.count; i++) {
     int d = archive.images[i].distanceMm;
-    if (d >= 30) {
-      sum_i += i; sum_d += d;
-      sum_id += (float)i * d; sum_ii += (float)i * i;
-      n++;
-    }
+    if (d < 0) continue;             // -1 no-target / -2 sensor error
+    if (first_dist < 0) first_dist = d;
+    if (min_dist < 0 || d < min_dist) min_dist = d;
+    n_valid++;
   }
-  if (n < 3) return 0; // not enough data
-  float denom = n * sum_ii - sum_i * sum_i;
-  if (denom == 0) return 0;
-  float slope = (n * sum_id - sum_i * sum_d) / denom;
-  Serial.printf("ToF trend: n=%d slope=%.1f mm/frame\n", n, slope);
-  if (slope < -15) return 1; // entering (getting closer)
-  if (slope > 15)  return 2; // exiting (moving away)
-  return 3; // flat / passing (cat sitting at flap)
+  if (n_valid == 0) return 0;        // unknown
+  bool is_exit = (min_dist < DIRECTION_EXIT_MIN_DIST_MM) &&
+                 (first_dist < DIRECTION_EXIT_FIRST_DIST_MM);
+  Serial.printf("Direction: n_valid=%d min=%dmm first=%dmm -> %s\n",
+                n_valid, min_dist, first_dist, is_exit ? "EXIT" : "ENTER");
+  return is_exit ? 2 : 1;
 }
 
 void addEvent(int gen, int frameCount, int result, int distMin, int distMax, int trend, bool autonomous) {
@@ -693,7 +709,18 @@ void saveBurstToSd(int archIdx) {
         arch.images[i].distanceMm, arch.images[i].gainApplied,
         arch.images[i].aecApplied, arch.images[i].captureMs, offsetMs);
     }
-    mf.print("]}");
+    // Direction prediction from existing per-frame ToF (Stage 0 of exit detector).
+    // Recompute here so it is always up to date with the classifier in firmware.
+    int direction = classifyDistTrend(arch);  // 0 unknown, 1 enter, 2 exit
+    int dirMin = -1, dirFirst = -1;
+    for (int i = 0; i < arch.count; i++) {
+      int d = arch.images[i].distanceMm;
+      if (d < 0) continue;
+      if (dirFirst < 0) dirFirst = d;
+      if (dirMin < 0 || d < dirMin) dirMin = d;
+    }
+    mf.printf("],\"direction\":%d,\"directionMinDist\":%d,\"directionFirstDist\":%d}",
+              direction, dirMin, dirFirst);
     mf.close();
   }
   Serial.printf("SD: saved %d frames + meta to %s\n", arch.count, dirPath);
