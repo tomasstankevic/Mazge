@@ -1,0 +1,4 @@
+# manifest.csv and bursts.csv are derived from raw data + labels.jsonl.
+# Regenerate them anytime with: uv run python tools/build_dataset.py
+manifest.csv
+bursts.csv
