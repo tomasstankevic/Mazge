@@ -649,6 +649,7 @@ def main() -> None:
     print(f"\nServing http://127.0.0.1:{args.port}/   (Ctrl-C to stop)\n",
           flush=True)
     Handler = make_handler(args.filter)
+    socketserver.TCPServer.allow_reuse_address = True
     with socketserver.TCPServer(("127.0.0.1", args.port), Handler) as httpd:
         try:
             httpd.serve_forever()
