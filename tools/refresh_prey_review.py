@@ -50,7 +50,7 @@ def download(host, remote_path, local_path):
     return len(data), ""
 
 
-def sync_folder(host, folder, remote_files_in_folder):
+def sync_folder(host, folder, remote_files_in_folder, idx=0, total=0):
     """Download any files for `folder` that are not already local."""
     local_dir = ROOT / folder
     local_set = (
@@ -60,14 +60,17 @@ def sync_folder(host, folder, remote_files_in_folder):
     to_get = [n for n in remote_files_in_folder if n not in local_set]
     if not to_get:
         return 0
-    print(f"  syncing {folder}: {len(to_get)} files...")
+    prefix = f"[{idx}/{total}] " if total else ""
+    print(f"  {prefix}{folder}: {len(to_get)} files to download...", flush=True)
     downloaded = 0
-    for name in to_get:
+    for i, name in enumerate(to_get, 1):
         n, err = download(host, f"{folder}/{name}", local_dir / name)
         if n > 0:
             downloaded += 1
+            if len(to_get) > 3:
+                print(f"    {i}/{len(to_get)} {name} ({n//1024}KB)", flush=True)
         else:
-            print(f"    ERR {name}: {err}")
+            print(f"    ERR {name}: {err}", flush=True)
     return downloaded
 
 
@@ -131,10 +134,13 @@ def main():
         if new_folders:
             print(f"New folders to fetch: {len(new_folders)}")
         # Sync new folders
-        for folder in sorted(by_folder):
-            if folder in local and (ROOT / folder / "meta.json").exists():
-                continue  # already have meta, skip (we'll fill in jpgs only if prey)
-            sync_folder(args.host, folder, by_folder[folder])
+        folders_to_sync = sorted(
+            f for f in by_folder
+            if f not in local or not (ROOT / f / "meta.json").exists()
+        )
+        print(f"Folders needing sync: {len(folders_to_sync)}", flush=True)
+        for i, folder in enumerate(folders_to_sync, 1):
+            sync_folder(args.host, folder, by_folder[folder], i, len(folders_to_sync))
 
     print("\n=== Step 3: Find prey-positive bursts locally ===")
     prey_bursts = find_local_prey_bursts()
@@ -142,11 +148,11 @@ def main():
 
     if not args.skip_sync:
         print("\n=== Step 4: Ensure all JPGs are downloaded for prey bursts ===")
-        for burst in prey_bursts:
+        for i, burst in enumerate(prey_bursts, 1):
             local_dir = ROOT / burst
             jpgs_local = sum(1 for f in local_dir.iterdir() if f.suffix == ".jpg")
             if jpgs_local < 8 and burst in by_folder:
-                sync_folder(args.host, burst, by_folder[burst])
+                sync_folder(args.host, burst, by_folder[burst], i, len(prey_bursts))
 
     print("\n=== Step 5: Copy prey bursts into captures/prey_review/ ===")
     REVIEW.mkdir(parents=True, exist_ok=True)
