@@ -13,6 +13,7 @@
 #include <Preferences.h>
 #include "SD_MMC.h"
 #include "secrets.h"
+#include "esp_task_wdt.h"
 
 // Blynk IoT (template defines are in secrets.h, must precede this include)
 #define BLYNK_PRINT Serial
@@ -43,20 +44,24 @@
 bool sdReady = false;
 
 // ===== Cat door control (transistor on GPIO 14) =====
-// Door is normally OPEN: pin HIGH = open (default), pin LOW = closed.
-// Default state on boot is HIGH (door open) — set BEFORE pinMode(OUTPUT) to
-// avoid a brief low pulse during init that would slam the door shut.
+// Door is normally CLOSED (entry side): pin HIGH = open, pin LOW = closed.
+// The physical lock is one-way: exits are always free regardless of pin state.
+// Default state on boot is LOW (closed) so that crashes / power cycles never
+// leave the entry unlocked. Set BEFORE pinMode(OUTPUT) so init glitches don't
+// open the door.
 //
-// On a trigger (ToF or fake) we IMMEDIATELY close the door. After API
-// analysis completes:
+// On a trigger (ToF or fake) the door is already closed; we still call
+// doorCloseNow() to mark the trigger in logs/Blynk. After API analysis:
 //   - prey detected on any frame  -> stay closed for PREY_LOCKOUT_MS (15 min)
-//   - no prey on any frame        -> reopen the door
+//   - no prey on any frame        -> open the door for GREEN_LIGHT_MS, then
+//                                    close again automatically
 // During lockout, manual "open" requests are blocked.
 #define DOOR_PIN 14
 #define PREY_LOCKOUT_MS (15UL * 60UL * 1000UL)  // 15 minutes
 // After a no-prey verdict, give the cat a re-try window where the door
 // stays open and triggers are ignored (no analysis, no door close). Lets
 // the cat back off and try again without the 7-second analysis delay.
+// When this window expires the door auto-closes again.
 #define GREEN_LIGHT_MS (60UL * 1000UL)          // 1 minute
 // Rate-limit triggers to prevent the API pipeline from being overwhelmed:
 //   - During green-light: NO triggers (cat just passed, no prey)
@@ -76,8 +81,11 @@ bool sdReady = false;
 // prey detected) but FEWER false positives (7 vs 9) and HALF the latency
 // when no prey is found (5.5s vs 11s).
 #define MAX_API_FRAMES 5
-volatile bool doorOpen = true;
+volatile bool doorOpen = false;
 volatile unsigned long preyLockoutUntilMs = 0;  // millis() value; 0 = no lockout
+// Lockout end-time in UNIX seconds, persisted to NVS so a crash mid-lockout
+// doesn't drop the lockout on reboot. Restored in setup() if still in future.
+volatile int32_t preyLockoutUntilEpoch = 0;
 volatile unsigned long greenLightUntilMs = 0;   // millis() value; 0 = no green light
 volatile bool blynkDoorChanged = false;         // flag for Blynk door state update
 volatile unsigned long lastBurstTriggerMs = 0;  // millis() of most recent accepted trigger
@@ -212,7 +220,11 @@ volatile int jpegQuality = 95;
 
 // ===== Burst capture (pre-trigger ring buffer) =====
 #define RING_SIZE 10         // 5 pre-trigger + 5 post-trigger
-#define BURST_ARCHIVES 40
+// Number of burst metadata structs kept in RAM. Each is ~535B static so
+// 40 = ~21KB of internal heap permanently reserved. The web UI typically
+// only shows the last 5-10 anyway, and SD has the full history. Cut to 15
+// to free ~13KB internal heap for TLS / WiFi / lwIP buffers.
+#define BURST_ARCHIVES 15
 
 // ===== Prey Detection API (autonomous mode) =====
 #define LAPTOP_TIMEOUT_MS 30000  // consider laptop absent after 30s no contact
@@ -341,6 +353,30 @@ void loadEventLog() {
   Serial.printf("Loaded %d events from NVS\n", eventCount);
 }
 
+// === Persistent prey-lockout state ============================================
+// preyLockoutUntilMs is RAM-only (millis-based), so a crash or reboot mid-lockout
+// would drop the lockout. We mirror the absolute end-time to NVS as a UNIX
+// epoch second every time the lockout is set/cleared, and restore on boot.
+// One NVS write per prey trigger + one per reboot — cheap.
+void persistLockoutEpoch(int32_t untilEpoch) {
+  preyLockoutUntilEpoch = untilEpoch;
+  nvsPrefs.begin("state", false);
+  nvsPrefs.putInt("lockUntil", untilEpoch);
+  nvsPrefs.end();
+}
+
+// Restore lockout from NVS. Returns the seconds remaining (>0 = still active),
+// or 0 if no lockout pending. Caller is responsible for translating remaining
+// seconds into preyLockoutUntilMs once millis() is available and time is synced.
+int32_t loadLockoutEpoch() {
+  nvsPrefs.begin("state", true);
+  int32_t until = nvsPrefs.getInt("lockUntil", 0);
+  nvsPrefs.end();
+  preyLockoutUntilEpoch = until;
+  return until;
+}
+// ==============================================================================
+
 // Classify burst direction from per-frame ToF readings already captured
 // in archive.images[i].distanceMm.
 //
@@ -456,6 +492,7 @@ BLYNK_WRITE(V14) {
     if (doorLockoutActive()) {
       Serial.println("Blynk: door open requested but lockout active — overriding");
       preyLockoutUntilMs = 0;  // clear lockout
+      persistLockoutEpoch(0);
     }
     doorOpenNow("Blynk dashboard");
   } else {
@@ -1010,7 +1047,7 @@ static void startApiWorkers() {
     apiWorkers[i].task = NULL;
     char name[16];
     snprintf(name, sizeof(name), "apiw%d", i);
-    xTaskCreatePinnedToCore(apiWorkerTask, name, 8192,
+    xTaskCreatePinnedToCore(apiWorkerTask, name, 16384,
                              &apiWorkers[i],
                              tskIDLE_PRIORITY + 2, &apiWorkers[i].task,
                              /*core*/ 0);
@@ -1024,6 +1061,32 @@ static void stopApiWorkers() {
   ApiWorkItem stop = {-1, NULL, 0, 0};
   for (int i = 0; i < N_API_WORKERS; i++) {
     xQueueSend(apiWorkQueue, &stop, pdMS_TO_TICKS(100));
+  }
+}
+
+// Free per-worker TLS clients while keeping the worker tasks alive.
+// Each WiFiClientSecure + HTTPClient pair holds ~50-60KB of internal heap
+// (mbedTLS context). The first burst of a triggers reinitialises them in
+// ~1s; for back-to-back triggers the per-worker keep-alive avoids redundant
+// reconnects. After GREEN_LIGHT_MS of inactivity (no burst, no cat) we can
+// safely drop these to claw back ~120KB of internal heap.
+//
+// Safe to call from loop() because the workers are blocked on the work
+// queue when no burst is in progress; the TLS pointers they read are
+// behind the `connected` flag they own. We still take the conservative
+// approach of only freeing when apiTaskBusy() is false.
+static void freeIdleWorkerTls() {
+  uint32_t freedAny = 0;
+  for (int i = 0; i < N_API_WORKERS; i++) {
+    ApiWorker *w = &apiWorkers[i];
+    if (!w->connected && !w->http && !w->tls) continue;
+    if (w->http) { w->http->end();  delete w->http; w->http = NULL; freedAny++; }
+    if (w->tls)  { w->tls->stop();  delete w->tls;  w->tls  = NULL; freedAny++; }
+    w->connected = false;
+  }
+  if (freedAny) {
+    Serial.printf("API: freed idle worker TLS (heap now %u)\n",
+                  (unsigned)ESP.getFreeHeap());
   }
 }
 
@@ -1276,6 +1339,12 @@ api_done:
   if (preyConfirmed) {
     preyLockoutUntilMs = millis() + PREY_LOCKOUT_MS;
     if (preyLockoutUntilMs == 0) preyLockoutUntilMs = 1;  // avoid sentinel
+    // Persist absolute end-time as epoch so the lockout survives a reboot.
+    {
+      time_t nowEpoch;
+      time(&nowEpoch);
+      persistLockoutEpoch((int32_t)nowEpoch + (int32_t)(PREY_LOCKOUT_MS / 1000UL));
+    }
     greenLightUntilMs = 0;  // clear any pending green light
     char reason[80];
     snprintf(reason, sizeof(reason),
@@ -1324,6 +1393,10 @@ api_done:
 volatile unsigned long apiTaskStartMs = 0;
 volatile bool apiAbandonRequested = false;          // signal to in-flight task to stop early
 volatile uint32_t apiAbandonCount = 0;              // total abandons since boot
+
+// Diagnostics: persisted across boots so we can see crash patterns remotely.
+static uint32_t bootResetReason = 0;       // ESP reset-reason code from this boot
+static uint32_t bootCounter = 0;           // total boots since the firmware was first flashed
 // API_TASK_DEADLINE_MS forward-declared above near autonomousApiCheck
 #define API_TASK_HARD_RESET_AFTER 5                 // consecutive abandons before reboot
 static inline bool apiTaskBusy() {
@@ -2103,6 +2176,50 @@ static esp_err_t stats_handler(httpd_req_t *req) {
   return httpd_resp_send(req, json, strlen(json));
 }
 
+// Lightweight diagnostics endpoint — heap, boot count, reset reason, worker
+// stack high-water marks. Lets us correlate crashes over time without serial.
+static esp_err_t diag_handler(httpd_req_t *req) {
+  char json[512];
+  UBaseType_t w0 = apiWorkers[0].task ? uxTaskGetStackHighWaterMark(apiWorkers[0].task) : 0;
+  UBaseType_t w1 = (N_API_WORKERS > 1 && apiWorkers[N_API_WORKERS > 1 ? 1 : 0].task)
+                     ? uxTaskGetStackHighWaterMark(apiWorkers[N_API_WORKERS > 1 ? 1 : 0].task) : 0;
+  uint32_t storedBoot = 0;
+  uint32_t lastRR = 0;
+  nvsPrefs.begin("state", true);
+  storedBoot = nvsPrefs.getUInt("bootCount", 0);
+  lastRR     = nvsPrefs.getUInt("lastRR", 0);
+  nvsPrefs.end();
+  const char *rrName = "?";
+  switch ((esp_reset_reason_t)bootResetReason) {
+    case ESP_RST_POWERON:   rrName = "POWERON";   break;
+    case ESP_RST_EXT:       rrName = "EXT";       break;
+    case ESP_RST_SW:        rrName = "SW";        break;
+    case ESP_RST_PANIC:     rrName = "PANIC";     break;
+    case ESP_RST_INT_WDT:   rrName = "INT_WDT";   break;
+    case ESP_RST_TASK_WDT:  rrName = "TASK_WDT";  break;
+    case ESP_RST_WDT:       rrName = "WDT";       break;
+    case ESP_RST_DEEPSLEEP: rrName = "DEEPSLEEP"; break;
+    case ESP_RST_BROWNOUT:  rrName = "BROWNOUT";  break;
+    case ESP_RST_SDIO:      rrName = "SDIO";      break;
+    default: break;
+  }
+  snprintf(json, sizeof(json),
+    "{\"bootCount\":%u,\"resetReason\":%u,\"resetReasonName\":\"%s\","
+    "\"persistedRR\":%u,\"uptimeMs\":%lu,"
+    "\"freeHeap\":%u,\"minFreeHeap\":%u,\"freePsram\":%u,\"minFreePsram\":%u,"
+    "\"workerStackHW0\":%u,\"workerStackHW1\":%u,"
+    "\"apiAbandons\":%u,\"rssi\":%d}",
+    (unsigned)bootCounter, (unsigned)bootResetReason, rrName,
+    (unsigned)lastRR, millis(),
+    (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap(),
+    (unsigned)ESP.getFreePsram(), (unsigned)ESP.getMinFreePsram(),
+    (unsigned)w0, (unsigned)w1,
+    (unsigned)apiAbandonCount, (int)WiFi.RSSI());
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  return httpd_resp_send(req, json, strlen(json));
+}
+
 static esp_err_t burstmeta_handler(httpd_req_t *req) {
   char buf[48];
   char val[8];
@@ -2385,6 +2502,7 @@ static esp_err_t cmd_handler(httpd_req_t *req) {
         unsigned long remain = (preyLockoutUntilMs - millis()) / 1000;
         Serial.printf("Door: manual OPEN overriding lockout (%lus remaining)\n", remain);
         preyLockoutUntilMs = 0;  // clear lockout on manual override
+        persistLockoutEpoch(0);
       }
       doorOpenNow("manual");
     } else {
@@ -3131,12 +3249,20 @@ void startUIServer() {
     .user_ctx = NULL
   };
 
+  httpd_uri_t diag_uri = {
+    .uri = "/diag",
+    .method = HTTP_GET,
+    .handler = diag_handler,
+    .user_ctx = NULL
+  };
+
   if (httpd_start(&ui_httpd, &config) == ESP_OK) {
     httpd_register_uri_handler(ui_httpd, &index_uri);
     httpd_register_uri_handler(ui_httpd, &stats_uri);
     httpd_register_uri_handler(ui_httpd, &cmd_uri);
     httpd_register_uri_handler(ui_httpd, &burst_uri);
     httpd_register_uri_handler(ui_httpd, &burstmeta_uri);
+    httpd_register_uri_handler(ui_httpd, &diag_uri);
     httpd_uri_t apitest_uri = {
       .uri = "/apitest",
       .method = HTTP_GET,
@@ -3184,13 +3310,45 @@ void setup() {
   Serial.begin(115200);
   Serial.println();
 
-  // Initialize door control IMMEDIATELY: drive HIGH (open) before pinMode
-  // so the brief glitch at boot doesn't close the door.
-  digitalWrite(DOOR_PIN, HIGH);
+  // Log the reason for this boot. Helps correlate crashes with bursts/API calls.
+  // Codes: 1=POWERON 2=EXT 3=SW 4=PANIC 5=INT_WDT 6=TASK_WDT 7=WDT 8=DEEPSLEEP 9=BROWNOUT 10=SDIO
+  {
+    esp_reset_reason_t rr = esp_reset_reason();
+    const char *name = "?";
+    switch (rr) {
+      case ESP_RST_POWERON:   name = "POWERON";  break;
+      case ESP_RST_EXT:       name = "EXT";      break;
+      case ESP_RST_SW:        name = "SW";       break;
+      case ESP_RST_PANIC:     name = "PANIC";    break;
+      case ESP_RST_INT_WDT:   name = "INT_WDT";  break;
+      case ESP_RST_TASK_WDT:  name = "TASK_WDT"; break;
+      case ESP_RST_WDT:       name = "WDT";      break;
+      case ESP_RST_DEEPSLEEP: name = "DEEPSLEEP";break;
+      case ESP_RST_BROWNOUT:  name = "BROWNOUT"; break;
+      case ESP_RST_SDIO:      name = "SDIO";     break;
+      default: break;
+    }
+    Serial.printf("Reset reason: %s (%d)\n", name, (int)rr);
+    // Persist a counter and last reason so we can correlate post-mortem.
+    nvsPrefs.begin("state", false);
+    uint32_t bootCount = nvsPrefs.getUInt("bootCount", 0) + 1;
+    nvsPrefs.putUInt("bootCount", bootCount);
+    nvsPrefs.putUInt("lastRR", (uint32_t)rr);
+    nvsPrefs.end();
+    bootResetReason = (uint32_t)rr;
+    bootCounter = bootCount;
+    Serial.printf("Boot #%u (last reset reason persisted)\n", (unsigned)bootCount);
+  }
+
+  // Initialize door control IMMEDIATELY: drive LOW (CLOSED) before pinMode
+  // so any boot glitch / crash recovery leaves the door SAFE-closed rather
+  // than open. The lock is one-way (exit is always free) so this only blocks
+  // entry until the firmware has time to evaluate the next ToF trigger.
+  digitalWrite(DOOR_PIN, LOW);
   pinMode(DOOR_PIN, OUTPUT);
-  digitalWrite(DOOR_PIN, HIGH);
-  doorOpen = true;
-  Serial.println("Door: opened (boot default)");
+  digitalWrite(DOOR_PIN, LOW);
+  doorOpen = false;
+  Serial.println("Door: closed (boot default — normally-closed entry side)");
 
   // Drive on-board WS2812 RGB LED to OFF (GPIO 48) to keep it dark.
   // (The red power LED is hardwired and cannot be disabled in firmware.)
@@ -3251,8 +3409,31 @@ void setup() {
     localtime_r(&now, &ti);
     Serial.printf("\nNTP synced: %04d-%02d-%02d %02d:%02d:%02d CET/CEST\n",
       ti.tm_year+1900, ti.tm_mon+1, ti.tm_mday, ti.tm_hour, ti.tm_min, ti.tm_sec);
+
+    // Restore any lockout that survived a crash/reboot.
+    int32_t lockUntil = loadLockoutEpoch();
+    if (lockUntil > (int32_t)now) {
+      int32_t remainSec = lockUntil - (int32_t)now;
+      preyLockoutUntilMs = millis() + (unsigned long)remainSec * 1000UL;
+      if (preyLockoutUntilMs == 0) preyLockoutUntilMs = 1;
+      Serial.printf("Lockout RESTORED from NVS: %ds remaining (until epoch %d)\n",
+                    (int)remainSec, (int)lockUntil);
+    } else if (lockUntil != 0) {
+      Serial.printf("Lockout in NVS already expired (epoch %d, now %d) — clearing\n",
+                    (int)lockUntil, (int)now);
+      persistLockoutEpoch(0);
+    }
   } else {
     Serial.println("\nNTP sync failed, using uptime");
+    // Without NTP we can't know if the persisted lockout is still in window.
+    // Be SAFE: if a lockout is persisted at all, restore the full PREY_LOCKOUT_MS
+    // window. Worst case we lock for 15 extra minutes after recovery — acceptable.
+    int32_t lockUntil = loadLockoutEpoch();
+    if (lockUntil != 0) {
+      preyLockoutUntilMs = millis() + PREY_LOCKOUT_MS;
+      if (preyLockoutUntilMs == 0) preyLockoutUntilMs = 1;
+      Serial.println("Lockout RESTORED conservatively (no NTP): full 15 min");
+    }
   }
 
   // FIX 2: Disable WiFi power save mode.
@@ -3314,6 +3495,20 @@ void setup() {
   });
   ArduinoOTA.begin();
   Serial.println("OTA ready");
+
+  // Hardware Task Watchdog — last line of defence against full lockups.
+  // If loop() doesn't feed the WDT within LOOP_WDT_TIMEOUT_S seconds,
+  // ESP-IDF performs a hard reset at hardware level (no software path
+  // can prevent it). This is what prevents indefinite bricks like the
+  // one we hit during testing.
+  //
+  // 60s is generous: a normal loop() iteration is <100ms; even worst-case
+  // burst capture + SD save shouldn't block loop() for more than ~5s
+  // because the heavy work runs in separate FreeRTOS tasks.
+#define LOOP_WDT_TIMEOUT_S 60
+  esp_task_wdt_init(LOOP_WDT_TIMEOUT_S, /*panic on timeout*/ true);
+  esp_task_wdt_add(NULL);  // subscribe the current (loop / Arduino main) task
+  Serial.printf("Task WDT armed: %ds\n", LOOP_WDT_TIMEOUT_S);
 }
 
 // ===== Loop =====
@@ -3324,6 +3519,10 @@ void setup() {
 // while dramatically reducing WiFi contention during streaming.
 void loop() {
   unsigned long now = millis();
+
+  // Feed the Task WDT first thing every loop iteration. If we ever fail to
+  // reach this point within LOOP_WDT_TIMEOUT_S the chip hard-resets.
+  esp_task_wdt_reset();
 
   // During OTA: only handle OTA, skip everything else
   if (otaInProgress) {
@@ -3380,11 +3579,70 @@ void loop() {
     if (Blynk.connected()) Blynk.virtualWrite(V0, 0);
   }
 
+  // Auto-close after green-light window expires (normally-closed entry side).
+  // Tracks the open->closed edge so we only call doorCloseNow() once.
+  static bool greenLightWasActive = false;
+  bool greenLightNow = greenLightActive();
+  if (greenLightWasActive && !greenLightNow && doorOpen && !doorLockoutActive()) {
+    doorCloseNow("green-light expired");
+  }
+  greenLightWasActive = greenLightNow;
+
+  // Free idle worker TLS to reclaim ~120KB internal heap during quiet periods.
+  // Trigger condition: no API task busy, no burst capturing, no green light or
+  // lockout active, and >IDLE_TLS_FREE_MS since the last trigger. Re-init on
+  // next burst costs ~1s of TLS handshake (per worker, in parallel) which is
+  // hidden behind the BURST_SHIFT_MS pre-capture window.
+#define IDLE_TLS_FREE_MS (90UL * 1000UL)
+  static unsigned long lastTlsFreeCheckMs = 0;
+  if (now - lastTlsFreeCheckMs > 5000) {  // check every 5s
+    lastTlsFreeCheckMs = now;
+    bool idle = !apiTaskBusy() && !burstCapturing && !greenLightNow &&
+                !doorLockoutActive() && (postTriggerRemaining == 0) &&
+                (pendingFreezeAtMs == 0);
+    bool quiet = (lastBurstTriggerMs == 0) ||
+                 ((now - lastBurstTriggerMs) > IDLE_TLS_FREE_MS);
+    if (idle && quiet) {
+      freeIdleWorkerTls();
+    }
+  }
+
+  // Heartbeat: log key state once a minute so a serial capture can show
+  // exactly how far the firmware got before any crash. Cheap (one Serial.printf).
+  static unsigned long lastHeartbeat = 0;
+  if (now - lastHeartbeat >= 60000UL) {
+    lastHeartbeat = now;
+    time_t hbEpoch;
+    time(&hbEpoch);
+    uint32_t freeHeap   = ESP.getFreeHeap();
+    uint32_t minHeap    = ESP.getMinFreeHeap();
+    uint32_t freePsram  = ESP.getFreePsram();
+    int rssi            = WiFi.RSSI();
+    long lockRemainS    = doorLockoutActive() ? (long)((preyLockoutUntilMs - now) / 1000UL) : 0;
+    long greenRemainS   = greenLightActive() ? (long)((greenLightUntilMs - now) / 1000UL) : 0;
+    // Worker stack high-water (smallest stack free observed so far per worker)
+    UBaseType_t w0 = apiWorkers[0].task ? uxTaskGetStackHighWaterMark(apiWorkers[0].task) : 0;
+    UBaseType_t w1 = (N_API_WORKERS > 1 && apiWorkers[N_API_WORKERS > 1 ? 1 : 0].task)
+                       ? uxTaskGetStackHighWaterMark(apiWorkers[N_API_WORKERS > 1 ? 1 : 0].task) : 0;
+    Serial.printf("HB up=%lus epoch=%ld door=%s lock=%lds green=%lds "
+                  "heap=%u/min=%u psram=%u rssi=%ddBm wifi=%d blynk=%d "
+                  "apiBusy=%d burst=%d abandons=%u boot=#%u rr=%u wHW=%u/%u\n",
+                  now / 1000UL, (long)hbEpoch, doorOpen ? "OPEN" : "CLOSED",
+                  lockRemainS, greenRemainS,
+                  (unsigned)freeHeap, (unsigned)minHeap, (unsigned)freePsram, rssi,
+                  (int)WiFi.isConnected(), (int)Blynk.connected(),
+                  (int)apiTaskBusy(), (int)burstCapturing,
+                  (unsigned)apiAbandonCount, (unsigned)bootCounter,
+                  (unsigned)bootResetReason, (unsigned)w0, (unsigned)w1);
+  }
+
   // Blynk: V1 — reset prey frame count to 0 when lockout expires
   if (blynkLockoutWasActive && !doorLockoutActive()) {
     blynkLockoutWasActive = false;
     if (Blynk.connected()) Blynk.virtualWrite(V1, 0);
     blynkLockoutPreyFrames = 0;
+    // Lockout naturally expired — clear the persisted NVS entry too.
+    if (preyLockoutUntilEpoch != 0) persistLockoutEpoch(0);
   }
   if (doorLockoutActive()) blynkLockoutWasActive = true;
 
