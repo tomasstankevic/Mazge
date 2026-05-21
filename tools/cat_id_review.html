@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Cat ID Review</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: monospace; background: #111; color: #ddd; margin: 0; height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
+
+  */top bar   /* 
+  #topbar { display: flex; align-items: center; gap: 12px; padding: 6px 12px; background: #1a1a2e; border-bottom: 1px solid #333; flex-shrink: 0; flex-wrap: wrap; }
+  #progress { font-size: 0.85em; color: #aaa; white-space: nowrap; }
+  #stats { font-size: 0.82em; }
+  .stat-m { color: #7cb9e8; } .stat-b { color: #f28b82; } .stat-u { color: #888; }
+  #topbar button { padding: 4px 12px; border: none; border-radius: 4px; cursor: pointer; font-size: 0.82em; font-weight: bold; }
+  #btn-grid { background: #2a2a3e; color: #aad4f5; border: 1px solid #444; }
+  #btn-grid.active { background: #3a3a5e; border-color: #aad4f5; }
+  #btn-save { background: #2e7d32; color: #fff; }
+  #btn-export { background: #1565c0; color: #fff; }
+  #hint { font-size: 0.76em; color: #666; white-space: nowrap; }
+
+ single- */card view   /* 
+  #single { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 8px; overflow: hidden; }
+  #img-wrap { position: relative; display: flex; align-items: center; justify-content: center; flex: 1; width: 100%; }
+  #main-img { max-height: 100%; max-width: 100%; object-fit: contain; border-radius: 6px; border: 3px solid #333; transition: border-color 0.1s; }
+  #main-img.mazge { border-color: #7cb9e8; }
+  #main-img.benis { border-color: #f28b82; }
+  #main-img.unknown { border-color: #555; }
+  #nav-prev, #nav-next { position: absolute; top: 50%; transform: translateY(-50%); background: rgba(0,0,0,0.5); border: none; color: #aaa; font-size: 1.8em; cursor: pointer; padding: 8px 14px; border-radius: 4px; }
+  #nav-prev { left: 0; } #nav-next { right: 0; }
+  #nav-prev:hover, #nav-next:hover { background: rgba(0,0,0,0.8); color: #fff; }
+  #card-meta { text-align: center; margin-top: 6px; font-size: 0.78em; color: #888; }
+  #card-label-display { font-size: 1.3em; font-weight: bold; margin: 2px 0; }
+  .lbl-mazge { color: #7cb9e8; } .lbl-benis { color: #f28b82; } .lbl-unknown { color: #666; }
+  #label-btns { display: flex; gap: 8px; margin-top: 6px; }
+  #label-btns button { padding: 8px 28px; border: 2px solid transparent; border-radius: 6px; cursor: pointer; font-size: 1em; font-weight: bold; transition: all 0.1s; }
+  #btn-mazge { background: #1e3a5f; color: #7cb9e8; } #btn-mazge:hover, #btn-mazge.sel { background: #2a5298; border-color: #7cb9e8; }
+  #btn-benis { background: #5f1e1e; color: #f28b82; } #btn-benis:hover, #btn-benis.sel { background: #a02020; border-color: #f28b82; }
+  #btn-unknown { background: #222; color: #888; } #btn-unknown:hover, #btn-unknown.sel { background: #444; border-color: #888; }
+  #key-hint { font-size: 0.72em; color: #555; margin-top: 3px; }
+
+  */grid view   /* 
+  #grid-view { flex: 1; overflow-y: auto; padding: 8px; display: none; flex-wrap: wrap; gap: 6px; align-content: flex-start; }
+  #grid-view.visible { display: flex; }
+  .gcard { width: 160px; border-radius: 5px; overflow: hidden; border: 2px solid #333; background: #111; cursor: pointer; }
+  .gcard:hover { border-color: #aad4f5; }
+  .gcard.mazge { border-color: #7cb9e8; } .gcard.benis { border-color: #f28b82; }
+  .gcard img { width: 100%; height: 140px; object-fit: cover; display: block; }
+  .gcard-info { padding: 3px 5px; font-size: 0.68em; }
+  .gcard-id { color: #666; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .gcard-lbl { font-weight: bold; }
+  .gcard.mazge .gcard-lbl { color: #7cb9e8; }
+  .gcard.benis .gcard-lbl { color: #f28b82; }
+  .gcard.unknown .gcard-lbl { color: #555; }
+  #grid-filters { flex-shrink: 0; display: flex; gap: 6px; padding: 6px 8px 0; background: #111; }
+  #grid-filters button { padding: 3px 10px; border-radius: 12px; border: 1px solid #444; background: #1a1a1a; color: #aaa; cursor: pointer; font-size: 0.78em; }
+  #grid-filters button.active { border-color: #aad4f5; color: #aad4f5; }
+
+  #toast { position: fixed; bottom: 16px; right: 16px; background: #333; color: #fff; padding: 8px 16px; border-radius: 5px; display: none; font-size: 0.85em; z-index: 100; }
+  #flash { position: fixed; top: 0; left: 0; right: 0; bottom: 0; pointer-events: none; opacity: 0; transition: opacity 0.15s; z-index: 50; }
+</style>
+</head>
+<body>
+
+<div id="topbar">
+  <span id="progress"></span>Loading
+  <span id="stats"></span>
+</b>=navigate</span>
+  <button id="btn-grid" onclick=" Grid</button>toggleGrid()">
+</div>  <button id="btn-export" onclick="exportJSONL()">  <button id="btn-save" onclick="saveJSON()">
+
+<!-- single view -->
+<div id="single">
+  <div id="img-wrap">
+    <button id="nav-prev" onclick="go(-1)"  <<<<<<<<</button>prev">title="
+    <img id="main-img" src="" alt="">
+ </button>next">
+  </div>
+  <div id="card-meta">
+    <div id="card-id-text"></div>
+    <div id="card-label-display"></div>
+  </div>
+  <div id="label-btns">
+    <button id="btn-mazge" onclick="label('mazge')">Mazge <small>[M]</small></button>
+    <button id="btn-benis" onclick="label('benis')">Benis <small>[B]</small></button>
+    <button id="btn-unknown" onclick="label('unknown')">Unknown <small>[U]</small></button>
+  </div>
+  <div id="key-hint">Arrow keys        labeling auto-advances</div>navigate 
+</div>
+
+<!-- grid view (hidden by default) -->
+<div id="grid-filters" style="display:none">
+  <button class="active" data-gf="all" onclick="setGFilter('all',this)">All</button>
+  <button data-gf="mazge" onclick="setGFilter('mazge',this)">Mazge</button>
+  <button data-gf="benis" onclick="setGFilter('benis',this)">Benis</button>
+  <button data-gf="unknown" onclick="setGFilter('unknown',this)">Unknown</button>
+</div>
+<div id="grid-view"></div>
+
+<div id="flash"></div>
+<div id="toast"></div>
+
+<script>
+let data = [];
+let cur = 0;
+let gridMode = false;
+let gFilter = 'all';
+
+async function loadData() {
+  const url = new URLSearchParams(location.search).get('data') || 'catid_pending.json';
+  const resp = await fetch(url);
+  data = await resp.json();
+  cur = 0;
+  showSingle();
+  updateStats();
+}
+
+ single view // 
+function showSingle() {
+  if (gridMode) return;
+  const item = data[cur];
+  const img = document.getElementById('main-img');
+  img.src = '../' + item.frame_path;
+  img.className = item.label;
+  document.getElementById('card-id-text').textContent = `#${item.idx}  ${item.burst_id}`;
+  renderLabel(item.label);
+  document.getElementById('progress').textContent = `${cur + 1} / ${data.length}`;
+}
+
+function renderLabel(lbl) {
+  const d = document.getElementById('card-label-display');
+  d.className = 'lbl-' + lbl;
+  d.textContent = lbl.toUpperCase();
+  ['mazge','benis','unknown'].forEach(l => {
+    document.getElementById('btn-' + (l==='unknown'?'unknown':l)).classList.toggle('sel', l === lbl);
+  });
+  document.getElementById('main-img').className = lbl;
+}
+
+function label(lbl) {
+  data[cur].label = lbl;
+  renderLabel(lbl);
+  updateStats();
+  // flash colour
+  const flash = document.getElementById('flash');
+  const colors = {mazge:'#7cb9e820',benis:'#f28b8220',unknown:'#55555520'};
+  flash.style.background = colors[lbl];
+  flash.style.opacity = '1';
+  setTimeout(() => flash.style.opacity = '0', 120);
+  // advance
+  if (cur < data.length - 1) setTimeout(() => { cur++; showSingle(); }, 80);
+}
+
+function go(delta) {
+  cur = Math.max(0, Math.min(data.length - 1, cur + delta));
+  showSingle();
+}
+
+ grid view // 
+function toggleGrid() {
+  gridMode = !gridMode;
+  document.getElementById('btn-grid').classList.toggle('active', gridMode);
+  document.getElementById('single').style.display = gridMode ? 'none' : 'flex';
+  document.getElementById('grid-view').classList.toggle('visible', gridMode);
+  document.getElementById('grid-filters').style.display = gridMode ? 'flex' : 'none';
+  if (gridMode) renderGrid();
+}
+
+function setGFilter(f, btn) {
+  gFilter = f;
+  document.querySelectorAll('#grid-filters button').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  renderGrid();
+}
+
+function renderGrid() {
+  const grid = document.getElementById('grid-view');
+  grid.innerHTML = '';
+  data.forEach((item, i) => {
+    if (gFilter !== 'all' && item.label !== gFilter) return;
+    const c = document.createElement('div');
+    c.className = `gcard ${item.label}`;
+    c.innerHTML = `<img src="../${item.frame_path}" loading="lazy" onerror="this.style.background='#333'">
+      <div class="gcard-info"><div class="gcard-id" title="${item.burst_id}">#${item.idx} ${item.burst_id.slice(-14)}</div>
+      <div class="gcard-lbl">${item.label.toUpperCase()}</div></div>`;
+    c.onclick = () => { cur = i; gridMode = true; toggleGrid(); };  // jump to this card
+    grid.appendChild(c);
+  });
+}
+
+ stats // 
+function updateStats() {
+  const c = {mazge:0,benis:0,unknown:0};
+  data.forEach(d => c[d.label] = (c[d.label]||0) + 1);
+  document.getElementById('stats').innerHTML =
+    `<span class="stat-m">M:${c.mazge}</span> <span class="stat-b">B:${c.benis}</span> <span class="stat-u">U:${c.unknown}</span>`;
+}
+
+ keyboard // 
+document.addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+  if (gridMode) { if (e.key === 'Escape') toggleGrid(); return; }
+  switch(e.key) {
+    case 'm': case 'M': label('mazge'); break;
+    case 'b': case 'B': label('benis'); break;
+    case 'u': case 'U': case '?': label('unknown'); break;
+    case 'ArrowLeft':  e.preventDefault(); go(-1); break;
+    case 'ArrowRight': e.preventDefault(); go(+1); break;
+    case 'ArrowUp':    e.preventDefault(); go(-10); break;
+    case 'ArrowDown':  e.preventDefault(); go(+10); break;
+    case 'Escape': if (gridMode) toggleGrid(); break;
+  }
+});
+
+ save / export // 
+function saveJSON() {
+  const blob = new Blob([JSON.stringify(data, null, 2)], {type:'application/json'});
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
+  a.download = 'catid_reviewed.json'; a.click();
+  toast('Saved catid_reviewed.json');
+}
+
+function exportJSONL() {
+  const ts = new Date().toISOString();
+  const lines = data.map(item => JSON.stringify({
+    image_id: item.frame_path,
+    source: 'human:ruta:burst_cat_id',
+    label: item.label,
+    confidence: item.label === 'unknown' ? 0.0 : 1.0,
+    ts,
+    notes: `reviewed; auto was: ${item.auto_label}`
+  }));
+  const blob = new Blob([lines.join('\n') + '\n'], {type:'application/x-ndjson'});
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
+  a.download = 'catid_labels.jsonl'; a.click();
+  toast('Exported catid_labels. append to dataset/labels.jsonl');jsonl 
+}
+
+function toast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg; t.style.display = 'block';
+  setTimeout(() => t.style.display = 'none', 3500);
+}
+
+loadData();
+</script>
+</body>
+</html>

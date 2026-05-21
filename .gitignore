@@ -47,3 +47,4 @@ test_jpeg_crop
 
 # Diagnostic poller output
 tools/diag_log.jsonl
+models/prey_v1/*.pt

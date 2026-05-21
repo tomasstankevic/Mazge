@@ -81,13 +81,15 @@ def load_human_burst_labels(jsonl_path: Path) -> dict[str, dict]:
             burst_id = parts[2]
             entry = out.setdefault(burst_id, {})
             if src.startswith("human:"):
-                kind = src.split(":")[-1]  # "burst_prey" / "burst_direction" / "burst_subject"
+                kind = src.split(":")[-1]  # "burst_prey" / "burst_direction" / "burst_subject" / "burst_cat_id"
                 if kind == "burst_prey":
                     entry["prey"] = (rec.get("label"), rec.get("confidence"))
                 elif kind == "burst_direction":
                     entry["direction"] = (rec.get("label"), rec.get("confidence"))
                 elif kind == "burst_subject":
                     entry["subject"] = (rec.get("label"), rec.get("confidence"))
+                elif kind == "burst_cat_id":
+                    entry["cat_id"] = (rec.get("label"), rec.get("confidence"))
             elif src == "model:yolo11n_subject_v1":
                 yolo_map = entry.setdefault("yolo_subject_per_frame", {})
                 yolo_map[image_id] = rec.get("label")
@@ -263,6 +265,7 @@ def build_frame_rows(burst_dir: Path,
             "human_prey": "",          # "" / 0 / 1 / unclear
             "human_direction": "",     # "" / entering / exiting / unclear
             "human_subject": "",       # "" / empty / cat / human / other / unclear
+            "cat_id": "",              # "" / mazge / benis / unknown
             # Per-frame YOLO subject auto-label (0 empty, 1 cat, 2 human, 3 other):
             "yolo_subject": yolo_subject_per_frame.get(image_id, ""),
             # Best-available subject label for THIS frame:
@@ -297,6 +300,7 @@ def build_frame_rows(burst_dir: Path,
     human_prey = None  # 0 / 1 / "unclear" / None
     human_dir = None   # 0 (entering) / 1 (exiting) / "unclear" / None
     human_subj = None  # 0 empty / 1 cat / 2 human / 3 other / "unclear" / None
+    human_cat_id = None  # "mazge" / "benis" / "unknown" / None
     if human:
         if "prey" in human:
             lab, conf = human["prey"]
@@ -307,6 +311,9 @@ def build_frame_rows(burst_dir: Path,
         if "subject" in human:
             lab, conf = human["subject"]
             human_subj = "unclear" if (conf == 0.0) else lab
+        if "cat_id" in human:
+            lab, conf = human["cat_id"]
+            human_cat_id = lab  # "mazge" / "benis" / "unknown"
 
     if human_prey in (0, 1):
         consolidated_burst_label = human_prey
@@ -327,6 +334,8 @@ def build_frame_rows(burst_dir: Path,
             row["human_direction"] = DIR_STR.get(human_dir, "")
         if human_subj is not None:
             row["human_subject"] = SUBJ_STR.get(human_subj, "")
+        if human_cat_id is not None:
+            row["cat_id"] = human_cat_id
 
         # Per-frame `subject`: human burst override > YOLO per-frame > ""
         if human_subj in (0, 1, 2, 3):
@@ -378,6 +387,7 @@ def build_frame_rows(burst_dir: Path,
         "human_prey": PREY_STR.get(human_prey, ""),
         "human_direction": DIR_STR.get(human_dir, ""),
         "human_subject": SUBJ_STR.get(human_subj, ""),
+        "cat_id": human_cat_id if human_cat_id is not None else "",
         "yolo_subject_majority": _majority_yolo_subject(yolo_subject_per_frame, images, burst_id),
         "consolidated_burst_label": consolidated_burst_label,
         "has_full_analysis": int(full is not None),
@@ -394,7 +404,14 @@ def append_labels_jsonl(jsonl_path: Path, new_records: list[dict]) -> int:
     Dedup key is (image_id, source, label) — we do NOT dedup on confidence/notes
     so a re-run of the same source overwrites nothing (no duplicate row).
     """
-    seen: set[tuple[str, str, int]] = set()
+    def _label_key(v):
+        """Normalise label to a comparable value for dedup (int or str)."""
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return str(v)
+
+    seen: set[tuple] = set()
     if jsonl_path.exists():
         with jsonl_path.open() as f:
             for line in f:
@@ -406,13 +423,13 @@ def append_labels_jsonl(jsonl_path: Path, new_records: list[dict]) -> int:
                 except Exception:
                     continue
                 seen.add((rec.get("image_id", ""), rec.get("source", ""),
-                          int(rec.get("label", -1))))
+                          _label_key(rec.get("label", -1))))
 
     now = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
     added = 0
     with jsonl_path.open("a") as f:
         for r in new_records:
-            key = (r["image_id"], r["source"], int(r["label"]))
+            key = (r["image_id"], r["source"], _label_key(r["label"]))
             if key in seen:
                 continue
             seen.add(key)
