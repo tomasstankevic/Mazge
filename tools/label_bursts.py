@@ -105,12 +105,26 @@ def existing_labels(image_id: str) -> dict:
     })
 
 
-def build_queue(filter_mode: str) -> list[dict]:
-    """Return list of burst dicts to label, in priority order."""
+def build_queue(filter_mode: str, since: str | None = None,
+                until: str | None = None) -> list[dict]:
+    """Return list of burst dicts to label, in priority order.
+
+    `since` / `until` are inclusive 8-digit date prefixes (YYYYMMDD) matched
+    against the burst folder name. Folders whose name does not start with an
+    8-digit date are skipped when either bound is set.
+    """
     items = []
     for d in sorted(SD.iterdir()):
         if not d.is_dir():
             continue
+        if since or until:
+            prefix = d.name[:8]
+            if not (len(prefix) == 8 and prefix.isdigit()):
+                continue
+            if since and prefix < since:
+                continue
+            if until and prefix > until:
+                continue
         meta = burst_meta(d)
         if not meta:
             continue
@@ -634,13 +648,15 @@ def main() -> None:
         choices=["prey-positive", "disagreement", "unlabelled", "all",
                  "human", "other"],
     )
+    ap.add_argument("--since", help="YYYYMMDD, inclusive lower bound on burst date")
+    ap.add_argument("--until", help="YYYYMMDD, inclusive upper bound on burst date")
     args = ap.parse_args()
 
     print(f"Building queue (filter={args.filter})...", flush=True)
     rebuild_label_index()
     print(f"  loaded {len(LABEL_INDEX)} labelled image entries", flush=True)
     global BURSTS
-    BURSTS = build_queue(args.filter)
+    BURSTS = build_queue(args.filter, since=args.since, until=args.until)
     print(f"  -> {len(BURSTS)} bursts in queue", flush=True)
     if not BURSTS:
         print("Nothing to label. Try --filter all", flush=True)
