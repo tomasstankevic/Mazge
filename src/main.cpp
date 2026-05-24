@@ -908,13 +908,23 @@ struct ApiTiming {
 // ===== Per-worker TLS client (one per concurrent worker) =====
 // Each worker keeps a persistent WiFiClientSecure + HTTPClient pair. Workers
 // use these directly (instead of the shared tlsClient/httpApi).
+//
+// IMPORTANT: only the worker task itself ever touches w->tls / w->http
+// (allocates, calls, frees). Other tasks (loop()'s watchdog, idle-TLS-free
+// path, ToF-trigger pre-warm) communicate by setting the volatile request
+// flags below. The worker checks them between queue iterations and acts on
+// them locally. This avoids a use-after-free race that previously caused
+// PANIC crashes when the API watchdog tore down TLS pointers while the
+// worker was mid-POST.
 struct ApiWorker {
   WiFiClientSecure *tls;
   HTTPClient *http;
   bool connected;
-  unsigned long connectedAtMs;  // when this TLS session was opened
+  unsigned long connectedAtMs;     // when this TLS session was opened
   TaskHandle_t task;
   int id;
+  volatile bool resetTlsRequested; // set by other tasks; worker tears down on next iteration
+  volatile bool prewarmRequested;  // set by other tasks; worker ensures TLS is connected
 };
 static ApiWorker apiWorkers[N_API_WORKERS];
 
@@ -1014,8 +1024,30 @@ static void apiWorkerTask(void *arg) {
   ApiWorker *w = (ApiWorker *)arg;
   Serial.printf("API worker %d started\n", w->id);
   while (apiWorkersRunning) {
+    // === Race-free self-managed TLS state ===
+    // Other tasks (loop watchdog, idle-TLS-free, ToF pre-warm) may set
+    // resetTlsRequested or prewarmRequested. We act on them here, with no
+    // other task touching w->tls / w->http.
+    if (w->resetTlsRequested) {
+      w->resetTlsRequested = false;
+      if (w->http) { w->http->end(); delete w->http; w->http = NULL; }
+      if (w->tls)  { w->tls->stop(); delete w->tls;  w->tls  = NULL; }
+      w->connected = false;
+      Serial.printf("API[w%d]: TLS torn down on request (heap %u)\n",
+                    w->id, (unsigned)ESP.getFreeHeap());
+    }
+    if (w->prewarmRequested) {
+      w->prewarmRequested = false;
+      if (!w->connected) {
+        unsigned long t0 = millis();
+        bool ok = ensureWorkerTls(w);
+        Serial.printf("API[w%d]: pre-warm TLS %s in %lums\n",
+                      w->id, ok ? "OK" : "FAILED", millis() - t0);
+      }
+    }
+
     ApiWorkItem item;
-    // Wait up to 100ms for work (so we can check apiWorkersRunning)
+    // Wait up to 100ms for work (so we can check apiWorkersRunning + flags)
     if (xQueueReceive(apiWorkQueue, &item, pdMS_TO_TICKS(100)) != pdPASS) {
       continue;
     }
@@ -1071,22 +1103,22 @@ static void stopApiWorkers() {
 // reconnects. After GREEN_LIGHT_MS of inactivity (no burst, no cat) we can
 // safely drop these to claw back ~120KB of internal heap.
 //
-// Safe to call from loop() because the workers are blocked on the work
-// queue when no burst is in progress; the TLS pointers they read are
-// behind the `connected` flag they own. We still take the conservative
-// approach of only freeing when apiTaskBusy() is false.
+// SIGNAL ONLY: we never touch w->tls / w->http from this task. We just set
+// the request flag; the worker tears down its own pointers from its own
+// task. This eliminates the use-after-free race that previously crashed
+// during back-to-back bursts.
 static void freeIdleWorkerTls() {
-  uint32_t freedAny = 0;
+  uint32_t signaled = 0;
   for (int i = 0; i < N_API_WORKERS; i++) {
     ApiWorker *w = &apiWorkers[i];
-    if (!w->connected && !w->http && !w->tls) continue;
-    if (w->http) { w->http->end();  delete w->http; w->http = NULL; freedAny++; }
-    if (w->tls)  { w->tls->stop();  delete w->tls;  w->tls  = NULL; freedAny++; }
-    w->connected = false;
+    if (w->connected || w->http || w->tls) {
+      w->resetTlsRequested = true;
+      signaled++;
+    }
   }
-  if (freedAny) {
-    Serial.printf("API: freed idle worker TLS (heap now %u)\n",
-                  (unsigned)ESP.getFreeHeap());
+  if (signaled) {
+    Serial.printf("API: requested %u workers to free TLS (will happen within 100ms)\n",
+                  (unsigned)signaled);
   }
 }
 
@@ -1410,18 +1442,19 @@ static inline bool apiTaskBusy() {
   return true;
 }
 
-// Force-tear down both the legacy shared TLS client and per-worker TLS clients.
+// Force-tear down the legacy shared TLS client and request worker tear down.
 // Used by the watchdog after abandoning an in-flight analysis. The next call
 // will reconnect from scratch.
+//
+// Worker TLS is torn down via a flag the worker checks itself — never from
+// this task — to avoid use-after-free races while the worker is mid-POST.
 static void resetAllApiConnections(const char *reason) {
   Serial.printf("API: resetting TLS connections (%s)\n", reason);
   tlsConnected = false;
   if (httpApi)   { httpApi->end();   delete httpApi;   httpApi   = NULL; }
   if (tlsClient) { tlsClient->stop(); delete tlsClient; tlsClient = NULL; }
   for (int i = 0; i < N_API_WORKERS; i++) {
-    apiWorkers[i].connected = false;
-    if (apiWorkers[i].http) { apiWorkers[i].http->end();  delete apiWorkers[i].http; apiWorkers[i].http = NULL; }
-    if (apiWorkers[i].tls)  { apiWorkers[i].tls->stop();  delete apiWorkers[i].tls;  apiWorkers[i].tls  = NULL; }
+    apiWorkers[i].resetTlsRequested = true;
   }
 }
 
@@ -2530,6 +2563,11 @@ static esp_err_t cmd_handler(httpd_req_t *req) {
     blynkSetTriggerActive();
     lastBurstTriggerMs = nowMs;
     pendingBurstTriggerMs = nowMs;
+    // Pre-warm worker TLS during the BURST_SHIFT_MS + capture window so the
+    // first API POST does not pay TLS handshake cost.
+    for (int i = 0; i < N_API_WORKERS; i++) {
+      if (!apiWorkers[i].connected) apiWorkers[i].prewarmRequested = true;
+    }
     // Lock current exposure for the shift window so post-trigger frames
     // don't auto-brighten when ToF object leaves range.
     sensor_t *s = esp_camera_sensor_get();
@@ -3740,6 +3778,13 @@ void loop() {
       lastBurstTriggerMs = now;
       pendingBurstTriggerMs = now;
       tofCloseCount = 0;
+      // Pre-warm worker TLS NOW: BURST_SHIFT_MS (200ms) + capture (~1s) gives
+      // the workers ~1.2s to complete a TLS handshake before the first API
+      // POST is issued. Hides the freeIdleWorkerTls cost on cold bursts and
+      // restores pre-2026-05-21 API latency (~3-4s/burst instead of 5-6s).
+      for (int i = 0; i < N_API_WORKERS; i++) {
+        if (!apiWorkers[i].connected) apiWorkers[i].prewarmRequested = true;
+      }
       sensor_t *s = esp_camera_sensor_get();
       if (s) {
         frozenAec  = s->status.aec_value;
