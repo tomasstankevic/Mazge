@@ -42,6 +42,10 @@
 #define SD_CMD  38
 #define SD_D0   40
 bool sdReady = false;
+// Serializes all SD_MMC access. SD_MMC is NOT thread-safe — concurrent
+// reads from multiple httpd worker tasks crash the firmware. All file
+// open/read/close in handler code paths must take this first.
+SemaphoreHandle_t sdMutex = NULL;
 
 // ===== Cat door control (transistor on GPIO 14) =====
 // Door is normally CLOSED (entry side): pin HIGH = open, pin LOW = closed.
@@ -228,10 +232,6 @@ volatile int jpegQuality = 95;
 // to free ~13KB internal heap for TLS / WiFi / lwIP buffers.
 #define BURST_ARCHIVES 15
 
-// ===== Prey Detection API (autonomous mode) =====
-#define LAPTOP_TIMEOUT_MS 30000  // consider laptop absent after 30s no contact
-volatile unsigned long lastLaptopContactMs = 0;  // last /burst_wait or /burststream request
-
 // ===== HDR gain + exposure bracketing =====
 // Manual exposure: capped at 1/40s to avoid motion blur on moving cats.
 // OV2640 AEC value ≈ line count. At 20MHz XCLK, VGA: 1 line ≈ 80µs.
@@ -253,7 +253,6 @@ volatile int nightLuxThreshold = 10;  // (legacy, unused)
 volatile int dayGainCap = 2;          // (legacy, unused)
 volatile int dayExposureDiv = 4;      // (legacy, unused)
 volatile int dayMinExposure = 20;     // (legacy, unused)
-volatile int apiFallbackMs = 5000;    // fallback timeout (ms)
 volatile int burstTriggerMm = 480;    // ToF trigger distance (mm)
 volatile int burstCooldownMs = 15000;  // cooldown between bursts (ms)
 // Gain brackets: 10 frames cycling through (gain, exposure) pairs.
@@ -322,17 +321,18 @@ int postTriggerRemaining = 0;  // >0 means we're in post-trigger phase
 
 // ===== Persistent event log (NVS) =====
 #define MAX_EVENTS 50
-struct EventEntry {
+struct __attribute__((packed)) EventEntry {
   uint32_t uptimeMs;   // millis() when result finalized
   int32_t  epochSec;   // Unix epoch seconds (real clock)
   int16_t  gen;        // burst generation
   int8_t   frameCount; // number of frames in burst
-  int8_t   result;     // -1=pending, 0=no prey, 1=prey
+  int8_t   result;     // -1=pending, 0=clear, N=prey frames detected (RING_SIZE max = 10)
   int16_t  distMin;    // min distance mm (-1 = unknown)
   int16_t  distMax;    // max distance mm (-1 = unknown)
-  uint8_t  mode;       // 0=laptop, 1=autonomous
+  uint8_t  mode;       // 0=laptop (legacy, always 1 now), 1=autonomous
   int8_t   trend;      // 0=unknown, 1=entering (far→close), 2=exiting (close→far), 3=passing
-}; // 17 bytes per entry
+  uint16_t latencyMs;  // API processing latency (apiDoneMs - apiCallMs), 0 = unknown
+}; // packed = exactly 20 bytes
 Preferences nvsPrefs;
 EventEntry eventLog[MAX_EVENTS];
 int eventCount = 0;
@@ -419,7 +419,7 @@ int classifyDistTrend(BurstArchive &archive) {
   return is_exit ? 2 : 1;
 }
 
-void addEvent(int gen, int frameCount, int result, int distMin, int distMax, int trend, bool autonomous) {
+void addEvent(int gen, int frameCount, int result, int distMin, int distMax, int trend, bool autonomous, time_t epochOverride = 0, uint16_t latencyMs = 0) {
   if (eventCount >= MAX_EVENTS) {
     // Shift out oldest half to make room
     int keep = MAX_EVENTS / 2;
@@ -430,7 +430,9 @@ void addEvent(int gen, int frameCount, int result, int distMin, int distMax, int
   e.uptimeMs = millis();
   time_t nowEpoch;
   time(&nowEpoch);
-  e.epochSec = (int32_t)nowEpoch;
+  // Prefer the burst dir's actual creation epoch (passed in) so the UI can
+  // reconstruct the SD dir name exactly. Falls back to "now" if caller has none.
+  e.epochSec = (int32_t)((epochOverride > 1000000000) ? epochOverride : nowEpoch);
   e.gen = (int16_t)gen;
   e.frameCount = (int8_t)frameCount;
   e.result = (int8_t)result;
@@ -438,6 +440,7 @@ void addEvent(int gen, int frameCount, int result, int distMin, int distMax, int
   e.distMax = (int16_t)distMax;
   e.mode = autonomous ? 1 : 0;
   e.trend = (int8_t)trend;
+  e.latencyMs = latencyMs;
   eventCount++;
   saveEventLog();
 }
@@ -684,6 +687,14 @@ void saveBurstToSd(int archIdx) {
   BurstArchive &arch = burstArchives[archIdx];
   if (arch.count == 0) return;
 
+  // Take SD mutex for the whole write — keeps HTTP /sdget readers from
+  // touching the controller mid-write (causes data corruption / crash).
+  // Long timeout: writes can take several seconds for 10 frames.
+  if (sdMutex && xSemaphoreTake(sdMutex, pdMS_TO_TICKS(30000)) != pdTRUE) {
+    Serial.println("SD: saveBurstToSd timeout waiting for mutex — skipping");
+    return;
+  }
+
   char dirPath[48];
   time_t now;
   time(&now);
@@ -763,6 +774,7 @@ void saveBurstToSd(int archIdx) {
     mf.close();
   }
   Serial.printf("SD: saved %d frames + meta to %s\n", arch.count, dirPath);
+  if (sdMutex) xSemaphoreGive(sdMutex);
 }
 
 // ===== Autonomous prey API call (when laptop absent) =====
@@ -1420,11 +1432,29 @@ api_done:
   }
   if (dMin > dMax) { dMin = -1; dMax = -1; }
   int trend = classifyDistTrend(archive);
-  addEvent(archive.generation, archive.count, archive.apiPreyDetected, dMin, dMax, trend, true);
+  // result encodes prey-frame count: -1=pending, 0=clear, N=N prey frames
+  int eventResult = (archive.apiPreyDetected < 0) ? -1 : preyFrameCount;
+  // Parse dir epoch from sdPath ("/YYYYMMDD_HHMMSS_genN") so the UI can
+  // reconstruct the SD dir name exactly without searching.
+  time_t dirEpoch = 0;
+  if (archive.sdPath[0] == '/') {
+    int y, mo, d, hh, mm, ss, g;
+    if (sscanf(archive.sdPath + 1, "%4d%2d%2d_%2d%2d%2d_gen%d",
+               &y, &mo, &d, &hh, &mm, &ss, &g) == 7) {
+      struct tm ti = {};
+      ti.tm_year = y - 1900; ti.tm_mon = mo - 1; ti.tm_mday = d;
+      ti.tm_hour = hh; ti.tm_min = mm; ti.tm_sec = ss; ti.tm_isdst = -1;
+      dirEpoch = mktime(&ti);
+    }
+  }
+  // API processing latency (cap at uint16 max = 65535 ms)
+  unsigned long latMs = (archive.apiDoneMs > archive.apiCallMs)
+    ? (archive.apiDoneMs - archive.apiCallMs) : 0;
+  if (latMs > 65535) latMs = 65535;
+  addEvent(archive.generation, archive.count, eventResult, dMin, dMax, trend, true, dirEpoch, (uint16_t)latMs);
 
   // Blynk: push event telemetry (prey result + detail)
-  unsigned long latencyMs = archive.apiDoneMs - archive.apiCallMs;
-  blynkPushEvent(archive.apiPreyDetected == 1 ? 1 : 0, preyFrameCount, archive.count, latencyMs);
+  blynkPushEvent(archive.apiPreyDetected == 1 ? 1 : 0, preyFrameCount, archive.count, latMs);
 }
 
 // Guard: only one API task at a time (timestamp-based, auto-expires).
@@ -1474,63 +1504,161 @@ static void apiCheckTask(void *param) {
   vTaskDelete(NULL);
 }
 
-// Fallback task: wait briefly for laptop, then run autonomous immediately
-static void apiFallbackTask(void *param) {
-  int archIdx = (int)(intptr_t)param;
-  unsigned long t0 = millis();
-  // Wait up to apiFallbackMs for laptop to process first
-  while (millis() - t0 < (unsigned long)apiFallbackMs) {
-    if (archIdx < 0 || archIdx >= burstArchiveCount) { apiTaskStartMs = 0; vTaskDelete(NULL); return; }
-    if (burstArchives[archIdx].apiPreyDetected != -1) {
-      Serial.printf("API fallback: archive %d already processed (prey=%d), skipping\n",
-        archIdx, burstArchives[archIdx].apiPreyDetected);
-      apiTaskStartMs = 0;
-      vTaskDelete(NULL);
-      return;
-    }
-    vTaskDelay(500 / portTICK_PERIOD_MS);
-  }
-  // Laptop didn't process in time — run autonomous check on ALL frames
-  if (archIdx >= 0 && archIdx < burstArchiveCount &&
-      burstArchives[archIdx].apiPreyDetected == -1) {
-    Serial.printf("API fallback: laptop timeout, running autonomous check on archive %d\n", archIdx);
-    autonomousApiCheck(archIdx);
-  }
-  if (!apiAbandonRequested) apiAbandonCount = 0;  // healthy completion
-  apiTaskStartMs = 0;
-  vTaskDelete(NULL);
-}
-
 // ===== HTML page =====
 const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html>
 <head>
   <meta charset="UTF-8">
-  <title>ESP32-CAM</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>ESP32-CAM Live</title>
   <style>
     * { box-sizing: border-box; }
-    body { background: #111; color: #eee; font-family: sans-serif;
-           display: flex; flex-direction: column; align-items: center;
-           margin: 0; padding: 12px; }
-    h1 { margin: 0 0 4px; font-size: 1.3em; }
-    #stats { color: #888; margin: 0 0 8px; font-family: monospace; font-size: 0.85em; }
-    img { max-width: 100%; border: 2px solid #333; border-radius: 8px; }
-    .rot90 { transform: rotate(-90deg); }
-    #stream-wrap { display:inline-block; position:relative; overflow:hidden; max-width:400px; }
-    #stream-wrap img { position:absolute; top:50%; left:50%; transform:rotate(-90deg) translate(-50%,-50%); transform-origin:0 0; max-width:none; }
-    .thumb-wrap { display:inline-block; position:relative; width:19%; aspect-ratio:3/4; overflow:hidden; border:2px solid #555; border-radius:3px; cursor:pointer; }
-    .thumb-wrap .dist-label { position:absolute; bottom:0; left:0; right:0; background:rgba(0,0,0,0.7); color:#4cf; font-size:0.65em; text-align:center; padding:1px 0; z-index:1; pointer-events:none; }
-    .thumb-wrap.api-prey { border-color:#f44; border-width:3px; box-shadow:0 0 6px #f44; }
-    .thumb-wrap.api-clear { border-color:#4f4; border-width:3px; box-shadow:0 0 6px #4f4; }
-    .thumb-wrap.api-err { border-color:#f84; border-width:3px; }
-    .thumb-wrap img { position:absolute; top:50%; left:50%; transform:rotate(-90deg) translate(-50%,-50%); transform-origin:0 0; width:133.33%; max-width:none; border:none; border-radius:0; }
-    .controls { display: grid; grid-template-columns: 110px 1fr 50px;
-                gap: 4px 8px; align-items: center; width: 100%; max-width: 500px;
-                margin-top: 12px; font-size: 0.85em; }
-    .controls label { text-align: right; color: #aaa; }
-    .controls select, .controls input[type=range] { width: 100%; }
-    .controls .val { color: #6f6; font-family: monospace; }
+    body {
+      background: radial-gradient(circle at 25% 10%, #1e2538 0%, #0d1017 35%, #07080b 100%);
+      color: #e8edf7;
+      font-family: sans-serif;
+      margin: 0;
+      padding: 10px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+    h1 { margin: 0 0 4px; font-size: 1.35em; }
+    #stats { color: #7f8aa4; margin: 0 0 8px; font-family: monospace; font-size: 0.82em; }
+    #stream-wrap {
+      display: inline-block;
+      position: relative;
+      overflow: hidden;
+      max-width: 420px;
+      border-radius: 10px;
+      border: 1px solid #29314a;
+      background: #05070d;
+    }
+    #stream-wrap img {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: rotate(-90deg) translate(-50%,-50%);
+      transform-origin: 0 0;
+      max-width: none;
+    }
+    .btn-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      justify-content: center;
+      margin: 0 0 8px;
+    }
+    .btn-row button, .btn-row a {
+      padding: 8px 14px;
+      border: none;
+      border-radius: 7px;
+      color: #fff;
+      text-decoration: none;
+      font-size: 0.92em;
+      cursor: pointer;
+      display: inline-block;
+    }
+    .btn-main { background: #8b2e2e; }
+    .btn-warn { background: #a06a16; }
+    .btn-safe { background: #2f7a49; }
+    .btn-danger { background: #822f2f; }
+    .btn-link { background: #314d85; }
+    .btn-link2 { background: #37543d; }
+    .panel {
+      width: 100%;
+      max-width: 920px;
+      margin-top: 14px;
+      background: rgba(14, 20, 33, 0.9);
+      border: 1px solid #25304a;
+      border-radius: 10px;
+      padding: 10px;
+    }
+    .panel h2 { font-size: 1.06em; margin: 0 0 8px; }
+    #events-log {
+      max-height: 180px;
+      overflow-y: auto;
+      font-family: monospace;
+      font-size: 0.8em;
+      color: #97a6c9;
+      border-top: 1px solid #202a3f;
+      padding-top: 5px;
+    }
+    .event-row { padding: 2px 0; border-bottom: 1px solid #182034; }
+    .event-row:hover { background: #1d2740; }
+    .burst-card {
+      margin: 8px 0;
+      padding: 8px;
+      border-radius: 8px;
+      background: #131b2b;
+      border: 1px solid #2a3754;
+    }
+    .burst-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      align-items: baseline;
+      margin-bottom: 6px;
+      font-size: 0.86em;
+    }
+    .burst-date { color: #c6d4f3; font-weight: bold; }
+    .burst-meta { color: #7f90b6; }
+    .burst-grid {
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      gap: 6px;
+    }
+    .thumb-wrap {
+      position: relative;
+      width: 100%;
+      aspect-ratio: 3 / 4;
+      overflow: hidden;
+      border: 2px solid #4e5976;
+      border-radius: 5px;
+      background: #060911;
+      cursor: pointer;
+    }
+    .thumb-wrap img {
+      /* Camera shoots landscape but device is mounted sideways → rotate
+         90° CCW. After rotation a 4:3 source matches the 3:4 thumb-wrap.
+         We set width/height to the wrap's *opposite* dimension and translate
+         so the rotated image fills the box. */
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      width: 133.333%;       /* = wrap height / wrap width (4/3) */
+      height: 75%;           /* = wrap width  / wrap height (3/4) */
+      transform: translate(-50%, -50%) rotate(-90deg);
+      transform-origin: center center;
+      object-fit: cover;
+      display: block;
+      border: none;
+    }
+    .thumb-wrap.prey { border-color: #f54; box-shadow: 0 0 8px rgba(255, 80, 70, 0.7); }
+    .thumb-wrap.clear { border-color: #4d5; box-shadow: 0 0 8px rgba(80, 240, 80, 0.55); }
+    .thumb-wrap.pending { border-color: #cc8; }
+    .thumb-wrap.missing::before {
+      content: 'missing';
+      position: absolute; top: 50%; left: 0; right: 0;
+      transform: translateY(-50%);
+      text-align: center; color: #888; font-size: 0.75em;
+    }
+    .idx {
+      position: absolute;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      text-align: center;
+      font-size: 0.67em;
+      padding: 1px 0;
+      background: rgba(0, 0, 0, 0.68);
+      color: #c9d7f8;
+    }
+    #prey-empty { color: #94a4c8; font-size: 0.9em; }
+    @media (max-width: 760px) {
+      .burst-grid { grid-template-columns: repeat(2, 1fr); }
+    }
   </style>
 </head>
 <body>
@@ -1544,68 +1672,33 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
   <p id="stats">Connecting...</p>
   <p id="sensor-line" style="font-size:1.1em;font-weight:bold;margin:4px 0 8px;">Distance: <span id="dist-val" style="color:#888;">--</span> | AEC: <span id="aec-val" style="color:#888;">--</span></p>
   <p id="mode-line" style="font-size:1em;margin:2px 0 6px;">Mode: <span id="mode-val" style="padding:2px 10px;border-radius:4px;font-weight:bold;">--</span></p>
-  <div style="display:flex;flex-wrap:wrap;gap:8px;justify-content:center;margin:0 0 8px;">
-    <button id="toggle-stream" onclick="toggleStream()" style="padding:8px 20px;font-size:1em;cursor:pointer;border-radius:6px;border:none;background:#a44;color:#fff;">Start Stream</button>
-    <button onclick="fetch('/cmd?trigger=1')" style="padding:8px 20px;font-size:1em;cursor:pointer;border-radius:6px;border:none;background:#c80;color:#fff;">Fake Trigger</button>
-    <button onclick="fetch('/cmd?door=1')" style="padding:8px 20px;font-size:1em;cursor:pointer;border-radius:6px;border:none;background:#284;color:#fff;">Open Door</button>
-    <button onclick="fetch('/cmd?door=0')" style="padding:8px 20px;font-size:1em;cursor:pointer;border-radius:6px;border:none;background:#822;color:#fff;">Close Door</button>
-    <a href="/settings" style="padding:8px 16px;font-size:0.9em;border-radius:6px;background:#335;color:#8af;text-decoration:none;display:inline-block;">⚙ Settings</a>
-    <a href="/sd" style="padding:8px 16px;font-size:0.9em;border-radius:6px;background:#253;color:#8fa;text-decoration:none;display:inline-block;">💾 SD Card</a>
+  <div class="btn-row">
+    <button id="toggle-stream" class="btn-main" onclick="toggleStream()">Start Stream</button>
+    <button class="btn-warn" onclick="fetch('/cmd?trigger=1')">Fake Trigger</button>
+    <button class="btn-safe" onclick="fetch('/cmd?door=1')">Open Door</button>
+    <button class="btn-danger" onclick="fetch('/cmd?door=0')">Close Door</button>
+    <a href="/controls" class="btn-link">Camera Controls</a>
+    <a href="/settings" class="btn-link">Advanced Settings</a>
+    <a href="/sd" class="btn-link2">SD Card</a>
   </div>
   <div id="stream-wrap"><img id="stream" src="" onload="var w=this.naturalHeight,h=this.naturalWidth;this.parentElement.style.width=w+'px';this.parentElement.style.height=h+'px';this.style.width=h+'px';" /></div>
-  <div id="events-section" style="width:100%;max-width:700px;margin-top:16px;">
-    <h2 style="font-size:1.1em;margin:0 0 6px;">Events Log</h2>
-    <div id="events-log" style="background:#0a0a1a;border:1px solid #333;border-radius:6px;padding:8px;max-height:200px;overflow-y:auto;font-family:monospace;font-size:0.8em;color:#aaa;"></div>
+  <div class="panel">
+    <h2>Events Log</h2>
+    <div id="events-log"></div>
   </div>
-  <div id="burst-section" style="width:100%;max-width:700px;margin-top:16px;">
-    <h2 style="font-size:1.1em;margin:0 0 6px;">Burst Archives: <span id="burst-archive-count">0</span> | PSRAM: <span id="psram-val">--</span></h2>
-    <div id="burst-archives"></div>
+
+  <div class="panel">
+    <h2>Burst Viewer</h2>
+    <div id="prey-meta" style="font-size:0.84em;color:#8da0c9;margin-bottom:6px;">Click an event row above to load its burst frames from SD.</div>
+    <div id="prey-empty" style="display:none;"></div>
+    <div id="prey-list"></div>
   </div>
-  <div class="controls">
-    <label>Quality</label>
-    <input type="range" id="quality" min="10" max="100" value="95">
-    <span class="val" id="quality-val">80</span>
 
-    <label>FPS Cap</label>
-    <input type="range" id="fps" min="1" max="30" value="15">
-    <span class="val" id="fps-val">15</span>
-
-    <label>Brightness</label>
-    <input type="range" id="brightness" min="-2" max="2" value="0">
-    <span class="val" id="brightness-val">0</span>
-
-    <label>Contrast</label>
-    <input type="range" id="contrast" min="-2" max="2" value="0">
-    <span class="val" id="contrast-val">0</span>
-
-    <label>Auto Exposure</label>
-    <select id="aec">
-      <option value="1" selected>On</option>
-      <option value="0">Off</option>
-    </select><span></span>
-
-    <label>AE Level</label>
-    <input type="range" id="ae_level" min="-2" max="2" value="0">
-    <span class="val" id="ae_level-val">0</span>
-
-    <label>Gain Ceil</label>
-    <select id="gainceiling">
-      <option value="0">2x</option>
-      <option value="2" selected>8x</option>
-      <option value="4">32x</option>
-      <option value="6">128x</option>
-    </select><span></span>
-
-    <label>Night Mode</label>
-    <select id="nightmode">
-      <option value="0" selected>Off</option>
-      <option value="1">On</option>
-    </select><span></span>
-  </div>
   <script>
     let streamOn = false;
     let doorOpenState = null;
     let lockoutEndsAt = 0; // local timestamp (ms); 0 = no lockout
+    let lastEventsSignature = '';
 
     function renderDoorBanner() {
       const banner = document.getElementById('door-banner');
@@ -1648,35 +1741,6 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     // Local 1 Hz tick so the lockout countdown updates smoothly between /stats polls
     setInterval(renderDoorBanner, 1000);
 
-    // Fetch per-frame API results and colorize thumbnail borders
-    async function colorizeGallery(archIdx, galEl) {
-      try {
-        const r = await fetch('/burstmeta?a=' + archIdx);
-        const m = await r.json();
-        if (!m.apiResults) return;
-        galEl.dataset.colored = '1';
-        const wraps = galEl.querySelectorAll('.thumb-wrap');
-        for (let i = 0; i < wraps.length && i < m.apiResults.length; i++) {
-          const res = m.apiResults[i];
-          if (res === 1) wraps[i].classList.add('api-prey');
-          else if (res === 0) wraps[i].classList.add('api-clear');
-          else if (res === -1) { /* not checked */ }
-          else wraps[i].classList.add('api-err');
-        }
-        // Add distance labels
-        if (m.distanceMm) {
-          for (let i = 0; i < wraps.length && i < m.distanceMm.length; i++) {
-            if (!wraps[i].querySelector('.dist-label')) {
-              const lbl = document.createElement('span');
-              lbl.className = 'dist-label';
-              const d = m.distanceMm[i];
-              lbl.textContent = d >= 0 ? d + 'mm' : (d === -1 ? '>500' : '--');
-              wraps[i].appendChild(lbl);
-            }
-          }
-        }
-      } catch(e) {}
-    }
     const streamImg = document.getElementById('stream');
     const toggleBtn = document.getElementById('toggle-stream');
 
@@ -1695,6 +1759,97 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
         streamOn = true;
         clearInterval(statsInterval);
         statsInterval = setInterval(pollStats, 1000);
+      }
+    }
+
+    function fmtEpoch(epoch) {
+      if (!epoch || epoch < 1700000000) return 'time unknown';
+      const d = new Date(epoch * 1000);
+      return d.toLocaleString('sv-SE', { timeZone: 'Europe/Bratislava', hour12: false });
+    }
+
+    function frameClassByResult(res) {
+      if (res === 1) return 'prey';
+      if (res === 0) return 'clear';
+      return 'pending';
+    }
+
+    let currentBurstKey = null;
+    // Show a burst that's still in RAM (latest archives). Instant — no SD reads.
+    async function showRamBurst(archIdx, label) {
+      const key = 'ram:' + archIdx + ':' + label;
+      const listEl = document.getElementById('prey-list');
+      const emptyEl = document.getElementById('prey-empty');
+      const metaEl = document.getElementById('prey-meta');
+      currentBurstKey = key;
+      metaEl.textContent = 'Loading burst ' + label + ' (RAM)...';
+      listEl.innerHTML = '';
+      emptyEl.style.display = 'none';
+      try {
+        const r = await fetch('/raminfo?a=' + archIdx);
+        const data = await r.json();
+        if (currentBurstKey !== key) return;
+        if (!data.ok) { metaEl.textContent = label + ' — ' + (data.error || 'failed'); return; }
+        const frames = data.frames || [];
+        metaEl.textContent = label + ' — RAM archive #' + data.a + ' gen' + data.gen + ' (' + frames.length + ' frames)';
+        if (frames.length === 0) { emptyEl.textContent = 'No frames'; emptyEl.style.display = ''; return; }
+        let html = '<div class="burst-card"><div class="burst-grid">';
+        for (let fr of frames) {
+          const cls = frameClassByResult(fr.res);
+          const u = '/ramburst?a=' + data.a + '&i=' + fr.idx;
+          html += '<div class="thumb-wrap ' + cls + '" data-url="' + u + '">';
+          html += '<img src="' + u + '" onerror="this.style.display=\'none\';this.parentNode.classList.add(\'missing\');">';
+          html += '<div class="idx">f' + String(fr.idx).padStart(2, '0') + (fr.res === 1 ? ' PREY' : (fr.res === 0 ? ' CLEAR' : ' ?')) + '</div>';
+          html += '</div>';
+        }
+        html += '</div></div>';
+        listEl.innerHTML = html;
+        for (const el of listEl.querySelectorAll('.thumb-wrap')) {
+          el.onclick = () => { const u = el.getAttribute('data-url'); if (u) window.open(u, '_blank'); };
+        }
+      } catch (e) {
+        if (currentBurstKey === key) document.getElementById('prey-meta').textContent = 'Failed: ' + e;
+      }
+    }
+
+    async function showBurst(epoch, gen, label) {
+      const key = epoch + ':' + gen;
+      const listEl = document.getElementById('prey-list');
+      const emptyEl = document.getElementById('prey-empty');
+      const metaEl = document.getElementById('prey-meta');
+      currentBurstKey = key;
+      metaEl.textContent = 'Loading burst ' + label + '...';
+      listEl.innerHTML = '';
+      emptyEl.style.display = 'none';
+      try {
+        const r = await fetch('/burstinfo?epoch=' + epoch + '&gen=' + gen);
+        const data = await r.json();
+        if (currentBurstKey !== key) return; // user clicked another row already
+        if (!data.ok) {
+          metaEl.textContent = label + ' — ' + (data.error || 'failed');
+          return;
+        }
+        const frames = data.frames || [];
+        metaEl.textContent = label + ' — ' + data.dir + ' (' + frames.length + ' frames)';
+        if (frames.length === 0) { emptyEl.textContent = 'No frames'; emptyEl.style.display = ''; return; }
+        let html = '<div class="burst-card"><div class="burst-grid">';
+        for (let fr of frames) {
+          const cls = frameClassByResult(fr.res);
+          const u = '/sdget?f=' + encodeURIComponent(data.dir + '/' + fr.file);
+          html += '<div class="thumb-wrap ' + cls + '" data-url="' + u + '">';
+          html += '<img src="' + u + '" onerror="this.style.display=\'none\';this.parentNode.classList.add(\'missing\');">';
+          html += '<div class="idx">f' + String(fr.idx).padStart(2, '0') + (fr.res === 1 ? ' PREY' : (fr.res === 0 ? ' CLEAR' : ' ?')) + '</div>';
+          html += '</div>';
+        }
+        html += '</div></div>';
+        listEl.innerHTML = html;
+        for (const el of listEl.querySelectorAll('.thumb-wrap')) {
+          el.onclick = () => { const u = el.getAttribute('data-url'); if (u) window.open(u, '_blank'); };
+        }
+      } catch (e) {
+        if (currentBurstKey === key) {
+          document.getElementById('prey-meta').textContent = 'Failed to load burst: ' + e;
+        }
       }
     }
 
@@ -1737,30 +1892,35 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
         for (let i = events.length - 1; i >= 0; i--) {
           const e = events[i];
           const timeStr = formatEventTime(e);
-          let mode, modeColor;
-          if (e.mode === 1) { mode = '\u{1F916} AUTO'; modeColor = '#fc4'; }
-          else { mode = '\u{1F4BB} LAPTOP'; modeColor = '#4f4'; }
           let distStr;
           if (e.dMin >= 0 && e.dMax >= 0) {
             distStr = e.dMin === e.dMax ? e.dMin + 'mm' : e.dMin + '\u2192' + e.dMax + 'mm';
           } else { distStr = '--'; }
           let resStr, resColor;
-          if (e.res === 1) { resStr = '\u{1F534} PREY'; resColor = '#f44'; }
+          if (e.res >= 2) { resStr = '\u{1F534} PREY (' + e.res + 'f)'; resColor = '#f44'; }
+          else if (e.res === 1) { resStr = '\u{1F7E0} PREY (1f)'; resColor = '#fa3'; }
           else if (e.res === 0) { resStr = '\u{1F7E2} CLEAR'; resColor = '#4f4'; }
           else { resStr = '\u23F3 PENDING'; resColor = '#888'; }
           const div = document.createElement('div');
           div.id = 'pev-' + e.t;
-          div.style.cssText = 'padding:3px 0;border-bottom:1px solid #222;opacity:0.7;';
+          div.className = 'event-row';
+          div.style.opacity = '0.7';
           const trendLabels = ['\u2753','\u27A1\uFE0F IN','\u2B05\uFE0F OUT','\u21C6 FLAT'];
           const trendColors = ['#666','#4f4','#f84','#fc4'];
           const tl = e.trend >= 0 && e.trend <= 3 ? e.trend : 0;
           div.innerHTML = '<span style="color:#666">' + timeStr + '</span> ' +
             '<b style="color:#aaa">gen' + e.gen + '</b> ' +
             '<span style="color:#6af">' + e.nf + 'f</span> ' +
-            '<span style="color:' + modeColor + '">' + mode + '</span> ' +
             '<span style="color:#4cf">' + distStr + '</span> ' +
             '<span style="color:' + trendColors[tl] + '">' + trendLabels[tl] + '</span> ' +
-            '<span style="color:' + resColor + '">' + resStr + '</span>';
+            '<span style="color:' + resColor + '">' + resStr + '</span>' +
+            (e.lat > 0 ? ' <span style="color:#607296">' + (e.lat / 1000).toFixed(1) + 's</span>' : '');
+          // Make rows with a real epoch clickable: load the burst on demand
+          if (e.epoch && e.epoch > 1700000000) {
+            div.style.cursor = 'pointer';
+            const ep = e.epoch, gn = e.gen, lbl = timeStr + ' gen' + e.gen;
+            div.onclick = () => showBurst(ep, gn, lbl);
+          }
           el.appendChild(div);
         }
       } catch(e) { console.log('Failed to load persisted events:', e); }
@@ -1786,167 +1946,55 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
           lockoutEndsAt = (s.lockoutMs && s.lockoutMs > 0) ? (Date.now() + s.lockoutMs) : 0;
           renderDoorBanner();
         }
-        // PSRAM display
-        const psv = document.getElementById('psram-val');
-        if (psv && s.freePsram !== undefined) psv.textContent = (s.freePsram/1024).toFixed(0) + ' KB';
-        // Mode indicator
+        // Mode indicator (always autonomous now)
         const modeEl = document.getElementById('mode-val');
         if (modeEl) {
-          if (s.laptopPresent) {
-            modeEl.textContent = '\u{1F4BB} LAPTOP';
-            modeEl.style.background = '#264'; modeEl.style.color = '#4f4';
-          } else {
-            modeEl.textContent = '\u{1F916} AUTONOMOUS';
-            modeEl.style.background = '#642'; modeEl.style.color = '#fc4';
-          }
+          modeEl.textContent = '\u{1F916} AUTONOMOUS';
+          modeEl.style.background = '#642'; modeEl.style.color = '#fc4';
         }
-        // Update events log with rich per-burst data
+        // Lightweight live summary row (newest burst only)
         if (s.apiResults && s.apiResults.length > 0) {
-          const el = document.getElementById('events-log');
-          const up = s.uptimeMs || 0;
-          for (let a = 0; a < s.apiResults.length; a++) {
-            const gen = s.burstGens ? s.burstGens[a] : (a+1);
-            const res = s.apiResults[a];
-            const sent = s.apiSent ? s.apiSent[a] : 0;
-            const trigMs = s.triggerMs ? s.triggerMs[a] : 0;
-            const doneMs = s.apiDoneMs ? s.apiDoneMs[a] : 0;
-            const dMin = s.distMin ? s.distMin[a] : -1;
-            const dMax = s.distMax ? s.distMax[a] : -1;
-            const nf = s.burstCounts ? s.burstCounts[a] : 0;
-            // Time: seconds since boot when triggered
-            const tSec = (trigMs / 1000).toFixed(0);
-            const tAgo = ((up - trigMs) / 1000).toFixed(0);
-            // Mode: autonomous if apiFramesSent > 0, laptop if result set but no esp frames sent
-            let mode, modeColor;
-            if (res === -1) { mode = '⏳'; modeColor = '#888'; }
-            else if (sent > 0) { mode = '🤖 AUTO'; modeColor = '#fc4'; }
-            else { mode = '💻 LAPTOP'; modeColor = '#4f4'; }
-            // Distance gradient
-            let distStr;
-            if (dMin >= 0 && dMax >= 0) {
-              distStr = dMin === dMax ? dMin + 'mm' : dMin + '→' + dMax + 'mm';
-            } else { distStr = '--'; }
-            // Result
-            let resStr, resColor;
-            if (res === 1) { resStr = '🔴 PREY'; resColor = '#f44'; }
-            else if (res === 0) { resStr = '🟢 CLEAR'; resColor = '#4f4'; }
-            else { resStr = '⏳ PENDING'; resColor = '#888'; }
-            // Processing time
-            let procStr = '';
-            if (doneMs > 0 && trigMs > 0) {
-              procStr = ' ' + ((doneMs - trigMs) / 1000).toFixed(1) + 's';
-            }
-            const entryId = 'ev-' + gen;
-            let existing = document.getElementById(entryId);
-            const html = '<span style="color:#666">' + tAgo + 's ago</span> ' +
-              '<b style="color:#aaa">gen' + gen + '</b> ' +
-              '<span style="color:#6af">' + nf + 'f</span> ' +
-              '<span style="color:' + modeColor + '">' + mode + '</span> ' +
-              '<span style="color:#4cf">' + distStr + '</span> ' +
-              '<span style="color:' + resColor + '">' + resStr + '</span>' +
-              '<span style="color:#666">' + procStr + '</span>';
-            if (!existing) {
-              const div = document.createElement('div');
-              div.id = entryId;
-              div.style.cssText = 'padding:3px 0;border-bottom:1px solid #222;';
-              div.innerHTML = html;
-              el.insertBefore(div, el.firstChild);
-            } else if (existing.dataset.res !== String(res) || existing.dataset.up !== String(up)) {
-              existing.innerHTML = html;
-            }
-            if (existing) { existing.dataset.res = String(res); existing.dataset.up = String(up); }
-          }
-          el.dataset.count = String(s.apiResults.length);
-        }
-        // Update burst gallery
-        const bac = document.getElementById('burst-archive-count');
-        const ba = document.getElementById('burst-archives');
-        bac.textContent = s.burstArchives;
-        // Also update API result colors on existing galleries (only if thumbnails loaded)
-        if (ba.dataset.key && s.burstArchives > 0) {
-          for (let a = 0; a < s.burstArchives; a++) {
-            const gal = document.getElementById('gal-' + a);
-            if (gal && gal.childElementCount > 0 && !gal.dataset.colored && s.apiResults && s.apiResults[a] !== -1) {
-              colorizeGallery(a, gal);
-            }
-          }
-        }
-        const key = s.burstGen;
-        if (s.burstArchives > 0 && key !== parseInt(ba.dataset.key || '0')) {
-          ba.dataset.key = key;
-          ba.innerHTML = '';
-          for (let a = s.burstArchives - 1; a >= 0; a--) {
-            const isLatest = (a === s.burstArchives - 1);
-            const apiRes = s.apiResults ? s.apiResults[a] : -1;
-            const apiTag = apiRes === 1 ? ' \u{1F534}PREY' : apiRes === 0 ? ' \u{1F7E2}OK' : '';
-            const gen = s.burstGens ? s.burstGens[a] : '';
-            const div = document.createElement('div');
-            div.style.cssText = 'margin:8px 0;padding:8px;background:#1a1a2e;border-radius:6px;cursor:pointer;';
-            if (apiRes === 1) div.style.background = '#2e1a1a';
-            const h = document.createElement('h3');
-            h.style.cssText = 'font-size:0.95em;margin:0 0 4px;color:#aaa;';
-            h.textContent = (isLatest ? '\u25BC ' : '\u25B6 ') + 'Burst #' + gen + ' (' + s.burstCounts[a] + 'f)' + apiTag;
-            div.appendChild(h);
-            const gallery = document.createElement('div');
-            gallery.id = 'gal-' + a;
-            gallery.style.cssText = 'display:flex;flex-wrap:wrap;gap:4px;' + (isLatest ? '' : 'display:none;');
-            h.onclick = function() {
-              gallery.style.display = gallery.style.display === 'none' ? 'flex' : 'none';
-              h.textContent = (gallery.style.display === 'none' ? '\u25B6 ' : '\u25BC ') + 'Burst #' + gen + ' (' + s.burstCounts[a] + 'f)' + apiTag;
-              if (gallery.childElementCount === 0) {
-                for (let i = 0; i < s.burstCounts[a]; i++) {
-                  const wrap = document.createElement('div');
-                  wrap.className = 'thumb-wrap';
-                  const img = document.createElement('img');
-                  img.src = '/burst?a=' + a + '&i=' + i + '&t=' + Date.now();
-                  wrap.onclick = function(e) { e.stopPropagation(); window.open(img.src); };
-                  wrap.appendChild(img);
-                  gallery.appendChild(wrap);
-                }
-                colorizeGallery(a, gallery);
-              }
-            };
-            if (isLatest) {
-              for (let i = 0; i < s.burstCounts[a]; i++) {
-                const wrap = document.createElement('div');
-                wrap.className = 'thumb-wrap';
-                const img = document.createElement('img');
-                img.src = '/burst?a=' + a + '&i=' + i + '&t=' + Date.now();
-                wrap.onclick = function(e) { e.stopPropagation(); window.open(img.src); };
-                wrap.appendChild(img);
-                gallery.appendChild(wrap);
-              }
-              colorizeGallery(a, gallery);
-            }
-            div.appendChild(gallery);
-            ba.appendChild(div);
+          const last = s.apiResults.length - 1;
+          const sig = String(s.burstGen) + ':' + String(s.apiResults[last]);
+          if (sig !== lastEventsSignature) {
+            lastEventsSignature = sig;
+            const el = document.getElementById('events-log');
+            const gen = s.burstGens ? s.burstGens[last] : s.burstGen;
+            const res = s.apiResults[last];
+            const dMin = s.distMin ? s.distMin[last] : -1;
+            const dMax = s.distMax ? s.distMax[last] : -1;
+            const nf = s.burstCounts ? s.burstCounts[last] : 0;
+            const trigMs = s.triggerMs ? s.triggerMs[last] : 0;
+            const doneMs = s.apiDoneMs ? s.apiDoneMs[last] : 0;
+            const up = s.uptimeMs || 0;
+            const tAgo = trigMs > 0 ? ((up - trigMs) / 1000).toFixed(0) : '--';
+            const distStr = (dMin >= 0 && dMax >= 0) ? (dMin === dMax ? dMin + 'mm' : (dMin + '→' + dMax + 'mm')) : '--';
+            let resText = res === 1 ? 'PREY' : res === 0 ? 'CLEAR' : 'PENDING';
+            let resColor = res === 1 ? '#f44' : res === 0 ? '#4f4' : '#999';
+            const proc = (doneMs > 0 && trigMs > 0) ? (((doneMs - trigMs) / 1000).toFixed(1) + 's') : '';
+            const row = document.createElement('div');
+            row.className = 'event-row';
+            row.innerHTML = '<span style="color:#607296">' + tAgo + 's ago</span> ' +
+              '<b style="color:#a7b9de">gen' + gen + '</b> ' +
+              '<span style="color:#85a5da">' + nf + 'f</span> ' +
+              '<span style="color:#64b7d7">' + distStr + '</span> ' +
+              '<span style="color:' + resColor + '">' + resText + '</span> ' +
+              '<span style="color:#607296">' + proc + '</span>';
+            // Click → show from RAM (instant, no SD).
+            row.style.cursor = 'pointer';
+            const archIdx = last;
+            const lbl = tAgo + 's ago gen' + gen;
+            row.onclick = () => showRamBurst(archIdx, lbl);
+            el.insertBefore(row, el.firstChild);
+            while (el.childElementCount > 80) el.removeChild(el.lastChild);
+            // Auto-display newly-finished burst (only when API is done — res != -1)
+            if (res !== -1) showRamBurst(archIdx, lbl);
           }
         }
       } catch(e) {}
     }
     let statsInterval = setInterval(pollStats, 200);
-
-    // Send command helper
-    async function cmd(k, v) {
-      try { await fetch(`/cmd?${k}=${v}`); } catch(e) {}
-    }
-
-    // Wire up controls
-    for (const id of ['quality','fps','brightness','contrast','ae_level']) {
-      const el = document.getElementById(id);
-      const valEl = document.getElementById(id + '-val');
-      el.addEventListener('input', () => { valEl.textContent = el.value; });
-      el.addEventListener('change', () => { cmd(id, el.value); });
-    }
-    document.getElementById('aec').addEventListener('change', function() {
-      cmd('aec', this.value);
-    });
-    document.getElementById('gainceiling').addEventListener('change', function() {
-      cmd('gainceiling', this.value);
-    });
-    document.getElementById('nightmode').addEventListener('change', function() {
-      cmd('nightmode', this.value);
-    });
+    pollStats();
   </script>
 </body>
 </html>
@@ -2089,43 +2137,9 @@ static esp_err_t stream_handler(httpd_req_t *req) {
 // RTOS task, so it never blocks the main loop.
 static esp_err_t index_handler(httpd_req_t *req) {
   httpd_resp_set_type(req, "text/html");
+  // Never cache the HTML — UI changes ship via OTA and we want them visible immediately.
+  httpd_resp_set_hdr(req, "Cache-Control", "no-store, must-revalidate");
   return httpd_resp_send(req, INDEX_HTML, strlen(INDEX_HTML));
-}
-
-// Long-poll: blocks until burstGen > gen parameter, then returns stats JSON
-static esp_err_t burst_wait_handler(httpd_req_t *req) {
-  lastLaptopContactMs = millis();
-  char buf[32];
-  int knownGen = 0;
-  if (httpd_req_get_url_query_str(req, buf, sizeof(buf)) == ESP_OK) {
-    char val[16];
-    if (httpd_query_key_value(buf, "gen", val, sizeof(val)) == ESP_OK)
-      knownGen = atoi(val);
-  }
-  // Wait up to 30s for a new burst
-  for (int i = 0; i < 600 && burstGen <= knownGen; i++) {
-    vTaskDelay(50 / portTICK_PERIOD_MS);
-  }
-  // Fall through to stats response (even on timeout — client retries)
-  // Build the same JSON as stats_handler
-  char json[512];
-  char archBuf[80] = "[";
-  for (int a = 0; a < burstArchiveCount; a++) {
-    char tmp[12];
-    snprintf(tmp, sizeof(tmp), "%s%d", a > 0 ? "," : "", burstArchives[a].count);
-    strlcat(archBuf, tmp, sizeof(archBuf));
-  }
-  strlcat(archBuf, "]", sizeof(archBuf));
-  bool laptopPresent1 = (lastLaptopContactMs > 0) &&
-                        (millis() - lastLaptopContactMs < LAPTOP_TIMEOUT_MS);
-  snprintf(json, sizeof(json),
-    "{\"fps\":%.1f,\"frameBytes\":%u,\"frameMs\":%u,\"totalFrames\":%u,\"distance\":%d,\"lux\":%u,\"autoAec\":%d,\"burstArchives\":%d,\"burstGen\":%d,\"burstCounts\":%s,\"laptopPresent\":%s,\"freePsram\":%u,\"uptimeMs\":%lu}",
-    streamFps, lastFrameBytes, lastFrameMs, frameCount,
-    tofDistance, alsLux, autoBaseAec, burstArchiveCount, burstGen, archBuf,
-    laptopPresent1 ? "true" : "false", ESP.getFreePsram(), millis());
-  httpd_resp_set_type(req, "application/json");
-  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-  return httpd_resp_send(req, json, strlen(json));
 }
 
 static esp_err_t stats_handler(httpd_req_t *req) {
@@ -2189,8 +2203,6 @@ static esp_err_t stats_handler(httpd_req_t *req) {
   strlcat(distMinBuf, "]", sizeof(distMinBuf));
   strlcat(distMaxBuf, "]", sizeof(distMaxBuf));
   strlcat(apiDoneBuf, "]", sizeof(apiDoneBuf));
-  bool laptopPresent2 = (lastLaptopContactMs > 0) &&
-                        (millis() - lastLaptopContactMs < LAPTOP_TIMEOUT_MS);
   unsigned long nowMs = millis();
   unsigned long lockoutMsRemaining = 0;
   if (preyLockoutUntilMs != 0 && (long)(preyLockoutUntilMs - nowMs) > 0) {
@@ -2200,13 +2212,13 @@ static esp_err_t stats_handler(httpd_req_t *req) {
     "{\"fps\":%.1f,\"frameBytes\":%u,\"frameMs\":%u,\"totalFrames\":%u,\"distance\":%d,\"lux\":%u,\"autoAec\":%d,"
     "\"burstArchives\":%d,\"burstGen\":%d,\"burstCounts\":%s,\"apiResults\":%s,\"burstGens\":%s,"
     "\"apiSent\":%s,\"triggerMs\":%s,\"apiDoneMs\":%s,\"distMin\":%s,\"distMax\":%s,"
-    "\"laptopPresent\":%s,\"freePsram\":%u,\"uptimeMs\":%lu,"
+    "\"freePsram\":%u,\"uptimeMs\":%lu,"
     "\"doorOpen\":%s,\"lockoutMs\":%lu,"
     "\"apiBusy\":%s,\"apiTaskAgeMs\":%lu,\"apiAbandons\":%u,\"lastTriggerMs\":%lu}",
     streamFps, lastFrameBytes, lastFrameMs, frameCount,
     tofDistance, alsLux, autoBaseAec, burstArchiveCount, burstGen, archBuf,
     apiResBuf, genBuf, sentBuf, trigBuf, apiDoneBuf, distMinBuf, distMaxBuf,
-    laptopPresent2 ? "true" : "false", ESP.getFreePsram(), nowMs,
+    ESP.getFreePsram(), nowMs,
     doorOpen ? "true" : "false", lockoutMsRemaining,
     apiTaskStartMs ? "true" : "false",
     apiTaskStartMs ? (nowMs - apiTaskStartMs) : 0UL,
@@ -2603,29 +2615,6 @@ static esp_err_t cmd_handler(httpd_req_t *req) {
     s->set_gainceiling(s, (gainceiling_t)atoi(val));
   } else if (httpd_query_key_value(buf, "nightmode", val, sizeof(val)) == ESP_OK) {
     s->set_aec2(s, atoi(val));
-  } else if (httpd_query_key_value(buf, "result", val, sizeof(val)) == ESP_OK) {
-    // Laptop reporting prey detection result: /cmd?result=0&a=2
-    int preyResult = atoi(val);
-    char aVal[8];
-    int archIdx = burstArchiveCount - 1; // default: latest archive
-    if (httpd_query_key_value(buf, "a", aVal, sizeof(aVal)) == ESP_OK) {
-      archIdx = atoi(aVal);
-    }
-    if (archIdx >= 0 && archIdx < burstArchiveCount) {
-      burstArchives[archIdx].apiPreyDetected = preyResult ? 1 : 0;
-      burstArchives[archIdx].apiDoneMs = millis();
-      Serial.printf("Laptop result: archive %d prey=%d\n", archIdx, preyResult);
-      // Persist event to NVS
-      BurstArchive &la = burstArchives[archIdx];
-      int ldMin = 9999, ldMax = -9999;
-      for (int i = 0; i < la.count; i++) {
-        int d = la.images[i].distanceMm;
-        if (d >= 0) { if (d < ldMin) ldMin = d; if (d > ldMax) ldMax = d; }
-      }
-      if (ldMin > ldMax) { ldMin = -1; ldMax = -1; }
-      int ltrend = classifyDistTrend(la);
-      addEvent(la.generation, la.count, la.apiPreyDetected, ldMin, ldMax, ltrend, false);
-    }
   } else if (httpd_query_key_value(buf, "reboot", val, sizeof(val)) == ESP_OK) {
     httpd_resp_set_type(req, "text/plain");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
@@ -2687,75 +2676,300 @@ void startStreamServer() {
 
   config.max_uri_handlers = 3;
   config.lru_purge_enable = true;
-  config.max_open_sockets = 3;  // stream + burst_wait + margin
-
-  httpd_uri_t burst_wait_uri = {
-    .uri = "/burst_wait",
-    .method = HTTP_GET,
-    .handler = burst_wait_handler,
-    .user_ctx = NULL
-  };
+  config.max_open_sockets = 2;  // stream + margin
 
   if (httpd_start(&stream_httpd, &config) == ESP_OK) {
     httpd_register_uri_handler(stream_httpd, &stream_uri);
-    httpd_register_uri_handler(stream_httpd, &burst_wait_uri);
     Serial.println("Stream server started on port 81");
   }
 }
 
-// ===== MJPEG burst stream: all frames in one multipart response =====
-static esp_err_t burststream_handler(httpd_req_t *req) {
-  lastLaptopContactMs = millis();
-  char buf[48], val[8];
-  int len = httpd_req_get_url_query_len(req) + 1;
-  if (len <= 1 || len > (int)sizeof(buf)) { httpd_resp_send_404(req); return ESP_FAIL; }
-  httpd_req_get_url_query_str(req, buf, sizeof(buf));
-  int archIdx = 0;
-  if (httpd_query_key_value(buf, "a", val, sizeof(val)) == ESP_OK) archIdx = atoi(val);
-  if (archIdx < 0 || archIdx >= burstArchiveCount) { httpd_resp_send_404(req); return ESP_FAIL; }
-
-  int fd = httpd_req_to_sockfd(req);
-  int yes = 1;
-  setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
-
-  httpd_resp_set_type(req, STREAM_CONTENT_TYPE);
-  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-
-  char part_buf[80];
-  BurstArchive &archive = burstArchives[archIdx];
-
-  for (int i = 0; i < archive.count; i++) {
-    if (!archive.images[i].buf) continue;
-    // Burst images are already JPEG
-    httpd_resp_send_chunk(req, STREAM_BOUNDARY, strlen(STREAM_BOUNDARY));
-    size_t hlen = snprintf(part_buf, sizeof(part_buf), STREAM_PART, archive.images[i].len);
-    httpd_resp_send_chunk(req, part_buf, hlen);
-    esp_err_t res = httpd_resp_send_chunk(req, (const char *)archive.images[i].buf, archive.images[i].len);
-    if (res != ESP_OK) return res;  // client disconnected
-  }
-  // Final boundary + empty chunk to signal end of stream
-  httpd_resp_send_chunk(req, "\r\n--" PART_BOUNDARY "--\r\n", strlen("\r\n--" PART_BOUNDARY "--\r\n"));
-  httpd_resp_send_chunk(req, NULL, 0);
-  return ESP_OK;
+static bool parseJsonIntField(const char *json, const char *key, long *outVal) {
+  const char *p = strstr(json, key);
+  if (!p) return false;
+  p += strlen(key);
+  while (*p == ' ' || *p == '\t' || *p == ':') p++;
+  if (*p == '\0') return false;
+  char *endPtr = NULL;
+  long v = strtol(p, &endPtr, 10);
+  if (endPtr == p) return false;
+  *outVal = v;
+  return true;
 }
 
-static esp_err_t burst_handler(httpd_req_t *req) {
-  char buf[48];
-  char val[8];
-  int len = httpd_req_get_url_query_len(req) + 1;
-  if (len <= 1 || len > (int)sizeof(buf)) { httpd_resp_send_404(req); return ESP_FAIL; }
-  httpd_req_get_url_query_str(req, buf, sizeof(buf));
-  // /burst?a=archiveIdx&i=imageIdx
-  int archIdx = 0, imgIdx = 0;
-  if (httpd_query_key_value(buf, "a", val, sizeof(val)) == ESP_OK) archIdx = atoi(val);
-  if (httpd_query_key_value(buf, "i", val, sizeof(val)) == ESP_OK) imgIdx = atoi(val);
+static int parseApiResultsArray(const char *json, int8_t outRes[RING_SIZE]) {
+  for (int i = 0; i < RING_SIZE; i++) outRes[i] = -1;
+  const char *p = strstr(json, "\"apiResults\":[");
+  if (!p) return 0;
+  p = strchr(p, '[');
+  if (!p) return 0;
+  p++;
+  int count = 0;
+  while (*p && *p != ']' && count < RING_SIZE) {
+    while (*p == ' ' || *p == '\t' || *p == ',') p++;
+    if (*p == ']') break;
+    char *endPtr = NULL;
+    long v = strtol(p, &endPtr, 10);
+    if (endPtr == p) break;
+    if (v < -1) v = -1;
+    if (v > 1) v = 1;
+    outRes[count++] = (int8_t)v;
+    p = endPtr;
+    while (*p == ' ' || *p == '\t' || *p == ',') p++;
+  }
+  return count;
+}
+
+static bool loadMetaJson(const char *dirName, char *metaBuf, size_t metaBufSize) {
+  if (!dirName || !metaBuf || metaBufSize < 32) return false;
+  char path[96];
+  snprintf(path, sizeof(path), "/%s/meta.json", dirName);
+  File f = SD_MMC.open(path);
+  if (!f || f.isDirectory()) return false;
+  size_t n = f.readBytes(metaBuf, metaBufSize - 1);
+  metaBuf[n] = '\0';
+  f.close();
+  return n > 0;
+}
+
+static bool fileNameEndsWithJpg(const char *name) {
+  if (!name) return false;
+  const char *base = strrchr(name, '/');
+  if (base) name = base + 1;
+  int n = strlen(name);
+  if (n < 4) return false;
+  const char *tail = name + n - 4;
+  return strcmp(tail, ".jpg") == 0 || strcmp(tail, ".JPG") == 0;
+}
+
+static int frameIndexFromName(const char *name) {
+  if (!name) return -1;
+  const char *base = strrchr(name, '/');
+  if (base) name = base + 1;
+  if (strlen(name) < 3) return -1;
+  if (name[0] == 'f' && name[1] >= '0' && name[1] <= '9' && name[2] >= '0' && name[2] <= '9') {
+    return (name[1] - '0') * 10 + (name[2] - '0');
+  }
+  return -1;
+}
+
+static int collectFrameFilesForBurst(const char *dirName,
+                                     char frameFileByIdx[RING_SIZE][24],
+                                     bool hasByIdx[RING_SIZE]) {
+  for (int i = 0; i < RING_SIZE; i++) {
+    frameFileByIdx[i][0] = '\0';
+    hasByIdx[i] = false;
+  }
+  char path[64];
+  snprintf(path, sizeof(path), "/%s", dirName);
+  File sub = SD_MMC.open(path);
+  if (!sub || !sub.isDirectory()) return 0;
+  int jpgCount = 0;
+  while (true) {
+    File sf = sub.openNextFile();
+    if (!sf) break;
+    if (!sf.isDirectory()) {
+      const char *nm = sf.name();
+      if (fileNameEndsWithJpg(nm)) {
+        jpgCount++;
+        int idx = frameIndexFromName(nm);
+        if (idx >= 0 && idx < RING_SIZE) {
+          const char *base = strrchr(nm, '/');
+          if (base) nm = base + 1;
+          strlcpy(frameFileByIdx[idx], nm, sizeof(frameFileByIdx[idx]));
+          hasByIdx[idx] = true;
+        }
+      }
+    }
+    sf.close();
+  }
+  sub.close();
+  return jpgCount;
+}
+
+// Try to find SD directory for a logged event by reconstructing its name
+// from epochSec + gen. New events store the exact dir-creation epoch so the
+// first reconstruction usually hits. For legacy events (event epoch != dir
+// epoch), we fall back to a single root scan that picks the closest dir.
+static bool findEventDir(time_t epochSec, int gen, char *outName, size_t outSize) {
+  if (!sdReady || epochSec < 1000000000) return false;
+  struct tm ti;
+  char tryName[48], metaPath[80];
+
+  // Fast path: try the exact reconstructed name.
+  localtime_r(&epochSec, &ti);
+  snprintf(tryName, sizeof(tryName), "%04d%02d%02d_%02d%02d%02d_gen%d",
+    ti.tm_year+1900, ti.tm_mon+1, ti.tm_mday,
+    ti.tm_hour, ti.tm_min, ti.tm_sec, gen);
+  snprintf(metaPath, sizeof(metaPath), "/%s/meta.json", tryName);
+  File f = SD_MMC.open(metaPath);
+  if (f) {
+    bool isDir = f.isDirectory();
+    f.close();
+    if (!isDir) {
+      strlcpy(outName, tryName, outSize);
+      return true;
+    }
+  }
+
+  // Fallback: single root scan to find closest dir within ±60s for same gen.
+  // One openNextFile sweep instead of dozens of blind opens.
+  File root = SD_MMC.open("/");
+  if (!root) return false;
+  char bestName[48] = "";
+  long bestDelta = 61; // > tolerance threshold
+  for (;;) {
+    File entry = root.openNextFile();
+    if (!entry) break;
+    bool isDir = entry.isDirectory();
+    char nm[64];
+    strlcpy(nm, entry.name(), sizeof(nm));
+    entry.close();
+    if (!isDir) continue;
+    const char *base = strrchr(nm, '/');
+    base = base ? base + 1 : nm;
+    int y, mo, d, hh, mm, ss, g;
+    if (sscanf(base, "%4d%2d%2d_%2d%2d%2d_gen%d", &y, &mo, &d, &hh, &mm, &ss, &g) != 7) continue;
+    if (g != gen) continue;
+    struct tm dt = {};
+    dt.tm_year = y - 1900; dt.tm_mon = mo - 1; dt.tm_mday = d;
+    dt.tm_hour = hh; dt.tm_min = mm; dt.tm_sec = ss; dt.tm_isdst = -1;
+    time_t dirEpoch = mktime(&dt);
+    long delta = (long)dirEpoch - (long)epochSec;
+    if (delta < 0) delta = -delta;
+    if (delta < bestDelta) {
+      bestDelta = delta;
+      strlcpy(bestName, base, sizeof(bestName));
+    }
+  }
+  root.close();
+  if (bestName[0]) {
+    strlcpy(outName, bestName, outSize);
+    return true;
+  }
+  return false;
+}
+
+// /raminfo?a=<archIdx> — JSON manifest of in-RAM burst archive (no SD).
+// Used for the "latest burst" view so newly-finished bursts show instantly.
+static esp_err_t raminfo_handler(httpd_req_t *req) {
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  char query[32], val[8];
+  int qlen = httpd_req_get_url_query_len(req) + 1;
+  int archIdx = burstArchiveCount - 1; // default: latest
+  if (qlen > 1 && qlen <= (int)sizeof(query)) {
+    httpd_req_get_url_query_str(req, query, sizeof(query));
+    if (httpd_query_key_value(query, "a", val, sizeof(val)) == ESP_OK) archIdx = atoi(val);
+  }
+  if (archIdx < 0 || archIdx >= burstArchiveCount) {
+    return httpd_resp_send(req, "{\"ok\":false,\"error\":\"bad archIdx\"}", HTTPD_RESP_USE_STRLEN);
+  }
+  BurstArchive &arch = burstArchives[archIdx];
+  char out[1024];
+  int pos = snprintf(out, sizeof(out),
+    "{\"ok\":true,\"a\":%d,\"gen\":%d,\"count\":%d,\"frames\":[",
+    archIdx, arch.generation, arch.count);
+  bool first = true;
+  for (int i = 0; i < arch.count && pos < (int)sizeof(out) - 80; i++) {
+    if (!arch.images[i].buf || arch.images[i].len == 0) continue;
+    pos += snprintf(out + pos, sizeof(out) - pos,
+      "%s{\"idx\":%d,\"res\":%d,\"bytes\":%u}",
+      first ? "" : ",", i, arch.apiResults[i], (unsigned)arch.images[i].len);
+    first = false;
+  }
+  if (pos < (int)sizeof(out) - 4) pos += snprintf(out + pos, sizeof(out) - pos, "]}");
+  return httpd_resp_send(req, out, pos);
+}
+
+// /ramburst?a=<archIdx>&i=<imgIdx> — raw JPEG from in-RAM burst archive.
+static esp_err_t ramburst_handler(httpd_req_t *req) {
+  char query[32], val[8];
+  int qlen = httpd_req_get_url_query_len(req) + 1;
+  if (qlen <= 1 || qlen > (int)sizeof(query)) { httpd_resp_send_404(req); return ESP_FAIL; }
+  httpd_req_get_url_query_str(req, query, sizeof(query));
+  int archIdx = -1, imgIdx = -1;
+  if (httpd_query_key_value(query, "a", val, sizeof(val)) == ESP_OK) archIdx = atoi(val);
+  if (httpd_query_key_value(query, "i", val, sizeof(val)) == ESP_OK) imgIdx = atoi(val);
   if (archIdx < 0 || archIdx >= burstArchiveCount) { httpd_resp_send_404(req); return ESP_FAIL; }
-  if (imgIdx < 0 || imgIdx >= burstArchives[archIdx].count || !burstArchives[archIdx].images[imgIdx].buf) { httpd_resp_send_404(req); return ESP_FAIL; }
-  // Burst images are already JPEG — serve directly
+  BurstArchive &arch = burstArchives[archIdx];
+  if (imgIdx < 0 || imgIdx >= arch.count || !arch.images[imgIdx].buf || arch.images[imgIdx].len == 0) {
+    httpd_resp_send_404(req); return ESP_FAIL;
+  }
   httpd_resp_set_type(req, "image/jpeg");
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-  return httpd_resp_send(req, (const char *)burstArchives[archIdx].images[imgIdx].buf,
-                         burstArchives[archIdx].images[imgIdx].len);
+  // RAM frames are tied to a session's burstArchives slot; safe to cache short-term.
+  return httpd_resp_send(req, (const char *)arch.images[imgIdx].buf, arch.images[imgIdx].len);
+}
+
+// /burstinfo?epoch=<sec>&gen=<n> — find SD dir for this event and return its
+// frame manifest. Returns {"ok":true,"dir":"...","frames":[{"idx":N,"res":-1/0/1,"file":"f02_0123ms.jpg"}, ...]}.
+// On-demand: no boot scan, no in-RAM cache. Frames are then fetched via /sdget.
+static esp_err_t burstinfo_handler(httpd_req_t *req) {
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  if (!sdReady) {
+    return httpd_resp_send(req, "{\"ok\":false,\"error\":\"SD not mounted\"}", HTTPD_RESP_USE_STRLEN);
+  }
+  char query[64], val[24];
+  int qlen = httpd_req_get_url_query_len(req) + 1;
+  if (qlen <= 1 || qlen > (int)sizeof(query)) {
+    return httpd_resp_send(req, "{\"ok\":false,\"error\":\"missing query\"}", HTTPD_RESP_USE_STRLEN);
+  }
+  httpd_req_get_url_query_str(req, query, sizeof(query));
+  time_t epoch = 0;
+  int gen = 0;
+  if (httpd_query_key_value(query, "epoch", val, sizeof(val)) == ESP_OK) epoch = (time_t)strtoll(val, NULL, 10);
+  if (httpd_query_key_value(query, "gen", val, sizeof(val)) == ESP_OK) gen = atoi(val);
+  if (epoch < 1000000000) {
+    return httpd_resp_send(req, "{\"ok\":false,\"error\":\"bad epoch\"}", HTTPD_RESP_USE_STRLEN);
+  }
+
+  if (!sdMutex || xSemaphoreTake(sdMutex, pdMS_TO_TICKS(15000)) != pdTRUE) {
+    return httpd_resp_send(req, "{\"ok\":false,\"error\":\"SD busy\"}", HTTPD_RESP_USE_STRLEN);
+  }
+
+  char dirName[48];
+  if (!findEventDir(epoch, gen, dirName, sizeof(dirName))) {
+    xSemaphoreGive(sdMutex);
+    return httpd_resp_send(req, "{\"ok\":false,\"error\":\"dir not found\"}", HTTPD_RESP_USE_STRLEN);
+  }
+
+  // Read API results from meta.json (if present)
+  int8_t apiResults[RING_SIZE];
+  int apiCount = 0;
+  {
+    char metaBuf[4096];
+    if (loadMetaJson(dirName, metaBuf, sizeof(metaBuf))) {
+      apiCount = parseApiResultsArray(metaBuf, apiResults);
+    }
+  }
+
+  // Enumerate JPEGs
+  char frameFileByIdx[RING_SIZE][24];
+  bool hasByIdx[RING_SIZE];
+  int jpgCount = collectFrameFilesForBurst(dirName, frameFileByIdx, hasByIdx);
+  xSemaphoreGive(sdMutex);
+  if (jpgCount == 0) {
+    return httpd_resp_send(req, "{\"ok\":false,\"error\":\"no frames\"}", HTTPD_RESP_USE_STRLEN);
+  }
+
+  // Build JSON: include all available frames so UI can pick which to show
+  char out[1024];
+  int pos = snprintf(out, sizeof(out), "{\"ok\":true,\"dir\":\"%s\",\"frames\":[", dirName);
+  bool first = true;
+  for (int idx = 0; idx < RING_SIZE && pos < (int)sizeof(out) - 80; idx++) {
+    if (!hasByIdx[idx]) continue;
+    int8_t res = (idx < apiCount) ? apiResults[idx] : (int8_t)-1;
+    pos += snprintf(out + pos, sizeof(out) - pos,
+      "%s{\"idx\":%d,\"res\":%d,\"file\":\"%s\"}",
+      first ? "" : ",", idx, res, frameFileByIdx[idx]);
+    first = false;
+  }
+  if (pos < (int)sizeof(out) - 4) {
+    pos += snprintf(out + pos, sizeof(out) - pos, "]}");
+  }
+  return httpd_resp_send(req, out, pos);
 }
 
 // ===== SD card browser HTML page =====
@@ -2881,6 +3095,11 @@ static esp_err_t sdlist_handler(httpd_req_t *req) {
     httpd_query_key_value(qbuf, "dir", dir_q, sizeof(dir_q));
   }
 
+  // Long sweep: take SD mutex for the whole walk (60s timeout).
+  if (!sdMutex || xSemaphoreTake(sdMutex, pdMS_TO_TICKS(60000)) != pdTRUE) {
+    httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"SD busy\"}");
+    return ESP_OK;
+  }
   httpd_resp_send_chunk(req, "{\"ok\":true,\"files\":[", -1);
   char entry_buf[128];
   bool first = true;
@@ -2944,6 +3163,7 @@ static esp_err_t sdlist_handler(httpd_req_t *req) {
 
   httpd_resp_send_chunk(req, "]}", -1);
   httpd_resp_send_chunk(req, NULL, 0);
+  xSemaphoreGive(sdMutex);
   return ESP_OK;
 }
 
@@ -2953,6 +3173,10 @@ static esp_err_t sdfolders_handler(httpd_req_t *req) {
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
   if (!sdReady) {
     httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"SD not mounted\"}");
+    return ESP_OK;
+  }
+  if (!sdMutex || xSemaphoreTake(sdMutex, pdMS_TO_TICKS(15000)) != pdTRUE) {
+    httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"SD busy\"}");
     return ESP_OK;
   }
   httpd_resp_send_chunk(req, "{\"ok\":true,\"folders\":[", -1);
@@ -2975,6 +3199,7 @@ static esp_err_t sdfolders_handler(httpd_req_t *req) {
   root.close();
   httpd_resp_send_chunk(req, "]}", -1);
   httpd_resp_send_chunk(req, NULL, 0);
+  xSemaphoreGive(sdMutex);
   return ESP_OK;
 }
 
@@ -2989,27 +3214,66 @@ static esp_err_t sdget_handler(httpd_req_t *req) {
   if (httpd_query_key_value(query, "f", filepath, sizeof(filepath)) != ESP_OK) {
     httpd_resp_send_404(req); return ESP_FAIL;
   }
+  // URL-decode %XX sequences in path (JS encodeURIComponent encodes '/' as %2F)
+  char decoded[96];
+  {
+    int di = 0;
+    for (int si = 0; filepath[si] && di < (int)sizeof(decoded) - 1; si++) {
+      if (filepath[si] == '%' && filepath[si+1] && filepath[si+2]) {
+        auto hex = [](char c) -> int {
+          if (c >= '0' && c <= '9') return c - '0';
+          if (c >= 'a' && c <= 'f') return 10 + c - 'a';
+          if (c >= 'A' && c <= 'F') return 10 + c - 'A';
+          return -1;
+        };
+        int h1 = hex(filepath[si+1]);
+        int h2 = hex(filepath[si+2]);
+        if (h1 >= 0 && h2 >= 0) {
+          decoded[di++] = (char)((h1 << 4) | h2);
+          si += 2;
+          continue;
+        }
+      }
+      decoded[di++] = filepath[si];
+    }
+    decoded[di] = '\0';
+  }
   // Ensure path starts with /
   char fullpath[128];
-  if (filepath[0] == '/') {
-    snprintf(fullpath, sizeof(fullpath), "%s", filepath);
+  if (decoded[0] == '/') {
+    snprintf(fullpath, sizeof(fullpath), "%s", decoded);
   } else {
-    snprintf(fullpath, sizeof(fullpath), "/%s", filepath);
+    snprintf(fullpath, sizeof(fullpath), "/%s", decoded);
+  }
+  // SD_MMC is single-threaded — serialize across httpd worker tasks.
+  // Generous timeout because parallel browser fetches queue up here.
+  if (!sdMutex || xSemaphoreTake(sdMutex, pdMS_TO_TICKS(15000)) != pdTRUE) {
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "SD busy");
+    return ESP_FAIL;
   }
   File f = SD_MMC.open(fullpath);
-  if (!f || f.isDirectory()) { httpd_resp_send_404(req); return ESP_FAIL; }
+  if (!f || f.isDirectory()) {
+    if (f) f.close();
+    xSemaphoreGive(sdMutex);
+    httpd_resp_send_404(req); return ESP_FAIL;
+  }
   // Set content type based on extension
   const char *ct = "application/octet-stream";
   if (strstr(fullpath, ".jpg") || strstr(fullpath, ".jpeg")) ct = "image/jpeg";
   else if (strstr(fullpath, ".json")) ct = "application/json";
   httpd_resp_set_type(req, ct);
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-  uint8_t buf[4096];
-  size_t bytesRead;
-  while ((bytesRead = f.read(buf, sizeof(buf))) > 0) {
-    httpd_resp_send_chunk(req, (const char *)buf, bytesRead);
+  // SD files are immutable (each burst dir is written once). Cache for a year
+  // so the browser only fetches each frame once per session/device.
+  httpd_resp_set_hdr(req, "Cache-Control", "public, max-age=31536000, immutable");
+  // 8 KB stack buffer: fewer syscalls than the old 4 KB, no PSRAM alloc churn.
+  uint8_t buf[8192];
+  size_t n;
+  while ((n = f.read(buf, sizeof(buf))) > 0) {
+    if (httpd_resp_send_chunk(req, (const char *)buf, n) != ESP_OK) break;
   }
   f.close();
+  xSemaphoreGive(sdMutex);
   httpd_resp_send_chunk(req, NULL, 0);
   return ESP_OK;
 }
@@ -3046,19 +3310,61 @@ static esp_err_t getevents_handler(httpd_req_t *req) {
   unsigned long nowMs = millis();
   int hdrLen = snprintf(hdr, sizeof(hdr), "{\"epoch\":%ld,\"uptimeMs\":%lu,\"events\":[", (long)nowEpoch, nowMs);
   httpd_resp_send_chunk(req, hdr, hdrLen);
-  char buf[160];
+  char buf[180];
   for (int i = 0; i < eventCount; i++) {
     EventEntry &e = eventLog[i];
     int len = snprintf(buf, sizeof(buf),
-      "%s{\"t\":%lu,\"epoch\":%ld,\"ago\":%lu,\"gen\":%d,\"nf\":%d,\"res\":%d,\"dMin\":%d,\"dMax\":%d,\"mode\":%d,\"trend\":%d}",
+      "%s{\"t\":%lu,\"epoch\":%ld,\"ago\":%lu,\"gen\":%d,\"nf\":%d,\"res\":%d,\"dMin\":%d,\"dMax\":%d,\"mode\":%d,\"trend\":%d,\"lat\":%u}",
       i > 0 ? "," : "",
       e.uptimeMs, (long)e.epochSec, (nowMs > e.uptimeMs) ? (nowMs - e.uptimeMs) : 0,
-      e.gen, e.frameCount, e.result, e.distMin, e.distMax, e.mode, e.trend);
+      e.gen, e.frameCount, e.result, e.distMin, e.distMax, e.mode, e.trend, (unsigned)e.latencyMs);
     httpd_resp_send_chunk(req, buf, len);
   }
   httpd_resp_send_chunk(req, "]}", 2);
   httpd_resp_send_chunk(req, NULL, 0);
   return ESP_OK;
+}
+
+// POST /setevents — overwrite NVS event log with binary payload.
+// Body = packed array of EventEntry structs (18 bytes each).
+// Up to MAX_EVENTS entries; extra are ignored.
+static esp_err_t setevents_handler(httpd_req_t *req) {
+  int contentLen = req->content_len;
+  const int entrySize = (int)sizeof(EventEntry);
+  if (contentLen <= 0 || contentLen % entrySize != 0) {
+    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad body size");
+    return ESP_FAIL;
+  }
+  int nEntries = contentLen / entrySize;
+  if (nEntries > MAX_EVENTS) nEntries = MAX_EVENTS;
+
+  EventEntry tmp[MAX_EVENTS];
+  int wantBytes = nEntries * entrySize;
+  int received = 0;
+  while (received < wantBytes) {
+    int r = httpd_req_recv(req, (char *)tmp + received, wantBytes - received);
+    if (r <= 0) {
+      httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "recv failed");
+      return ESP_FAIL;
+    }
+    received += r;
+  }
+  // Drain any tail bytes (in case more than MAX_EVENTS sent)
+  char drain[64];
+  int leftover = contentLen - wantBytes;
+  while (leftover > 0) {
+    int r = httpd_req_recv(req, drain, leftover > (int)sizeof(drain) ? (int)sizeof(drain) : leftover);
+    if (r <= 0) break;
+    leftover -= r;
+  }
+  memcpy(eventLog, tmp, wantBytes);
+  eventCount = nEntries;
+  saveEventLog();
+  char resp[64];
+  int n = snprintf(resp, sizeof(resp), "{\"ok\":true,\"count\":%d}", eventCount);
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  return httpd_resp_send(req, resp, n);
 }
 
 // ===== Settings API =====
@@ -3075,11 +3381,11 @@ static esp_err_t getsettings_handler(httpd_req_t *req) {
     "{\"aecMax\":%d,\"aecLow\":%d,\"dayLux\":%d,\"nightLux\":%d,"
     "\"dayGainCap\":%d,\"dayExpDiv\":%d,\"dayMinExp\":%d,\"nightExpCap\":%d,"
     "\"nightAecThr\":%d,\"nightGainCap\":%d,"
-    "\"apiFallbackMs\":%d,\"triggerMm\":%d,\"cooldownMs\":%d,\"autoBaseAec\":%d,\"hdrSteps\":%s}",
+    "\"triggerMm\":%d,\"cooldownMs\":%d,\"autoBaseAec\":%d,\"hdrSteps\":%s}",
     aecMax, aecLow, dayLuxThreshold, nightLuxThreshold,
     dayGainCap, dayExposureDiv, dayMinExposure, nightExposureCap,
     nightAecThreshold, nightGainCap,
-    apiFallbackMs, burstTriggerMm, burstCooldownMs, autoBaseAec, hdrBuf);
+    burstTriggerMm, burstCooldownMs, autoBaseAec, hdrBuf);
   httpd_resp_set_type(req, "application/json");
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
   return httpd_resp_send(req, json, strlen(json));
@@ -3101,7 +3407,6 @@ static esp_err_t setsettings_handler(httpd_req_t *req) {
   if (httpd_query_key_value(buf, "nightExpCap", val, sizeof(val)) == ESP_OK) nightExposureCap = atoi(val);
   if (httpd_query_key_value(buf, "nightAecThr", val, sizeof(val)) == ESP_OK) nightAecThreshold = atoi(val);
   if (httpd_query_key_value(buf, "nightGainCap", val, sizeof(val)) == ESP_OK) nightGainCap = atoi(val);
-  if (httpd_query_key_value(buf, "apiFallbackMs", val, sizeof(val)) == ESP_OK) apiFallbackMs = atoi(val);
   if (httpd_query_key_value(buf, "triggerMm", val, sizeof(val)) == ESP_OK) burstTriggerMm = atoi(val);
   if (httpd_query_key_value(buf, "cooldownMs", val, sizeof(val)) == ESP_OK) burstCooldownMs = atoi(val);
   // HDR steps: hdr0g=gain&hdr0e=aec ... hdr9g=gain&hdr9e=aec
@@ -3112,11 +3417,115 @@ static esp_err_t setsettings_handler(httpd_req_t *req) {
     if (httpd_query_key_value(buf, gKey, val, sizeof(val)) == ESP_OK) hdrSteps[i].gain = atoi(val);
     if (httpd_query_key_value(buf, eKey, val, sizeof(val)) == ESP_OK) hdrSteps[i].aec = atoi(val);
   }
-  Serial.printf("Settings updated: nightAecThr=%d nightExpCap=%d nightGainCap=%d triggerMm=%d apiFallback=%d cooldown=%d autoBaseAec=%d\n",
-    nightAecThreshold, nightExposureCap, nightGainCap, burstTriggerMm, apiFallbackMs, burstCooldownMs, autoBaseAec);
+  Serial.printf("Settings updated: nightAecThr=%d nightExpCap=%d nightGainCap=%d triggerMm=%d cooldown=%d autoBaseAec=%d\n",
+    nightAecThreshold, nightExposureCap, nightGainCap, burstTriggerMm, burstCooldownMs, autoBaseAec);
   httpd_resp_set_type(req, "text/plain");
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
   return httpd_resp_send(req, "OK", 2);
+}
+
+const char CONTROLS_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Camera Controls</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { background: #111; color: #eee; font-family: sans-serif; margin: 0; padding: 12px; max-width: 700px; margin-left: auto; margin-right: auto; }
+    h1 { margin: 0 0 6px; font-size: 1.25em; }
+    a { color: #8af; }
+    .panel { background: #1a1a2e; border: 1px solid #2e3750; border-radius: 8px; padding: 12px; }
+    .controls { display: grid; grid-template-columns: 120px 1fr 52px;
+                gap: 6px 8px; align-items: center; width: 100%; font-size: 0.9em; }
+    .controls label { text-align: right; color: #aaa; }
+    .controls select, .controls input[type=range] { width: 100%; }
+    .controls .val { color: #6f6; font-family: monospace; }
+    .hint { color: #888; font-size: 0.83em; margin: 0 0 10px; }
+    #status { margin-top: 10px; color: #8ac; font-size: 0.85em; font-family: monospace; }
+  </style>
+</head>
+<body>
+  <h1>Camera Controls</h1>
+  <p class="hint"><a href="/">Back to Live View</a> | Camera tuning controls moved off the main page.</p>
+  <div class="panel">
+    <div class="controls">
+      <label>Quality</label>
+      <input type="range" id="quality" min="10" max="100" value="95">
+      <span class="val" id="quality-val">95</span>
+
+      <label>FPS Cap</label>
+      <input type="range" id="fps" min="1" max="30" value="15">
+      <span class="val" id="fps-val">15</span>
+
+      <label>Brightness</label>
+      <input type="range" id="brightness" min="-2" max="2" value="0">
+      <span class="val" id="brightness-val">0</span>
+
+      <label>Contrast</label>
+      <input type="range" id="contrast" min="-2" max="2" value="0">
+      <span class="val" id="contrast-val">0</span>
+
+      <label>Auto Exposure</label>
+      <select id="aec">
+        <option value="1" selected>On</option>
+        <option value="0">Off</option>
+      </select><span></span>
+
+      <label>AE Level</label>
+      <input type="range" id="ae_level" min="-2" max="2" value="0">
+      <span class="val" id="ae_level-val">0</span>
+
+      <label>Gain Ceil</label>
+      <select id="gainceiling">
+        <option value="0">2x</option>
+        <option value="2" selected>8x</option>
+        <option value="4">32x</option>
+        <option value="6">128x</option>
+      </select><span></span>
+
+      <label>Night Mode</label>
+      <select id="nightmode">
+        <option value="0" selected>Off</option>
+        <option value="1">On</option>
+      </select><span></span>
+    </div>
+    <div id="status">Ready</div>
+  </div>
+
+  <script>
+    async function cmd(k, v) {
+      try {
+        await fetch('/cmd?' + k + '=' + v);
+        const st = document.getElementById('status');
+        st.textContent = 'Updated ' + k + '=' + v + ' at ' + new Date().toLocaleTimeString();
+      } catch(e) {}
+    }
+
+    for (const id of ['quality','fps','brightness','contrast','ae_level']) {
+      const el = document.getElementById(id);
+      const valEl = document.getElementById(id + '-val');
+      el.addEventListener('input', () => { valEl.textContent = el.value; });
+      el.addEventListener('change', () => { cmd(id, el.value); });
+    }
+    document.getElementById('aec').addEventListener('change', function() {
+      cmd('aec', this.value);
+    });
+    document.getElementById('gainceiling').addEventListener('change', function() {
+      cmd('gainceiling', this.value);
+    });
+    document.getElementById('nightmode').addEventListener('change', function() {
+      cmd('nightmode', this.value);
+    });
+  </script>
+</body>
+</html>
+)rawliteral";
+
+static esp_err_t controls_handler(httpd_req_t *req) {
+  httpd_resp_set_type(req, "text/html");
+  return httpd_resp_send(req, CONTROLS_HTML, strlen(CONTROLS_HTML));
 }
 
 // ===== Settings page HTML =====
@@ -3180,7 +3589,6 @@ const char SETTINGS_HTML[] PROGMEM = R"rawliteral(
   <div class="section">
     <h2>⚡ Trigger & Timing</h2>
     <div class="row"><label>Trigger Distance</label><input type="number" id="triggerMm"><span class="unit">mm</span></div>
-    <div class="row"><label>API Fallback</label><input type="number" id="apiFallbackMs"><span class="unit">ms</span></div>
     <div class="row"><label>Burst Cooldown</label><input type="number" id="cooldownMs"><span class="unit">ms</span></div>
   </div>
 
@@ -3191,7 +3599,7 @@ const char SETTINGS_HTML[] PROGMEM = R"rawliteral(
   <div id="status"></div>
 
   <script>
-    const fields = ['aecMax','aecLow','nightAecThr','nightExpCap','nightGainCap','apiFallbackMs','triggerMm','cooldownMs'];
+    const fields = ['aecMax','aecLow','nightAecThr','nightExpCap','nightGainCap','triggerMm','cooldownMs'];
     async function loadSettings() {
       const r = await fetch('/getsettings');
       const s = await r.json();
@@ -3257,7 +3665,7 @@ void startUIServer() {
   config.server_port = 80;
   config.ctrl_port = 32768;
   config.stack_size = 16384;
-  config.max_uri_handlers = 20;
+  config.max_uri_handlers = 26;
 
   httpd_uri_t index_uri = {
     .uri = "/",
@@ -3280,13 +3688,6 @@ void startUIServer() {
     .user_ctx = NULL
   };
 
-  httpd_uri_t burst_uri = {
-    .uri = "/burst",
-    .method = HTTP_GET,
-    .handler = burst_handler,
-    .user_ctx = NULL
-  };
-
   httpd_uri_t burstmeta_uri = {
     .uri = "/burstmeta",
     .method = HTTP_GET,
@@ -3305,7 +3706,6 @@ void startUIServer() {
     httpd_register_uri_handler(ui_httpd, &index_uri);
     httpd_register_uri_handler(ui_httpd, &stats_uri);
     httpd_register_uri_handler(ui_httpd, &cmd_uri);
-    httpd_register_uri_handler(ui_httpd, &burst_uri);
     httpd_register_uri_handler(ui_httpd, &burstmeta_uri);
     httpd_register_uri_handler(ui_httpd, &diag_uri);
     httpd_uri_t apitest_uri = {
@@ -3321,13 +3721,14 @@ void startUIServer() {
       .user_ctx = NULL
     };
     httpd_register_uri_handler(ui_httpd, &pipetest_uri);
-    httpd_uri_t burststream_uri = {
-      .uri = "/burststream",
-      .method = HTTP_GET,
-      .handler = burststream_handler,
-      .user_ctx = NULL
-    };
-    httpd_register_uri_handler(ui_httpd, &burststream_uri);
+    httpd_uri_t prey24h_uri = { .uri = "/burstinfo", .method = HTTP_GET, .handler = burstinfo_handler, .user_ctx = NULL };
+    httpd_register_uri_handler(ui_httpd, &prey24h_uri);
+    httpd_uri_t raminfo_uri = { .uri = "/raminfo", .method = HTTP_GET, .handler = raminfo_handler, .user_ctx = NULL };
+    httpd_register_uri_handler(ui_httpd, &raminfo_uri);
+    httpd_uri_t ramburst_uri = { .uri = "/ramburst", .method = HTTP_GET, .handler = ramburst_handler, .user_ctx = NULL };
+    httpd_register_uri_handler(ui_httpd, &ramburst_uri);
+    httpd_uri_t controls_uri = { .uri = "/controls", .method = HTTP_GET, .handler = controls_handler, .user_ctx = NULL };
+    httpd_register_uri_handler(ui_httpd, &controls_uri);
     httpd_uri_t settings_uri = { .uri = "/settings", .method = HTTP_GET, .handler = settings_handler, .user_ctx = NULL };
     httpd_register_uri_handler(ui_httpd, &settings_uri);
     httpd_uri_t getsettings_uri = { .uri = "/getsettings", .method = HTTP_GET, .handler = getsettings_handler, .user_ctx = NULL };
@@ -3336,6 +3737,8 @@ void startUIServer() {
     httpd_register_uri_handler(ui_httpd, &setsettings_uri);
     httpd_uri_t getevents_uri = { .uri = "/getevents", .method = HTTP_GET, .handler = getevents_handler, .user_ctx = NULL };
     httpd_register_uri_handler(ui_httpd, &getevents_uri);
+    httpd_uri_t setevents_uri = { .uri = "/setevents", .method = HTTP_POST, .handler = setevents_handler, .user_ctx = NULL };
+    httpd_register_uri_handler(ui_httpd, &setevents_uri);
     httpd_uri_t sdinfo_uri = { .uri = "/sdinfo", .method = HTTP_GET, .handler = sdinfo_handler, .user_ctx = NULL };
     httpd_register_uri_handler(ui_httpd, &sdinfo_uri);
     httpd_uri_t sdlist_uri = { .uri = "/sdlist", .method = HTTP_GET, .handler = sdlist_handler, .user_ctx = NULL };
@@ -3415,12 +3818,21 @@ void setup() {
     Serial.println("TOF050C not found on I2C");
   }
 
-  // SD card init (1-bit mode)
+  // SD card init: try 1-bit @ 40 MHz (high-speed) first, fall back to 20 MHz.
+  // Signature: begin(mountpoint, mode1bit, format_if_mount_failed, freqHz, maxOpenFiles)
+  sdMutex = xSemaphoreCreateMutex();
   SD_MMC.setPins(SD_CLK, SD_CMD, SD_D0);
-  if (SD_MMC.begin("/sdcard", true)) { // true = 1-bit mode
+  bool sdMounted = SD_MMC.begin("/sdcard", true, false, SDMMC_FREQ_HIGHSPEED);
+  unsigned sdFreqMhz = 40;
+  if (!sdMounted) {
+    Serial.println("SD card mount @40MHz failed, retrying @20MHz...");
+    sdMounted = SD_MMC.begin("/sdcard", true, false, SDMMC_FREQ_DEFAULT);
+    sdFreqMhz = 20;
+  }
+  if (sdMounted) {
     sdReady = true;
     uint64_t cardSize = SD_MMC.cardSize() / (1024 * 1024);
-    Serial.printf("SD card ready: %llu MB, type %d\n", cardSize, SD_MMC.cardType());
+    Serial.printf("SD card ready: %llu MB, type %d, %u MHz\n", cardSize, SD_MMC.cardType(), sdFreqMhz);
   } else {
     Serial.println("SD card mount failed");
   }
@@ -3842,13 +4254,11 @@ void loop() {
     aecProbeStart = now;
   }
 
-  // === TLS pre-connect: keep connection warm when laptop absent ===
+  // === TLS pre-connect: keep connection warm so first API call is fast ===
   static unsigned long lastTlsCheck = 0;
   if (!burstCapturing && now - lastTlsCheck >= 10000) {
     lastTlsCheck = now;
-    bool laptopHere = (lastLaptopContactMs > 0) &&
-                      (now - lastLaptopContactMs < LAPTOP_TIMEOUT_MS);
-    if (!laptopHere && !tlsConnected) {
+    if (!tlsConnected) {
       ensureTlsConnection();
     }
   }
@@ -4014,17 +4424,9 @@ void loop() {
       } else {
         apiTaskStartMs = millis();
         if (apiTaskStartMs == 0) apiTaskStartMs = 1;
-        bool laptopHere = (lastLaptopContactMs > 0) &&
-                          (now - lastLaptopContactMs < LAPTOP_TIMEOUT_MS);
-        if (laptopHere) {
-          xTaskCreatePinnedToCore(apiFallbackTask, "apiFallback",
-            16384, (void *)(intptr_t)archIdx,
-            tskIDLE_PRIORITY + 3, NULL, 0);
-        } else {
-          xTaskCreatePinnedToCore(apiCheckTask, "apiCheck",
-            16384, (void *)(intptr_t)archIdx,
-            tskIDLE_PRIORITY + 3, NULL, 0);
-        }
+        xTaskCreatePinnedToCore(apiCheckTask, "apiCheck",
+          16384, (void *)(intptr_t)archIdx,
+          tskIDLE_PRIORITY + 3, NULL, 0);
       }
     }
   }
