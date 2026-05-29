@@ -1,0 +1,153 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<title>Mazge Training Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+  body { font-family: system-ui,sans-serif; background:#111; color:#eee; margin:0; padding:14px; }
+  h1 { margin:0 0 6px; color:#aad4f5; font-size:1.2em; }
+  #status { color:#888; margin-bottom:14px; font-size:.9em; }
+  #status .running { color:#7cb9e8; }
+  #status .done { color:#7ce87c; }
+  .badge { background:#2a2a3e; padding:2px 8px; border-radius:10px; margin-right:6px; }
+  .grid { display:grid; grid-template-columns: 1fr 1fr; gap:14px; }
+  .chart-box { background:#1a1a2e; border-radius:8px; padding:10px; height:300px; }
+  .chart-box h2 { margin:0 0 4px; font-size:.95em; color:#aad4f5; }
+  .full { grid-column: 1 / -1; }
+  #latest { background:#1a1a2e; border-radius:8px; padding:10px; margin-top:14px; font-family:monospace; font-size:.85em; }
+  #latest table { width:100%; }
+  #latest td { padding:3px 8px; }
+  #latest td:first-child { color:#888; }
+  .good { color:#7ce87c; } .bad { color:#f28b82; } .meh { color:#e8d47c; }
+</style></head>
+<body>
+
+<h1>Mazge Prey-Model Training Dashboard</h1>
+<div id="status">Loading…</div>
+
+<div class="grid">
+  <div class="chart-box"><h2>Loss (lower = better)</h2><canvas id="loss"></canvas></div>
+  <div class="chart-box"><h2>Val Precision / Recall / F1</h2><canvas id="prf"></canvas></div>
+  <div class="chart-box"><h2>Cat-ID Accuracy</h2><canvas id="cat"></canvas></div>
+  <div class="chart-box"><h2>Confusion (val)</h2><canvas id="conf"></canvas></div>
+  <div class="chart-box full"><h2>Learning rate</h2><canvas id="lr"></canvas></div>
+</div>
+
+<div id="latest"></div>
+
+<script>
+const charts = {};
+
+function makeChart(id, datasets, opts={}) {
+  const ctx = document.getElementById(id);
+  return new Chart(ctx, {
+    type: 'line',
+    data: { labels: [], datasets },
+    options: {
+      responsive: true, maintainAspectRatio: false, animation: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: { legend: { labels: { color:'#ccc' } } },
+      scales: {
+        x: { ticks:{color:'#888'}, grid:{color:'#333'}, title:{display:true,text:'epoch',color:'#888'} },
+        y: { ticks:{color:'#888'}, grid:{color:'#333'}, ...opts.y },
+      },
+    },
+  });
+}
+
+const ds = (label, color, yAxisID) => ({
+  label, data: [], borderColor: color, backgroundColor: color+'33',
+  borderWidth: 2, pointRadius: 2, tension: 0.2, yAxisID,
+});
+
+charts.loss = makeChart('loss', [
+  ds('train', '#7cb9e8'),
+  ds('val',   '#f28b82'),
+  ds('prey loss', '#aad4f5'),
+  ds('cat loss',  '#7ce87c'),
+]);
+
+charts.prf = makeChart('prf', [
+  ds('precision', '#7cb9e8'),
+  ds('recall',    '#f28b82'),
+  ds('F1',        '#7ce87c'),
+], { y: { min: 0, max: 1 } });
+
+charts.cat = makeChart('cat', [
+  ds('cat-ID acc', '#aad4f5'),
+], { y: { min: 0, max: 1 } });
+
+charts.conf = makeChart('conf', [
+  ds('TP', '#7ce87c'),
+  ds('FP', '#f28b82'),
+  ds('FN', '#e8d47c'),
+]);
+
+charts.lr = makeChart('lr', [
+  ds('learning rate', '#aad4f5'),
+]);
+
+function fmt(n, d=3) { return n==null ? '—' : Number(n).toFixed(d); }
+
+async function refresh() {
+  try {
+    const url = new URLSearchParams(location.search).get('src') || '../models/prey_v1/metrics_live.json';
+    const r = await fetch(url + '?t=' + Date.now());
+    if (!r.ok) throw new Error('not found yet');
+    const data = await r.json();
+    render(data);
+  } catch(e) {
+    document.getElementById('status').innerHTML =
+      `<span class="meh">Waiting for training to start (${e.message}). Auto-retry in 5s.</span>`;
+  }
+}
+
+function render(d) {
+  const h = d.history || [];
+  const labels = h.map(e => e.epoch);
+  const setData = (chart, idx, key) => {
+    chart.data.labels = labels;
+    chart.data.datasets[idx].data = h.map(e => e[key]);
+  };
+
+  setData(charts.loss, 0, 'train_loss');
+  setData(charts.loss, 1, 'val_loss');
+  setData(charts.loss, 2, 'prey_loss');
+  setData(charts.loss, 3, 'cat_loss');
+  setData(charts.prf, 0, 'val_precision');
+  setData(charts.prf, 1, 'val_recall');
+  setData(charts.prf, 2, 'val_f1');
+  setData(charts.cat, 0, 'val_cat_acc');
+  setData(charts.conf, 0, 'tp');
+  setData(charts.conf, 1, 'fp');
+  setData(charts.conf, 2, 'fn');
+  setData(charts.lr, 0, 'lr');
+  Object.values(charts).forEach(c => c.update('none'));
+
+  const isDone = d.status === 'done';
+  const statusClass = isDone ? 'done' : 'running';
+  const statusText = isDone ? `✓ TRAINING COMPLETE` : `▶ Training`;
+  document.getElementById('status').innerHTML =
+    `<span class="${statusClass}">${statusText}</span> ` +
+    `<span class="badge">epoch ${d.current_epoch} / ${d.total_epochs}</span>` +
+    `<span class="badge">best F1 = ${fmt(d.best_f1,3)}</span>` +
+    `<span class="badge">lr = ${fmt(h[h.length-1]?.lr, 6)}</span>`;
+
+  // Latest table
+  const e = h[h.length-1];
+  if (!e) return;
+  const cls = (v, good=0.8, bad=0.5) => v >= good ? 'good' : v <= bad ? 'bad' : 'meh';
+  document.getElementById('latest').innerHTML = `
+    <table><tr><td colspan=4><b>Epoch ${e.epoch}</b> · ${e.secs.toFixed(0)}s · ${e.backbone_frozen?'<span class="meh">[backbone frozen]</span>':'[full fine-tune]'}</td></tr>
+    <tr><td>train loss</td><td>${fmt(e.train_loss)}</td><td>val loss</td><td>${fmt(e.val_loss)}</td></tr>
+    <tr><td>precision</td><td class="${cls(e.val_precision)}">${fmt(e.val_precision)}</td>
+        <td>recall</td><td class="${cls(e.val_recall)}">${fmt(e.val_recall)}</td></tr>
+    <tr><td>F1</td><td class="${cls(e.val_f1)}">${fmt(e.val_f1)}</td>
+        <td>cat-ID acc</td><td class="${cls(e.val_cat_acc, 0.85, 0.6)}">${fmt(e.val_cat_acc)}</td></tr>
+    <tr><td>TP / FP / FN / TN</td><td colspan=3>${e.tp} / ${e.fp} / ${e.fn} / ${e.tn}</td></tr>
+    </table>`;
+}
+
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body></html>

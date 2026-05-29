@@ -1,0 +1,29 @@
+{
+  "test": {
+    "loss": 11.36906514758155,
+    "precision": 0.5333333333333333,
+    "recall": 0.26666666666666666,
+    "f1": 0.3555555555555555,
+    "tp": 8,
+    "fp": 7,
+    "fn": 22,
+    "tn": 488,
+    "cat_id_acc": 1.0,
+    "cat_id_n": 168
+  },
+  "best_epoch": 34,
+  "best_val_f1": 0.47619047619047616,
+  "args": {
+    "epochs": 60,
+    "bs": 32,
+    "lr": 0.0001,
+    "weight_decay": 0.001,
+    "freeze_epochs": 10,
+    "outdir": "models/prey_v1",
+    "resume": "models/prey_v1/last.pt",
+    "oversample": 8,
+    "cat_id_weight": 0.3,
+    "threshold": 0.5
+  },
+  "model_params": 1041348
+}

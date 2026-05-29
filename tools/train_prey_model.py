@@ -101,9 +101,10 @@ def get_train_transform():
     return transforms.Compose([
         transforms.Resize((IMG_SIZE, IMG_SIZE)),
         transforms.RandomHorizontalFlip(p=0.5),
-        transforms.RandomAffine(degrees=5, translate=(0.05, 0.05), scale=(0.9, 1.1)),
-        transforms.ColorJitter(brightness=0.3, contrast=0.3),
+        transforms.RandomAffine(degrees=10, translate=(0.10, 0.10), scale=(0.85, 1.15)),
+        transforms.ColorJitter(brightness=0.4, contrast=0.4),
         transforms.ToTensor(),
+        transforms.RandomErasing(p=0.3, scale=(0.02, 0.15)),
         transforms.Normalize(mean=[0.485, 0.456, 0.406],
                              std=[0.229, 0.224, 0.225]),
     ])
@@ -141,7 +142,7 @@ class PreyDetector(nn.Module):
         self.prey_head = nn.Sequential(
             nn.Linear(head_dim, 128),
             nn.Hardswish(),
-            nn.Dropout(0.3),
+            nn.Dropout(0.5),
             nn.Linear(128, 1),
         )
 
@@ -149,9 +150,14 @@ class PreyDetector(nn.Module):
         self.cat_id_head = nn.Sequential(
             nn.Linear(head_dim, 64),
             nn.Hardswish(),
-            nn.Dropout(0.2),
+            nn.Dropout(0.3),
             nn.Linear(64, num_cat_ids),
         )
+
+    def freeze_backbone(self, freeze: bool = True):
+        """Freeze/unfreeze the pretrained MobileNet features."""
+        for p in self.features.parameters():
+            p.requires_grad = not freeze
 
     def forward(self, x, frame_idx=None):
         feat = self.features(x)
@@ -301,7 +307,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--epochs", type=int, default=60)
     ap.add_argument("--bs", type=int, default=32)
-    ap.add_argument("--lr", type=float, default=3e-4)
+    ap.add_argument("--lr", type=float, default=1e-4)
+    ap.add_argument("--weight-decay", type=float, default=1e-3)
+    ap.add_argument("--freeze-epochs", type=int, default=10,
+                    help="Number of warmup epochs with frozen backbone")
     ap.add_argument("--outdir", type=str, default="models/prey_v1")
     ap.add_argument("--resume", type=str, default=None)
     ap.add_argument("--oversample", type=int, default=8,
@@ -352,29 +361,63 @@ def main():
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device, weights_only=True)
         model.load_state_dict(ckpt["model"])
-        print(f"Resumed from {args.resume}")
+        start_epoch = ckpt.get("epoch", 0) + 1
+        best_f1 = ckpt.get("val_metrics", {}).get("f1", 0.0)
+        print(f"Resumed from {args.resume} (epoch {start_epoch - 1}, best F1={best_f1:.3f})")
+    else:
+        start_epoch = 1
+        best_f1 = 0.0
 
     # Optimizer + scheduler
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
+                                   weight_decay=args.weight_decay)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+
+    if args.resume and "optimizer" in ckpt:
+        optimizer.load_state_dict(ckpt["optimizer"])
+        # Step scheduler to the resume point
+        for _ in range(start_epoch - 1):
+            scheduler.step()
 
     # AMP scaler (not used on MPS, only CUDA)
     scaler = torch.amp.GradScaler() if device.type == "cuda" else None
 
     # Training loop
     log_path = outdir / "train_log.csv"
-    log_f = open(log_path, "w", newline="")
-    log_w = csv.writer(log_f)
-    log_w.writerow(["epoch", "train_loss", "prey_loss", "cat_loss",
-                     "val_loss", "val_prec", "val_rec", "val_f1",
-                     "val_cat_acc", "lr", "secs"])
+    if start_epoch > 1 and log_path.exists():
+        log_f = open(log_path, "a", newline="")
+        log_w = csv.writer(log_f)
+    else:
+        log_f = open(log_path, "w", newline="")
+        log_w = csv.writer(log_f)
+        log_w.writerow(["epoch", "train_loss", "prey_loss", "cat_loss",
+                         "val_loss", "val_prec", "val_rec", "val_f1",
+                         "val_cat_acc", "lr", "secs", "backbone_frozen"])
 
-    best_f1 = 0.0
+    # Live metrics JSON for the dashboard
+    metrics_live_path = outdir / "metrics_live.json"
+
+    # Reload previous history if resuming
+    epoch_history = []
+    if start_epoch > 1 and metrics_live_path.exists():
+        try:
+            prev = json.load(open(metrics_live_path))
+            epoch_history = prev.get("history", [])
+        except Exception:
+            pass
     print(f"\n{'='*70}")
-    print(f"Training for {args.epochs} epochs, batch_size={args.bs}, lr={args.lr}")
+    print(f"Training for {args.epochs} epochs (starting at {start_epoch}), batch_size={args.bs}, lr={args.lr}")
+    print(f"Backbone frozen for first {args.freeze_epochs} epochs")
     print(f"{'='*70}\n")
 
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
+        # Freeze/unfreeze backbone at the right epoch
+        if epoch <= args.freeze_epochs:
+            model.freeze_backbone(True)
+        elif epoch == args.freeze_epochs + 1:
+            model.freeze_backbone(False)
+            print(f"  >>> Unfreezing backbone at epoch {epoch}")
+
         t0 = time.time()
         train_loss, prey_loss, cat_loss = train_one_epoch(
             model, train_loader, optimizer, scaler, device,
@@ -385,6 +428,7 @@ def main():
 
         elapsed = time.time() - t0
         lr = optimizer.param_groups[0]["lr"]
+        backbone_frozen = int(epoch <= args.freeze_epochs)
 
         log_w.writerow([epoch, f"{train_loss:.4f}", f"{prey_loss:.4f}",
                         f"{cat_loss:.4f}", f"{val_metrics['loss']:.4f}",
@@ -392,14 +436,47 @@ def main():
                         f"{val_metrics['recall']:.3f}",
                         f"{val_metrics['f1']:.3f}",
                         f"{val_metrics['cat_id_acc']:.3f}",
-                        f"{lr:.6f}", f"{elapsed:.1f}"])
+                        f"{lr:.6f}", f"{elapsed:.1f}", backbone_frozen])
         log_f.flush()
+
+        # Write the live JSON for the dashboard (atomic-ish: write then rename)
+        epoch_history.append({
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "prey_loss": prey_loss,
+            "cat_loss": cat_loss,
+            "val_loss": val_metrics["loss"],
+            "val_precision": val_metrics["precision"],
+            "val_recall": val_metrics["recall"],
+            "val_f1": val_metrics["f1"],
+            "val_cat_acc": val_metrics["cat_id_acc"],
+            "tp": val_metrics["tp"], "fp": val_metrics["fp"],
+            "fn": val_metrics["fn"], "tn": val_metrics["tn"],
+            "lr": lr,
+            "secs": elapsed,
+            "backbone_frozen": bool(backbone_frozen),
+        })
+        live = {
+            "status": "training",
+            "current_epoch": epoch,
+            "total_epochs": args.epochs,
+            "best_f1": max(best_f1, val_metrics["f1"]),
+            "best_epoch": epoch if val_metrics["f1"] > best_f1 else None,
+            "args": vars(args),
+            "history": epoch_history,
+            "updated_at": time.time(),
+        }
+        tmp = metrics_live_path.with_suffix(".json.tmp")
+        with open(tmp, "w") as f:
+            json.dump(live, f)
+        tmp.replace(metrics_live_path)
 
         prey_str = (f"P={val_metrics['precision']:.2f} R={val_metrics['recall']:.2f} "
                      f"F1={val_metrics['f1']:.2f}")
         cat_str = f"cat_acc={val_metrics['cat_id_acc']:.2f}"
         tp_fp = f"TP={val_metrics['tp']} FP={val_metrics['fp']} FN={val_metrics['fn']}"
-        print(f"  [{epoch:3d}/{args.epochs}] loss={train_loss:.3f} "
+        frozen_str = "[frozen]" if backbone_frozen else "       "
+        print(f"  [{epoch:3d}/{args.epochs}]{frozen_str} loss={train_loss:.3f} "
               f"val_loss={val_metrics['loss']:.3f} | {prey_str} {tp_fp} | "
               f"{cat_str} | {elapsed:.0f}s")
 
@@ -446,6 +523,20 @@ def main():
     }
     with open(outdir / "metrics.json", "w") as f:
         json.dump(metrics, f, indent=2)
+
+    # Mark live status as done so the dashboard knows training finished
+    if metrics_live_path.exists():
+        try:
+            with open(metrics_live_path) as f:
+                live = json.load(f)
+            live["status"] = "done"
+            live["test"] = test_metrics
+            live["updated_at"] = time.time()
+            with open(metrics_live_path, "w") as f:
+                json.dump(live, f)
+        except Exception:
+            pass
+
     print(f"\nSaved to {outdir}/")
 
 
