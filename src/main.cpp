@@ -3865,16 +3865,33 @@ void loop() {
     sensor_t *s = esp_camera_sensor_get();
     int appliedGain = -1, appliedAec = -1;
     if (s && pendingFreezeAtMs != 0 && frozenAec >= 0) {
-      // Burst-shift: keep exposure constant, but HALVE aec because the cat
-      // typically moves directly UNDER the IR illuminator during the shift
-      // window (face is closer to IR than ToF distance suggests, so IR
-      // reflection is much stronger). Empirical: full locked aec produced
-      // overexposed faces in late frames.
-      int aec = frozenAec / 2;
+      // Burst-shift: cat is moving under the IR illuminator.
+      // Time-based exposure ramp-down: more reliable than ToF distance which
+      // can be noisy during fast cat passage.  Cat moves from trigger distance
+      // (~480mm) to very close (~150mm) in ~200ms, so IR intensity can increase
+      // ~10x.  Ramp BOTH AEC and gain down over the shift window.
+      unsigned long triggerMs = pendingFreezeAtMs - BURST_SHIFT_MS;
+      unsigned long elapsed = (now > triggerMs) ? (now - triggerMs) : 0;
+      if (elapsed > BURST_SHIFT_MS) elapsed = BURST_SHIFT_MS;
+      int gain = frozenGain;
+      int aec;
+      if (autoBaseAec > nightAecThreshold) {
+        // Night/IR: ramp AEC from frozenAec → frozenAec/5, gain → 0
+        long frac1000 = (long)elapsed * 1000 / BURST_SHIFT_MS;  // 0→1000
+        // AEC: scale 1000 → 200 (100% → 20% = 1/5)
+        long scale = 1000 - frac1000 * 800 / 1000;  // 1000→200
+        aec = (int)(frozenAec * scale / 1000);
+        // Gain: ramp from nightGainCap → 0 (minimum analog gain)
+        gain = (int)(nightGainCap * (1000 - frac1000) / 1000);
+      } else {
+        // Day mode: gentle halve, same as before
+        aec = frozenAec / 2;
+      }
       if (aec < 4) aec = 4;
-      s->set_agc_gain(s, frozenGain);
+      if (gain < 0) gain = 0;
+      s->set_agc_gain(s, gain);
       s->set_aec_value(s, aec);
-      appliedGain = frozenGain;
+      appliedGain = gain;
       appliedAec = aec;
     } else if (s && aecProbeState == 0) {
       if (autoBaseAec > nightAecThreshold) {
