@@ -52,12 +52,14 @@ bool sdReady = false;
 //
 // On a trigger (ToF or fake) the door is already closed; we still call
 // doorCloseNow() to mark the trigger in logs/Blynk. After API analysis:
-//   - prey detected on any frame  -> stay closed for PREY_LOCKOUT_MS (15 min)
+//   - prey on 1 frame             -> stay closed for PREY_SHORT_LOCKOUT_MS (3 min)
+//   - prey on >=2 frames          -> stay closed for PREY_LONG_LOCKOUT_MS (15 min)
 //   - no prey on any frame        -> open the door for GREEN_LIGHT_MS, then
 //                                    close again automatically
 // During lockout, manual "open" requests are blocked.
 #define DOOR_PIN 14
-#define PREY_LOCKOUT_MS (15UL * 60UL * 1000UL)  // 15 minutes
+#define PREY_SHORT_LOCKOUT_MS (3UL * 60UL * 1000UL)   // 3 minutes (low certainty)
+#define PREY_LONG_LOCKOUT_MS  (15UL * 60UL * 1000UL)  // 15 minutes (high certainty)
 // After a no-prey verdict, give the cat a re-try window where the door
 // stays open and triggers are ignored (no analysis, no door close). Lets
 // the cat back off and try again without the 7-second analysis delay.
@@ -69,7 +71,7 @@ bool sdReady = false;
 // (cat is locked out anyway, repeated analysis is wasteful).
 #define LOCKOUT_TRIGGER_INTERVAL_MS (2UL * 60UL * 1000UL)  // 2 minutes
 // Number of frames in a burst that must independently flag prey before
-// triggering the lockout. Tuned via threshold_analysis.py:
+// escalating to HIGH-CERTAINTY (long) lockout. Tuned via threshold_analysis.py:
 //   N=1 (early-exit): 100% recall, 46% precision (13 false closures)
 //   N=2 (this):       82% recall, 50% precision  (9 false closures)
 //   N=3:              64% recall, 70% precision  (3 false closures)
@@ -1364,34 +1366,39 @@ api_done:
     archive.apiFramesSent, preyFrameCount, PREY_FRAMES_THRESHOLD);
   archive.apiDoneMs = millis();
 
-  // Door logic: require >= PREY_FRAMES_THRESHOLD flagged frames to lockout.
-  bool preyConfirmed = (preyFrameCount >= PREY_FRAMES_THRESHOLD);
-  // Keep apiPreyDetected as the threshold-based verdict (used by event log)
-  archive.apiPreyDetected = preyConfirmed ? 1 : 0;
-  if (preyConfirmed) {
-    preyLockoutUntilMs = millis() + PREY_LOCKOUT_MS;
+  // Door logic: tiered confidence lockout.
+  //   - 0 prey frames: open (normal behavior)
+  //   - 1 prey frame : short lockout (3 min)
+  //   - >=2 frames   : long lockout (15 min)
+  bool preyAny = (preyFrameCount >= 1);
+  bool preyHighConfidence = (preyFrameCount >= PREY_FRAMES_THRESHOLD);
+  // Keep apiPreyDetected as "any prey evidence" for event logs.
+  archive.apiPreyDetected = preyAny ? 1 : 0;
+  if (preyAny) {
+    unsigned long lockoutMs = preyHighConfidence ? PREY_LONG_LOCKOUT_MS : PREY_SHORT_LOCKOUT_MS;
+    preyLockoutUntilMs = millis() + lockoutMs;
     if (preyLockoutUntilMs == 0) preyLockoutUntilMs = 1;  // avoid sentinel
     // Persist absolute end-time as epoch so the lockout survives a reboot.
     {
       time_t nowEpoch;
       time(&nowEpoch);
-      persistLockoutEpoch((int32_t)nowEpoch + (int32_t)(PREY_LOCKOUT_MS / 1000UL));
+      persistLockoutEpoch((int32_t)nowEpoch + (int32_t)(lockoutMs / 1000UL));
     }
     greenLightUntilMs = 0;  // clear any pending green light
     char reason[80];
-    snprintf(reason, sizeof(reason),
-             "prey on %d frames (>= %d) — 15 min lockout",
-             preyFrameCount, PREY_FRAMES_THRESHOLD);
+    snprintf(
+      reason,
+      sizeof(reason),
+      "prey on %d frame(s): %s lockout",
+      preyFrameCount,
+      preyHighConfidence ? "15 min" : "3 min"
+    );
     doorCloseNow(reason);
   } else {
-    if (preyFrameCount > 0) {
-      Serial.printf("Door: prey on %d frame(s) but threshold is %d — opening anyway\n",
-                    preyFrameCount, PREY_FRAMES_THRESHOLD);
-    }
     if (doorLockoutActive()) {
       Serial.println("Door: stay closed (lockout still active)");
     } else {
-      doorOpenNow(preyFrameCount == 0 ? "no prey detected" : "below prey threshold");
+      doorOpenNow("no prey detected");
     }
     // Start green-light window: cat may retry within GREEN_LIGHT_MS without
     // any door close on trigger. Lets the cat back off + retry without the
@@ -3464,11 +3471,11 @@ void setup() {
   } else {
     Serial.println("\nNTP sync failed, using uptime");
     // Without NTP we can't know if the persisted lockout is still in window.
-    // Be SAFE: if a lockout is persisted at all, restore the full PREY_LOCKOUT_MS
+    // Be SAFE: if a lockout is persisted at all, restore the full long-lockout
     // window. Worst case we lock for 15 extra minutes after recovery — acceptable.
     int32_t lockUntil = loadLockoutEpoch();
     if (lockUntil != 0) {
-      preyLockoutUntilMs = millis() + PREY_LOCKOUT_MS;
+      preyLockoutUntilMs = millis() + PREY_LONG_LOCKOUT_MS;
       if (preyLockoutUntilMs == 0) preyLockoutUntilMs = 1;
       Serial.println("Lockout RESTORED conservatively (no NTP): full 15 min");
     }
