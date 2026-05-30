@@ -53,3 +53,28 @@
 - [ ] Consider storing API results to flash/SPIFFS for persistence across reboots
 - [ ] Optimize TLS — investigate session resumption or keep-alive to reduce per-call overhead
 - [ ] Add LED/buzzer alert on prey detection
+
+---
+
+## 2026-05-31: Prey Classifier v2 — rebuild after v1 overfit
+
+See **`doc/prey_classifier_v2.md`** for the full design + experiment log.
+
+### What's done
+
+- Diagnosed `prey_v1` failure (whole-frame classifier overfit to ~16
+  prey events seen as 280 "independent" frames).
+- Studied original `niciBume/Cat_Prey_Analyzer` cascade and adopted
+  the same architecture: body detector → snout localiser → prey
+  classifier → burst aggregator.
+- **Stage 1 (cat-body detection) benchmark complete.** Tested 8
+  detector variants × 3 preprocessing variants = 24 configurations on
+  82 stratified bursts. Winner: **Ultralytics YOLO11x at 640×640 on
+  CCW-rotated + top-160 cropped frames** (100 % per-burst recall, 2 %
+  FP, 104 ms on M4 CPU). MegaDetector V6 is best on raw frames but
+  collapses on rotated input.
+- **Crop pipeline built and run** (`tools/build_crops.py`):
+  595 labeled bursts × 5 911 frames → 224×224 body + snout JPGs +
+  per-frame bbox metadata + live HTML dashboard.
+- Confirmed firmware-sid- rot- Confirmed firmware-sid- rot- Confirmed firmware-sid- rot-OLO r- Confirmed firmware-sid- rot- Confirmed firmware-sid- rot- Confaliser bench** (Haar / DeepF- Confirmed firmware-sid- rot- Confirmed firmware-sid- rot- Confirm; - Confirmed firmware-sid- rot- Confirmed firmwa a- Confirmed firmware-sid- rot- Confirmed firmware-sid- rot- Confirt the existing cloud API on the held-out test split.
+

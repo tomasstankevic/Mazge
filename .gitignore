@@ -48,3 +48,16 @@ test_jpeg_crop
 # Diagnostic poller output
 tools/diag_log.jsonl
 models/prey_v1/*.pt
+models/prey_v2*/
+
+# Per-burst regenerated crop pipelines (large, idempotent)
+dataset/crops_*/
+
+# Auto-downloaded YOLO weights in repo root
+/yolo11*.pt
+
+# Subject-detection benchmark outputs (regenerated)
+models/subject_detection_eval/
+
+# Editor backups
+*.bak
