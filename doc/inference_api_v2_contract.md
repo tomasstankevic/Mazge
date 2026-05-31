@@ -53,8 +53,12 @@ Content-Type: application/json
   "request_id": "9f4c4e48-7e7f-4c3f-9c3a-80d6f3170be5",
   "detected": true,
   "prey_score": 0.9321,
+  "cat_recognized": true,
   "cat_id": "mazge",
   "cat_confidence": 0.9872,
+  "severity": "high",
+  "lockout_seconds": 600,
+  "door_action": "deny",
   "model_version": "prey_v3",
   "decision_ms": 34,
   "server_ts_ms": 1780182985123,
@@ -69,13 +73,44 @@ Field definitions:
 - request_id: string echo of X-Request-Id
 - detected: boolean prey verdict for this frame
 - prey_score: float in [0,1]
+- cat_recognized: boolean, true only when cat identity confidence is above configured threshold
 - cat_id: string label or unknown
 - cat_confidence: float in [0,1]
+- severity: enum in [none, low, medium, high, critical]
+- lockout_seconds: integer lockout duration to apply from this decision
+- door_action: enum in [allow, deny]
 - model_version: string, expected prey_v3 initially
 - decision_ms: integer server compute time in ms
 - server_ts_ms: integer unix epoch ms at response
 - should_continue_burst: boolean hint for firmware burst loop
 - reason: short machine-readable reason code
+
+## door and lockout policy contract
+
+Firmware must enforce these rules exactly:
+
+1. If cat_recognized is false, then door_action must be deny.
+2. A frame can result in allow only when cat_recognized is true and severity is none.
+3. Firmware must apply lockout_seconds from the response when door_action is deny.
+4. Firmware must store cat_id, severity, lockout_seconds, and request_id in event logs for auditing.
+
+### normative severity to lockout mapping
+
+Server returns severity and lockout_seconds based on current policy:
+
+- none -> 0 seconds
+- low -> 30 seconds
+- medium -> 120 seconds
+- high -> 600 seconds
+- critical -> 1800 seconds
+
+The mapping is part of the wire contract and must remain stable unless contract_version changes.
+
+### suggested decision policy inputs
+
+- no cat recognized: severity=medium, door_action=deny
+- cat recognized and high prey score: severity=high or critical, door_action=deny
+- cat recognized and low prey score: severity=none, door_action=allow
 
 ### reason enum
 
@@ -84,6 +119,8 @@ Field definitions:
 - uncertain_need_more_frames
 - decode_error
 - model_unavailable
+- no_cat_recognized
+- lockout_by_severity
 
 ## error responses
 
@@ -174,6 +211,11 @@ Server must log one line per request with:
 - device_id
 - burst_id
 - frame_index
+- cat_id
+- cat_recognized
+- severity
+- lockout_seconds
+- door_action
 - status_code
 - prey_score
 - detected
@@ -192,6 +234,10 @@ Metrics to expose:
 - [ ] enforces X-Contract-Version = 2
 - [ ] echoes request_id in all responses
 - [ ] returns detected in 200 responses
+- [ ] returns cat_recognized in 200 responses
+- [ ] returns cat_id in 200 responses
+- [ ] returns severity and lockout_seconds in 200 responses
+- [ ] never returns door_action=allow when cat_recognized=false
 - [ ] supports idempotent replay by X-Request-Id
 - [ ] emits should_continue_burst hint
 - [ ] meets timeout and latency targets in LAN tests
