@@ -1,0 +1,70 @@
+====================================================================================================
+FULL-DATA EVALUATION (all labelled bursts, door-gate semantics)
+====================================================================================================
+
+### yolo11x+bodyA  
+  Total labelled bursts: 655
+  Outcomes: {'open_correct': 261, 'no_action': 213, 'skip_exit': 134, 'block_correct': 27, 'block_fp': 19, 'open_prey': 1}
+  Door decisions (cat detected & entering): n=308
+    TP open (good cat, door opens) : 261
+    TN block (prey, door blocked)  : 27  ✓ SAFE
+    FP block (good cat, door blocked, annoying): 19
+    FN safety (prey, door OPENS, BAD)         : 1
+    Open correctness  : 0.932
+    Block correctness : 0.964
+  Coverage:
+    Entering bursts cat-detection rate: 262/275 (95.3%)
+    Prey-entering cat-detection rate  : 28/28 (100.0%)
+
+### yolo11s+bodyA_s
+  Total labelled bursts: 655
+  Outcomes: {'no_action': 246, 'open_correct': 254, 'skip_exit': 129, 'block_correct': 25, 'open_prey': 1}
+  Door decisions (cat detected & entering): n=280
+    TP open (good cat, door opens) : 254
+    TN block (prey, door blocked)  : 25  ✓ SAFE
+    FP block (good cat, door blocked, annoying): 0
+    FN safety (prey, door OPENS, BAD)         : 1
+    Open correctness  : 1.000
+    Block correctness : 0.962
+  Coverage:
+    Entering bursts cat-detection rate: 254/275 (92.4%)
+    Prey-entering cat-detection rate  : 26/28 (92.9%)
+
+### By split
+  split=train
+    x: n_all=350  tp_open=211  tn_block=17  fp_block= 17  fn_safety= 0  cat_det=100.0%  prey_det=100.0%
+    s: n_all=327  tp_open=208  tn_block=16  fp_block=  0  fn_safety= 0  cat_det=100.0%  prey_det=100.0%
+  split=val
+    x: n_all= 48  tp_open= 28  tn_block= 5  fp_block=  2  fn_safety= 1  cat_det=100.0%  prey_det=100.0%
+    s: n_all= 45  tp_open= 29  tn_block= 4  fp_block=  0  fn_safety= 1  cat_det=100.0%  prey_det=100.0%
+  split=test
+    x: n_all= 44  tp_open= 22  tn_block= 5  fp_block=  0  fn_safety= 0  cat_det=100.0%  prey_det=100.0%
+    s: n_all= 37  tp_open= 17  tn_block= 5  fp_block=  0  fn_safety= 0  cat_det=100.0%  prey_det=100.0%
+
+### By cat
+  cat=(empty)
+    x: n_all=430  tp_open= 75  tn_block= 7  fp_block=  2  fn_safety= 0  cat_det= 76.0%  prey_det=100.0%
+    s: n_all=430  tp_open= 54  tn_block= 7  fp_block=  0  fn_safety= 0  cat_det= 70.0%  prey_det=100.0%
+  cat=benis
+    x: n_all= 74  tp_open= 69  tn_block= 4  fp_block=  1  fn_safety= 0  cat_det=100.0%  prey_det=100.0%
+    s: n_all= 74  tp_open= 67  tn_block= 3  fp_block=  0  fn_safety= 0  cat_det= 94.6%  prey_det= 75.0%
+  cat=mazge
+    x: n_all=147  tp_open=114  tn_block=15  fp_block= 16  fn_safety= 1  cat_det= 99.3%  prey_det=100.0%
+    s: n_all=147  tp_open=130  tn_block=14  fp_block=  0  fn_safety= 1  cat_det= 98.6%  prey_det= 93.8%
+  cat=unknown
+    x: n_all=  4  tp_open=  3  tn_block= 1  fp_block=  0  fn_safety= 0  cat_det=100.0%  prey_det=100.0%
+    s: n_all=  4  tp_open=  3  tn_block= 1  fp_block=  0  fn_safety= 0  cat_det=100.0%  prey_det=100.0%
+
+### By night/day
+  is_night=0
+    x: n_all=376  tp_open=161  tn_block= 2  fp_block=  0  fn_safety= 0  cat_det= 93.5%  prey_det=100.0%
+    s: n_all=376  tp_open=156  tn_block= 1  fp_block=  0  fn_safety= 0  cat_det= 91.6%  prey_det= 50.0%
+  is_night=1
+    x: n_all=279  tp_open=100  tn_block=25  fp_block= 19  fn_safety= 1  cat_det= 97.5%  prey_det=100.0%
+    s: n_all=279  tp_open= 98  tn_block=24  fp_block=  0  fn_safety= 1  cat_det= 93.3%  prey_det= 96.2%
+
+### Safety FNs (prey entered with door open)
+  x: 1 prey leaks
+    20260505_220948_gen9  split=val  cat=mazge  score=0.1028  nframes=10
+  s: 1 prey leaks
+    20260505_220948_gen9  split=val  cat=mazge  score=-0.0514  nframes=10
