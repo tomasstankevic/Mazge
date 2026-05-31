@@ -102,6 +102,7 @@ For moving from cloud API calls to a local inference server on another Mac,
 see:
 
 - `doc/local_inference_server_migration.md`
+- `doc/inference_api_v2_contract.md`
 
 ## WiFi Configuration
 

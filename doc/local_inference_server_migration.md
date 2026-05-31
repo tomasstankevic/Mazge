@@ -6,6 +6,10 @@ last updated: 2026-05-31
 
 Replace the external cloud prey API with a local HTTP service running on another Mac, while keeping firmware behavior unchanged.
 
+Authoritative wire-level contract is defined in:
+
+- `doc/inference_api_v2_contract.md`
+
 ## current repository state
 
 The repo now includes full model and evaluation artifacts needed for server-side inference:
@@ -45,6 +49,8 @@ The repo now includes full model and evaluation artifacts needed for server-side
 - committed the full trained model/eval artifact trees listed above.
 
 ## firmware compatibility contract (do not break)
+
+During migration, keep backward compatibility via the v1 compat endpoint and move firmware to v2 contract endpoint as described in `doc/inference_api_v2_contract.md`.
 
 Firmware currently posts one frame per request as JSON:
 
