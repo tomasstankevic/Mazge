@@ -96,6 +96,13 @@ pio run -e ota -t upload
 └── .gitignore
 ```
 
+## Inference Migration Notes
+
+For moving from cloud API calls to a local inference server on another Mac,
+see:
+
+- `doc/local_inference_server_migration.md`
+
 ## WiFi Configuration
 
 Edit the credentials at the top of `src/main.cpp`:

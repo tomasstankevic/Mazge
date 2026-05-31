@@ -76,5 +76,33 @@ See **`doc/prey_classifier_v2.md`** for the full design + experiment log.
 - **Crop pipeline built and run** (`tools/build_crops.py`):
   595 labeled bursts × 5 911 frames → 224×224 body + snout JPGs +
   per-frame bbox metadata + live HTML dashboard.
-- Confirmed firmware-sid- rot- Confirmed firmware-sid- rot- Confirmed firmware-sid- rot-OLO r- Confirmed firmware-sid- rot- Confirmed firmware-sid- rot- Confaliser bench** (Haar / DeepF- Confirmed firmware-sid- rot- Confirmed firmware-sid- rot- Confirm; - Confirmed firmware-sid- rot- Confirmed firmwa a- Confirmed firmware-sid- rot- Confirmed firmware-sid- rot- Confirt the existing cloud API on the held-out test split.
+- Confirmed firmware-side nano YOLO should stay on its native frame geometry for trigger-stage reliability, while high-quality rotated/cropped inference is handled in the server-side pipeline.
+
+---
+
+## 2026-05-31: v3 multitask models + local-server handoff prep
+
+### What's done
+
+- Added and trained `prey_v3` multitask model (prey + cat-id heads) and saved
+  checkpoints/metrics under `models/prey_v3/bodyA/`.
+- Added and trained `cat_id_v2` model and saved checkpoints/metrics under
+  `models/cat_id_v2/bodyA/`.
+- Added weighted burst decision sweep tooling and outputs under
+  `models/prey_v3/bodyA/metric_sweep/`.
+- Committed full model and evaluation artifacts to git for reproducible setup
+  on a second machine.
+
+### Operational follow-up
+
+- Added migration handoff doc for replacing cloud API with local inference:
+  `doc/local_inference_server_migration.md`.
+- Documented firmware API compatibility contract (`{"image_base64": ...}` in,
+  `{"detected": ...}` out) to avoid firmware changes during migration.
+
+### Next step
+
+- Stand up a local HTTP inference service on another Mac that preserves the
+  current cloud API response contract, then point firmware `PREY_API_URL` to
+  that host.
 
