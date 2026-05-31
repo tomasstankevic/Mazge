@@ -1,0 +1,39 @@
+{
+  "subset": "test",
+  "run_dir": "models/prey_v3/bodyA",
+  "checkpoint": "best_burst_f1",
+  "ckpt_epoch": 14,
+  "fn_weight": 5.0,
+  "fp_weight": 1.0,
+  "n_bursts": 44,
+  "best_combined": {
+    "mode": "topk_mean",
+    "topk": 3,
+    "w_prey": 0.8,
+    "w_cat": 0.0,
+    "w_count": 0.0,
+    "prey_count_threshold": 0.3,
+    "threshold": 0.3,
+    "tp": 5,
+    "fp": 0,
+    "fn": 0,
+    "tn": 39,
+    "n": 44,
+    "precision": 1.0,
+    "recall": 1.0,
+    "f1": 1.0,
+    "objective": 0.0
+  },
+  "best_baseline": {
+    "method": "prey_max",
+    "threshold": 0.35,
+    "tp": 5,
+    "fp": 2,
+    "fn": 0,
+    "tn": 37,
+    "n": 44,
+    "precision": 0.7142857142857143,
+    "recall": 1.0,
+    "f1": 0.8333333333333333
+  }
+}

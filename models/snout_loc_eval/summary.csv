@@ -1,0 +1,5 @@
+method,mean_ms,p95_ms,prey_found,prey_total,prey_rate,noprey_found,noprey_total,noprey_rate
+heuristic_top45,0.00,0.00,216,216,1.00,40,40,1.00
+haar_basic,2.19,2.49,105,216,0.49,10,40,0.25
+haar_extended,1.98,2.48,103,216,0.48,10,40,0.25
+haar_extended_box,1.99,2.52,105,216,0.49,10,40,0.25

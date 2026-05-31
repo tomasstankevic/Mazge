@@ -1,0 +1,43 @@
+{
+  "checkpoint": "best_val_burst_acc",
+  "ckpt_epoch": 7,
+  "duplicate_rows_ignored": 0,
+  "frame": {
+    "acc": 0.9258160237388724,
+    "balanced_acc": 0.924622641509434,
+    "tp": 115,
+    "tn": 197,
+    "fp": 15,
+    "fn": 10
+  },
+  "burst": {
+    "acc": 1.0,
+    "balanced_acc": 1.0,
+    "tp": 15,
+    "tn": 29,
+    "fp": 0,
+    "fn": 0
+  },
+  "n_frames": 337,
+  "n_bursts": 44,
+  "split_summary": {
+    "train": {
+      "total_bursts": 132,
+      "total_frames": 997,
+      "mazge_bursts": 88,
+      "benis_bursts": 44
+    },
+    "val": {
+      "total_bursts": 44,
+      "total_frames": 318,
+      "mazge_bursts": 29,
+      "benis_bursts": 15
+    },
+    "test": {
+      "total_bursts": 44,
+      "total_frames": 337,
+      "mazge_bursts": 29,
+      "benis_bursts": 15
+    }
+  }
+}
