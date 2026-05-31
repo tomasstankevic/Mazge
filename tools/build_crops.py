@@ -450,6 +450,13 @@ def main() -> None:
     out_dir = DATASET / pipeline_cls.dirname
     out_dir.mkdir(parents=True, exist_ok=True)
     index_csv = out_dir / "_index.csv"
+    existing_index_rows: dict[tuple[str, str, str], dict[str, str]] = {}
+    if args.skip_existing and index_csv.exists():
+        with open(index_csv, newline="") as f:
+            for row in csv.DictReader(f):
+                key = (row.get("burst_id", ""), row.get("frame_idx", ""),
+                       row.get("image_id", ""))
+                existing_index_rows[key] = row
 
     manifest_rows = list(csv.DictReader(open(DATASET / "manifest.csv")))
     bursts_rows = {r["burst_id"]: r
@@ -580,6 +587,7 @@ def main() -> None:
     for i, row in enumerate(manifest_rows, 1):
         bid = row["burst_id"]
         fidx = int(row["frame_idx"])
+        index_key = (bid, row["frame_idx"], row["image_id"])
         burst = bursts_rows.get(bid, {})
         split = row.get("split", "")
         subj = burst.get("human_subject", "")
@@ -606,6 +614,20 @@ def main() -> None:
 
         body_path = out_dir / bid / f"f{fidx:02d}_body.jpg"
         snout_path = out_dir / bid / f"f{fidx:02d}_snout.jpg"
+
+        if args.skip_existing and index_key in existing_index_rows:
+            prev = existing_index_rows[index_key]
+            # If we already have a body crop path in the index, skip to avoid
+            # appending duplicate rows. If body_path is empty, keep processing
+            # so this run can still recover a missed detection.
+            if prev.get("body_path", ""):
+                state["skipped"] += 1
+                state["done"] += 1
+                if prev.get("cat_found") == "1":
+                    state["found_cat"] += 1
+                    state["by_subject"][subj][1] += 1
+                state["by_subject"][subj][0] += 1
+                continue
 
         if args.skip_existing and body_path.exists():
             state["skipped"] += 1
@@ -692,6 +714,10 @@ def main() -> None:
             "bbox_h": bbox_upright[3] if bbox_upright else "",
             "body_path": body_p, "snout_path": snout_p,
         })
+        existing_index_rows[index_key] = {
+            "cat_found": str(int(bool(best))),
+            "body_path": body_p,
+        }
         idx_f.flush()
 
         state["done"] += 1
