@@ -229,10 +229,21 @@ class YOLOsRotCropPipeline:
         return bbox_upright
 
 
+class YOLOs480RotCropPipeline(YOLOsRotCropPipeline):
+    """yolo11s at imgsz=480 (matches the upright 480x480 frame natively)."""
+    name = "yolo11s480_rotcrop"
+    dirname = "crops_yolo11s480_rotcrop"
+
+    def __init__(self):
+        super().__init__()
+        self.imgsz = 480
+
+
 PIPELINES = {
     "mdv6_raw": MDv6Pipeline,
     "yolo11x_rotcrop": YOLOxRotCropPipeline,
     "yolo11s_rotcrop": YOLOsRotCropPipeline,
+    "yolo11s480_rotcrop": YOLOs480RotCropPipeline,
 }
 
 

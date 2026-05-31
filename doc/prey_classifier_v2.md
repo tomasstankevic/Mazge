@@ -434,3 +434,47 @@ a blown-out close-up where the classifier fails on either set of
 crops. yolo11s additionally misses crops on 2 prey bursts entirely
 (no cat detected → no door action → retry), so prey-coverage drops
 from 100 % → 92.9 %, but this is UX latency, not a safety leak.
+
+### imgsz=480 variant (matches frame size natively)
+
+After cropping the door occlusion the upright frame is 480x480, but
+yolo11s was run at imgsz=640 which letterboxes the 480 input. Re-ran
+with imgsz=480 (`yolo11s480_rotcrop` in build_crops.py) and trained
+`models/prey_v3/bodyA_s480/`.
+
+CPU latency (full sample of 818 frames,
+[`models/subject_detection_eval/variants/comparison_cpu_rot_crop160_s480.txt`](../models/subject_detection_eval/variants/comparison_cpu_rot_crop160_s480.txt)):
+
+| variant      | ms/frame (CPU) | cat_burst% | cat_frame% |
+|--------------|---------------:|-----------:|-----------:|
+| yolo11s_640  | 55.1           | 95.8 %     | 61.3 %     |
+| yolo11s_480  | **34.5**       | **97.2 %** | 50.1 %     |
+
+Per-burst recall is actually higher at 480 (the cat is still found at
+least once in nearly every burst); per-frame recall drops because
+small/distant cats fall below the threshold. The classifier ends up
+with ~18 % fewer crops per burst on average.
+
+Full-data 3-way evaluation
+([tools/eval_full_pipeline_3way.py](../tools/eval_full_pipeline_3way.py),
+[`models/prey_v3/full_eval_3way/summary.txt`](../models/prey_v3/full_eval_3way/summary.txt)):
+
+| pipeline                       | TP open | TN block | FP block | **FN safety** | open-corr | block-corr |
+|--------------------------------|--------:|---------:|---------:|--------------:|----------:|-----------:|
+| yolo11x + bodyA                |     261 |       27 |       19 |             1 |     93.2 %|      96.4 %|
+| yolo11s640 + bodyA_s           |     254 |       25 |        0 |             1 |    100.0 %|      96.2 %|
+| **yolo11s480 + bodyA_s480**    |     229 |       27 |        9 | **0**         |     96.2 %|     **100.0 %** |
+
+yolo11s480 is the only pipeline with **zero safety failures** — it
+catches the val burst `20260505_220948_gen9` that both x and s640
+miss. Sweep rule for bodyA_s480:
+
+```
+mode=topk_mean topk=3 w_prey=0.8 w_cat=-0.1 w_count=0.0
+prey_count_threshold=0.3 threshold=0.14
+```
+
+Trade-offs vs s640: +9 FP_blocks but **0 prey leaks** and ~1.6× CPU
+speedup. The lower threshold and shrunk metric weights reflect a
+classifier that's been trained on noisier (less-coverage) crops and
+needs to be more sensitive on prey signals.

@@ -1,0 +1,39 @@
+{
+  "subset": "all",
+  "run_dir": "models/prey_v3/bodyA_s480",
+  "checkpoint": "best_burst_f1",
+  "ckpt_epoch": 17,
+  "fn_weight": 5.0,
+  "fp_weight": 1.0,
+  "n_bursts": 389,
+  "best_combined": {
+    "mode": "topk_mean",
+    "topk": 3,
+    "w_prey": 0.8,
+    "w_cat": -0.1,
+    "w_count": 0.0,
+    "prey_count_threshold": 0.3,
+    "threshold": 0.14,
+    "tp": 27,
+    "fp": 9,
+    "fn": 0,
+    "tn": 353,
+    "n": 389,
+    "precision": 0.75,
+    "recall": 1.0,
+    "f1": 0.8571428571428571,
+    "objective": 9.0
+  },
+  "best_baseline": {
+    "method": "prey_max",
+    "threshold": 0.9,
+    "tp": 24,
+    "fp": 1,
+    "fn": 3,
+    "tn": 361,
+    "n": 389,
+    "precision": 0.96,
+    "recall": 0.8888888888888888,
+    "f1": 0.923076923076923
+  }
+}

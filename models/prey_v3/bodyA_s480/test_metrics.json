@@ -1,0 +1,39 @@
+{
+  "checkpoint": "best_burst_f1",
+  "ckpt_epoch": 17,
+  "frame": {
+    "precision": 1.0,
+    "recall": 0.8620689655172413,
+    "f1": 0.9259259259259259,
+    "tp": 25,
+    "fp": 0,
+    "fn": 4,
+    "tn": 141
+  },
+  "burst": {
+    "precision": 1.0,
+    "recall": 0.6666666666666666,
+    "f1": 0.8,
+    "tp": 4,
+    "fp": 0,
+    "fn": 2,
+    "tn": 32
+  },
+  "split_summary": {
+    "train": {
+      "total_bursts": 308,
+      "prey_bursts": 16,
+      "total_frames": 1466
+    },
+    "val": {
+      "total_bursts": 43,
+      "prey_bursts": 5,
+      "total_frames": 209
+    },
+    "test": {
+      "total_bursts": 38,
+      "prey_bursts": 6,
+      "total_frames": 170
+    }
+  }
+}

@@ -148,6 +148,8 @@ VARIANT_BUILDERS = {
     "nano_ncnn":      lambda: NcnnNano(),
     "yolo11n_640":    lambda: UltralyticsModel("yolo11n.pt", 640),
     "yolo11s_640":    lambda: UltralyticsModel("yolo11s.pt", 640),
+    "yolo11s_480":    lambda: UltralyticsModel("yolo11s.pt", 480,
+                                                name="yolo11s_480"),
     "yolo11m_640":    lambda: UltralyticsModel("yolo11m.pt", 640),
     "yolo11l_640":    lambda: UltralyticsModel("yolo11l.pt", 640),
     "yolo11x_640":    lambda: UltralyticsModel("yolo11x.pt", 640),

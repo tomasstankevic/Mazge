@@ -1,0 +1,46 @@
+
+====================================================================================================
+3-WAY FULL-DATA EVALUATION (all labelled bursts, door-gate semantics)
+====================================================================================================
+
+### yolo11x+bodyA (rule threshold=0.3)
+  Door decisions: n=308  TP_open=261  TN_block=27  FP_block=19  FN_safety=1
+  Open correctness: 0.932  Block correctness: 0.964
+  Coverage: cat_det=262/275 (95.3%)  prey_det=28/28 (100.0%)
+
+### yolo11s640+bodyA_s (rule threshold=0.42)
+  Door decisions: n=280  TP_open=254  TN_block=25  FP_block=0  FN_safety=1
+  Open correctness: 1.000  Block correctness: 0.962
+  Coverage: cat_det=254/275 (92.4%)  prey_det=26/28 (92.9%)
+
+### yolo11s480+bodyA_s480 (rule threshold=0.14)
+  Door decisions: n=265  TP_open=229  TN_block=27  FP_block=9  FN_safety=0
+  Open correctness: 0.962  Block correctness: 1.000
+  Coverage: cat_det=250/275 (90.9%)  prey_det=27/28 (96.4%)
+
+### Side-by-side door metrics
+  pipeline                  TP_open TN_block FP_block FN_safety open_corr block_corr
+  yolo11x+bodyA                 261       27       19         1     0.932      0.964
+  yolo11s640+bodyA_s            254       25        0         1     1.000      0.962
+  yolo11s480+bodyA_s480         229       27        9         0     0.962      1.000
+
+### By split (TP_open / TN_block / FP_block / FN_safety)
+  split=train
+    yolo11x+bodyA            n=350  tp=211 tn=17 fp=17 fn= 0  cat_det=100.0%  prey_det=100.0%
+    yolo11s640+bodyA_s       n=327  tp=208 tn=16 fp= 0 fn= 0  cat_det=100.0%  prey_det=100.0%
+    yolo11s480+bodyA_s480    n=308  tp=187 tn=16 fp= 8 fn= 0  cat_det=100.0%  prey_det=100.0%
+  split=val
+    yolo11x+bodyA            n= 48  tp= 28 tn= 5 fp= 2 fn= 1  cat_det=100.0%  prey_det=100.0%
+    yolo11s640+bodyA_s       n= 45  tp= 29 tn= 4 fp= 0 fn= 1  cat_det=100.0%  prey_det=100.0%
+    yolo11s480+bodyA_s480    n= 43  tp= 24 tn= 5 fp= 1 fn= 0  cat_det=100.0%  prey_det=100.0%
+  split=test
+    yolo11x+bodyA            n= 44  tp= 22 tn= 5 fp= 0 fn= 0  cat_det=100.0%  prey_det=100.0%
+    yolo11s640+bodyA_s       n= 37  tp= 17 tn= 5 fp= 0 fn= 0  cat_det=100.0%  prey_det=100.0%
+    yolo11s480+bodyA_s480    n= 38  tp= 18 tn= 6 fp= 0 fn= 0  cat_det=100.0%  prey_det=100.0%
+
+### Safety FNs (prey entered with door open)
+  yolo11x+bodyA: 1 prey leaks
+    20260505_220948_gen9  split=val  cat=mazge  score=0.1028  nframes=10
+  yolo11s640+bodyA_s: 1 prey leaks
+    20260505_220948_gen9  split=val  cat=mazge  score=-0.0514  nframes=10
+  yolo11s480+bodyA_s480: 0 prey leaks
