@@ -45,22 +45,116 @@ def run(cmd: list[str], *, cwd: Path = REPO, stdout_path: Path | None = None) ->
         subprocess.run(cmd, cwd=cwd, check=True, stdout=f)
 
 
-def fetch_remote_folders(host: str, retries: int = 8, timeout: float = 20.0) -> list[str]:
-    url = f"http://{host}/sdfolders"
-    last_exc: Exception | None = None
-    for attempt in range(1, retries + 1):
+def board_reachable(host: str, port: int = 80, timeout: float = 3.0) -> bool:
+    """Quick TCP connect check — returns False instead of blocking on a dead board."""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def read_with_deadline(response: object, deadline_s: float) -> bytes:
+    """Read an HTTP response body with a hard wall-clock deadline.
+
+    urllib's socket timeout governs individual recv() calls, not total transfer
+    time.  If the ESP sends data in slow trickles the socket timeout never fires
+    even though the overall read takes minutes.  This wrapper runs the read in a
+    daemon thread and closes the response socket if the deadline elapses, which
+    unblocks the thread immediately.
+    """
+    result: list[bytes] = []
+    exc_box: list[BaseException] = []
+
+    def _read() -> None:
         try:
-            with urllib.request.urlopen(url, timeout=timeout) as response:
-                data = json.loads(response.read())
-            folders = data.get("folders", [])
-            if not isinstance(folders, list):
-                raise RuntimeError("Invalid /sdfolders payload")
-            return [str(x) for x in folders]
-        except Exception as exc:  # noqa: BLE001
-            last_exc = exc
-            print(f"attempt {attempt}/{retries} failed: {exc}", flush=True)
-            time.sleep(2)
-    raise RuntimeError(f"Failed to fetch /sdfolders: {last_exc}")
+            result.append(response.read())  # type: ignore[attr-defined]
+        except BaseException as e:  # noqa: BLE001
+            exc_box.append(e)
+
+    t = threading.Thread(target=_read, daemon=True)
+    t.start()
+    t.join(deadline_s)
+    if t.is_alive():
+        try:
+            response.close()  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001
+            pass
+        t.join(2)  # give the thread a moment to notice the close
+        raise TimeoutError(f"response.read() exceeded {deadline_s:.0f}s deadline")
+    if exc_box:
+        raise exc_box[0]
+    return result[0]
+
+
+def fetch_remote_folders(host: str, port: int = 80, per_recv_timeout: float = 8.0,
+                         wall_clock_limit: float = 150.0) -> list[str]:
+    """/sdfolders streams ~1 KB/s as tiny HTTP chunks.  Waiting for complete JSON
+    before parsing means any hiccup kills the whole call.  Instead we stream-parse:
+    open a raw socket, read with short per-recv timeouts, accumulate bytes, and
+    extract folder names via regex as they arrive.  We return whatever we collected
+    if the connection closes normally OR if the wall-clock limit is reached (partial
+    list is better than nothing for the missing-folder diff).
+    """
+    import re as _re
+    request = (
+        f"GET /sdfolders HTTP/1.1\r\n"
+        f"Host: {host}\r\n"
+        f"Connection: close\r\n"
+        f"\r\n"
+    ).encode()
+
+    start = time.monotonic()
+    buf = bytearray()
+    sock = socket.create_connection((host, port), timeout=per_recv_timeout)
+    try:
+        sock.settimeout(per_recv_timeout)
+        sock.sendall(request)
+        while True:
+            if time.monotonic() - start > wall_clock_limit:
+                print(
+                    f"fetch_remote_folders: wall-clock limit {wall_clock_limit:.0f}s reached, "
+                    f"using partial response ({len(buf)} bytes)",
+                    flush=True,
+                )
+                break
+            try:
+                chunk = sock.recv(4096)
+            except TimeoutError:
+                # No data for per_recv_timeout seconds — board stalled or done
+                print(
+                    f"fetch_remote_folders: recv timeout after {time.monotonic()-start:.0f}s "
+                    f"({len(buf)} bytes so far)",
+                    flush=True,
+                )
+                break
+            if not chunk:
+                break  # clean EOF
+            buf += chunk
+    finally:
+        try:
+            sock.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+    elapsed = time.monotonic() - start
+    # Strip HTTP headers (everything before first blank line)
+    raw = bytes(buf)
+    header_end = raw.find(b"\r\n\r\n")
+    body = raw[header_end + 4:] if header_end != -1 else raw
+    # HTTP/1.1 chunked: strip chunk-size lines (hex\r\n ... \r\n)
+    # Simple approach: extract all quoted strings that look like burst folder names
+    folders = _re.findall(rb'"([^"]{8,50})"', body)
+    result = [f.decode(errors="replace") for f in folders
+              if len(f) >= 8 and (f[:8].isdigit() or f.startswith(b"burst_"))]
+    print(
+        f"fetch_remote_folders: {len(result)} folders in {elapsed:.1f}s "
+        f"({len(buf)} bytes)",
+        flush=True,
+    )
+    if not result:
+        raise RuntimeError(f"fetch_remote_folders: got {len(buf)} bytes but found no folder names")
+    return result
 
 
 def is_ts_folder(name: str) -> bool:
@@ -101,10 +195,10 @@ def pull_meta_gently(host: str, folders: list[str]) -> None:
         dst.mkdir(parents=True, exist_ok=True)
         url = f"http://{host}/sdget?f={folder}/meta.json"
         success = False
-        for attempt in range(4):
+        for attempt in range(3):
             try:
-                with urllib.request.urlopen(url, timeout=20) as response:
-                    data = response.read()
+                with urllib.request.urlopen(url, timeout=12) as response:
+                    data = read_with_deadline(response, deadline_s=20)
                 (dst / "meta.json").write_bytes(data)
                 meta = json.loads(data)
                 print(
@@ -115,7 +209,7 @@ def pull_meta_gently(host: str, folders: list[str]) -> None:
                 success = True
                 break
             except Exception as exc:  # noqa: BLE001
-                if attempt == 3:
+                if attempt == 2:
                     err += 1
                     print(f"  [{i}/{len(folders)}] {folder} ERR {exc}", flush=True)
                 else:
@@ -139,12 +233,12 @@ def recent_local_folders(since_prefix: str, until_prefix: str | None) -> list[Pa
     return out
 
 
-def fetch_with_retries(url: str, retries: int = 4, timeout: float = 20.0) -> bytes:
+def fetch_with_retries(url: str, retries: int = 3, timeout: float = 15.0) -> bytes:
     last_exc: Exception | None = None
     for attempt in range(1, retries + 1):
         try:
             with urllib.request.urlopen(url, timeout=timeout) as response:
-                return response.read()
+                return read_with_deadline(response, deadline_s=timeout * 1.5)
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
             if attempt < retries:
@@ -343,9 +437,31 @@ def wait_for_url(url: str, timeout_s: float = 20.0) -> None:
             time.sleep(0.5)
 
 
+def _free_port(port: int) -> None:
+    """Kill any process currently listening on *port* so a fresh server can bind."""
+    import subprocess as _sp
+    try:
+        result = _sp.run(
+            ["lsof", "-ti", f"tcp:{port}"],
+            capture_output=True, text=True,
+        )
+        pids = result.stdout.split()
+        if pids:
+            _sp.run(["kill", "-9"] + pids, capture_output=True)
+            time.sleep(0.5)
+            print(f"freed port {port} (killed pids: {' '.join(pids)})", flush=True)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def run_server_phase(cmd: list[str], url: str, title: str, cwd: Path = REPO, open_browser: bool = True) -> None:
     print(f"\n=== {title} ===", flush=True)
     print("Stop the server with Ctrl+C when you are done with this phase.", flush=True)
+    # Free the port before binding so stale servers from prior runs never block us.
+    import urllib.parse as _up
+    _parsed = _up.urlparse(url)
+    if _parsed.port:
+        _free_port(_parsed.port)
 
     def open_later() -> None:
         wait_for_url(url)
@@ -416,14 +532,30 @@ def main() -> None:
     print(f"window_since={since_prefix} until={until_prefix or '(none)'}", flush=True)
 
     if not args.skip_sync:
-        missing = list_recent_missing(args.host, since_prefix, until_prefix)
-        if missing:
-            print("\n=== Pull recent metadata ===", flush=True)
-            pull_meta_gently(args.host, missing)
+        print("\n=== Board connectivity check ===", flush=True)
+        if not board_reachable(args.host):
+            print(
+                f"WARNING: {args.host} unreachable (TCP connect timed out). "
+                "Skipping SD sync — rerun without --skip-sync when board is online.",
+                flush=True,
+            )
         else:
-            print("\nNo new recent folders to sync.", flush=True)
-        print("\n=== Pull missing JPGs for recent folders ===", flush=True)
-        pull_recent_jpgs_gently(args.host, since_prefix, until_prefix)
+            print(f"Board {args.host} reachable. Starting sync.", flush=True)
+            try:
+                missing = list_recent_missing(args.host, since_prefix, until_prefix)
+                if missing:
+                    print("\n=== Pull recent metadata ===", flush=True)
+                    pull_meta_gently(args.host, missing)
+                else:
+                    print("\nNo new recent folders to sync.", flush=True)
+                print("\n=== Pull missing JPGs for recent folders ===", flush=True)
+                pull_recent_jpgs_gently(args.host, since_prefix, until_prefix)
+            except Exception as exc:  # noqa: BLE001
+                print(
+                    f"\nWARNING: Sync failed ({exc}). "
+                    "Continuing with local data for reports and labeling.",
+                    flush=True,
+                )
 
     print("\n=== Refresh reports, statistics, dashboard inputs ===", flush=True)
     run_reports_and_stats()
