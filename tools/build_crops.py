@@ -189,9 +189,50 @@ class YOLOxRotCropPipeline:
         return bbox_upright
 
 
+class YOLOsRotCropPipeline:
+    """Ultralytics yolo11s_640 on rotated CCW + top-160 cropped frames."""
+    name = "yolo11s_rotcrop"
+    dirname = "crops_yolo11s_rotcrop"
+
+    def __init__(self):
+        from ultralytics import YOLO
+        import ultralytics.utils
+        ultralytics.utils.LOGGER.setLevel(logging.WARNING)
+        self.model = YOLO("yolo11s.pt")
+        self.imgsz = 640
+        import torch
+        self.device = ("mps" if torch.backends.mps.is_available()
+                       else ("cuda" if torch.cuda.is_available() else "cpu"))
+
+    def detect_cat(self, raw_bgr: np.ndarray) -> tuple[float, int, int, int, int] | None:
+        """Detect on upright frame, return bbox already in upright coords."""
+        upright = to_upright(raw_bgr)
+        res = self.model.predict(
+            upright, imgsz=self.imgsz, conf=CAT_CONF,
+            classes=[15],  # COCO cat
+            device=self.device, verbose=False)[0]
+        if res.boxes is None or len(res.boxes) == 0:
+            return None
+        best = None
+        for b, c in zip(res.boxes.xyxy.cpu().numpy(),
+                        res.boxes.conf.cpu().numpy()):
+            x1, y1, x2, y2 = b.tolist()
+            area = (x2 - x1) * (y2 - y1)
+            cand = (float(c), int(x1), int(y1),
+                    int(x2 - x1), int(y2 - y1), area)
+            if best is None or cand[5] > best[5]:
+                best = cand
+        return best[:5] if best else None
+
+    def bbox_to_upright(self, bbox_upright, raw_shape):
+        # Already in upright coords
+        return bbox_upright
+
+
 PIPELINES = {
     "mdv6_raw": MDv6Pipeline,
     "yolo11x_rotcrop": YOLOxRotCropPipeline,
+    "yolo11s_rotcrop": YOLOsRotCropPipeline,
 }
 
 

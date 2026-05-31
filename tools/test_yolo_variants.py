@@ -48,6 +48,7 @@ SAMPLE_CSV = REPO / "models" / "subject_detection_eval" / "summary.csv"
 MANIFEST_CSV = REPO / "dataset" / "manifest.csv"
 
 CAT_CONF = 0.15
+DEVICE_OVERRIDE: str | None = None
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -76,7 +77,9 @@ class UltralyticsModel:
         self.name = name or f"{Path(weights).stem}_{imgsz}"
         # Pick device
         import torch
-        if device == "auto":
+        if device == "auto" and DEVICE_OVERRIDE is not None:
+            self.device = DEVICE_OVERRIDE
+        elif device == "auto":
             if torch.backends.mps.is_available():
                 self.device = "mps"
             elif torch.cuda.is_available():
@@ -110,15 +113,21 @@ class MegaDetector:
     so it should out-perform COCO YOLO on this domain.
     """
     def __init__(self, version: str = "MDV6-yolov9-c",
-                 name: str | None = None):
+                 name: str | None = None,
+                 device: str = "auto"):
         import os
         os.environ.setdefault("SSL_CERT_FILE",
                               __import__("certifi").where())
         from PytorchWildlife.models import detection as pw_detection
-        # device='mps' is accepted but the base class fallback to cpu;
-        # we pass mps anyway in case a newer version respects it.
-        self.model = pw_detection.MegaDetectorV6(device="mps",
-                                                  version=version)
+        if device == "auto" and DEVICE_OVERRIDE is not None:
+            run_device = DEVICE_OVERRIDE
+        elif device == "auto":
+            import torch
+            run_device = "mps" if torch.backends.mps.is_available() else "cpu"
+        else:
+            run_device = device
+        self.model = pw_detection.MegaDetectorV6(device=run_device,
+                                                 version=version)
         self.name = name or version
 
     def detect(self, bgr):
@@ -164,6 +173,7 @@ def load_sample(max_bursts: int | None) -> list[dict]:
 
 
 def main():
+    global DEVICE_OVERRIDE
     ap = argparse.ArgumentParser()
     ap.add_argument("--variants", default=",".join(DEFAULT_VARIANTS),
                     help=f"Comma-separated variant names. "
@@ -177,7 +187,12 @@ def main():
                          "frame, where the bright door occlusion sits")
     ap.add_argument("--tag", default="",
                     help="Suffix to append to output files (e.g. 'rot')")
+    ap.add_argument("--device", default="auto",
+                    choices=["auto", "cpu", "mps", "cuda"],
+                    help="Force detector execution device for supported models")
     args = ap.parse_args()
+
+    DEVICE_OVERRIDE = None if args.device == "auto" else args.device
 
     OUT.mkdir(parents=True, exist_ok=True)
     variant_names = [v.strip() for v in args.variants.split(",") if v.strip()]

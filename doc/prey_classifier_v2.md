@@ -334,3 +334,74 @@ mdv6_yolov10c (1280)            0 %           48 %           65 %
 - **2026-05-30** Dropped sub-snout heuristic of "narrow snout
   horizontally" because the cat is column-shaped at the cat-flap
   entry; full-width preserves paws/prey context.
+- **2026-05-31** Switched Stage-1 from **yolo11x** to **yolo11s** for
+  the production server (CPU-only i5 target). See
+  [§ CPU deployment: yolo11s switch](#cpu-deployment-yolo11s-switch)
+  below for the full evaluation. The classifier was retrained on
+  yolo11s crops (`models/prey_v3/bodyA_s`) and slightly out-performs
+  the x-trained model on a 399-burst evaluation (TP=25/26, FP=0 vs
+  20, same single FN — a classifier-side failure that affects both
+  pipelines).
+
+## CPU deployment: yolo11s switch
+
+The local-inference server runs on a no-GPU i5 laptop. Re-ran the
+Stage-1 benchmark under `--device cpu`
+([tools/test_yolo_variants.py](../tools/test_yolo_variants.py),
+results in
+[`models/subject_detection_eval/variants/comparison_cpu_rot_crop160.txt`](../models/subject_detection_eval/variants/comparison_cpu_rot_crop160.txt)):
+
+| variant            | ms/frame (CPU) | cat_burst% | empty_FP% |
+|--------------------|---------------:|-----------:|----------:|
+| nano_ncnn_384x640  |   8.2          |  66.7 %    |   0.0 %   |
+| yolo11n_640        |  28.2          |  58.3 %    |   0.0 %   |
+| **yolo11s_640**    |  **55.9**      |  **95.8 %**|   0.0 %   |
+| yolo11m_640        | 118.6          |  98.6 %    |   0.0 %   |
+| yolo11l_640        | 161.4 (20-burst sub-sample) | 95.0 % | 0.0 % |
+| yolo11x_640        | 289.4 (20-burst sub-sample) |100.0 % | 0.0 % |
+
+yolo11x is ~5× slower than yolo11s on CPU; yolo11s is the
+speed/quality knee.
+
+### Full-pipeline evaluation (classifier included)
+
+Generated `dataset/crops_yolo11s_rotcrop` over the full 604-burst
+dataset and retrained the prey_v3 multitask classifier on it
+(`models/prey_v3/bodyA_s`). Re-ran the metric sweep
+([tools/eval_prey_v3_metric_sweep.py](../tools/eval_prey_v3_metric_sweep.py))
+to find the best per-rule decision threshold, then compared each
+(detector + matching classifier + own-sweep rule) end-to-end on the
+399 bursts both detectors cropped
+([tools/compare_full_x_vs_s.py](../tools/compare_full_x_vs_s.py),
+[`models/prey_v3/x_vs_s_full/per_burst.csv`](../models/prey_v3/x_vs_s_full/per_burst.csv)):
+
+| pipeline                       | TP | FP | FN | prec  | rec   | F1    |
+|--------------------------------|---:|---:|---:|------:|------:|------:|
+| yolo11x + bodyA (rule x)       | 25 | 20 |  1 | 0.556 | 0.962 | 0.704 |
+| **yolo11s + bodyA_s (rule s)** | **25** | **0** | **1** | **1.000** | **0.962** | **0.980** |
+
+Net: 20 train/val false-blocks fixed, no new prey leaks. The single
+remaining FN is `20260505_220948_gen9` (mazge, val) — a
+classifier-side failure on a blown-out close-up that both pipelines
+share, not a detector-side regression.
+
+Best rule for `bodyA_s` (from
+[`models/prey_v3/bodyA_s/metric_sweep/summary.json`](../models/prey_v3/bodyA_s/metric_sweep/summary.json)):
+
+```
+mode=topk_mean topk=3 w_prey=0.8 w_cat=-0.3 w_count=0.2
+prey_count_threshold=0.3 threshold=0.42
+```
+
+### Open considerations
+
+- Coverage gap: yolo11s detects nothing in 45 bursts where yolo11x
+  cropped at least one frame (2 of those are prey-entering bursts).
+  Door-gate logic treats "no cat detected" as "no door action", and
+  the burst-retry behaviour gives a second chance within seconds, so
+  these are not safety regressions — but they do increase
+  cat-waiting-at-door UX latency for a small number of cases.
+- val split has only 5 prey bursts; the FN is real but the sample is
+  small. Continue monitoring on rolling production data.
+- bodyA_s reaches the same val/test F1 in ~30 min training on MPS,
+  so retraining as the dataset grows is cheap.
