@@ -1209,10 +1209,11 @@ extern volatile uint32_t apiAbandonCount;
 // inference server SEQUENTIALLY, aggregates per-frame door_action and
 // lockout_seconds from the server response, applies door decision.
 //
-// Fail behaviour: if 0 frames return 200 OK (server unreachable / all errors),
-// fall back to CLOSED door with a default lockout so the cat retries on the
-// next ToF trigger rather than getting in unverified.
-#define V2_FAIL_CLOSED_LOCKOUT_S 120  // matches server "medium" severity
+// Lockout policy: only applied when the server actually detected prey
+// (severity drives duration). If the burst is denied for any other reason
+// (no cat recognized, server unreachable, ambiguous response), this burst
+// stays CLOSED but no lockout is set, so the cat can retry on the next
+// ToF trigger ~3s later.
 void autonomousApiCheck(int archIdx) {
   if (archIdx < 0 || archIdx >= burstArchiveCount) return;
   BurstArchive &archive = burstArchives[archIdx];
@@ -1314,21 +1315,29 @@ void autonomousApiCheck(int archIdx) {
     archive.apiFramesSent, okSoFar, anyDeny, anyAllow,
     catRecognizedCount, preyDetectedCount, (unsigned)maxLockoutS);
 
-  // Door decision (contract-driven):
-  //   - any frame said "deny": deny + apply max lockout_seconds
-  //   - all responding frames said "allow": open
-  //   - 0 frames responded (server unreachable / errors): FAIL-CLOSED
+  // Door decision (lockout only when prey actually detected):
+  //   - 0 frames responded: door stays CLOSED for this burst, NO lockout
+  //     (cat retries on next ToF trigger; covers transient server hiccups)
+  //   - any frame detected prey: deny + apply server's lockout_seconds
+  //     (server returns higher lockout for higher severity)
+  //   - anyDeny WITHOUT prey detection (no cat recognized, off-frame, etc.):
+  //     deny THIS burst but NO lockout. Cat retries on next ToF trigger.
+  //   - anyAllow + no deny: open
   bool open = false;
   uint16_t lockoutS = 0;
   const char *reason;
   if (okSoFar == 0) {
     open = false;
-    lockoutS = V2_FAIL_CLOSED_LOCKOUT_S;
-    reason = "v2 server unreachable (fail-closed)";
+    lockoutS = 0;  // no lockout on transient server problems
+    reason = "v2 server unreachable (no lockout, retry next trigger)";
+  } else if (preyDetectedCount > 0) {
+    open = false;
+    lockoutS = maxLockoutS;  // server-prescribed; scales with severity
+    reason = "v2 prey detected";
   } else if (anyDeny) {
     open = false;
-    lockoutS = maxLockoutS > 0 ? maxLockoutS : V2_FAIL_CLOSED_LOCKOUT_S;
-    reason = "v2 deny";
+    lockoutS = 0;  // no cat recognized but no prey -> don't penalize
+    reason = "v2 deny (no cat recognized, no lockout)";
   } else if (anyAllow) {
     open = true;
     lockoutS = 0;
@@ -1337,8 +1346,8 @@ void autonomousApiCheck(int archIdx) {
     // Responses came back but none said allow OR deny (shouldn't happen per
     // contract, but be safe).
     open = false;
-    lockoutS = V2_FAIL_CLOSED_LOCKOUT_S;
-    reason = "v2 ambiguous response (fail-closed)";
+    lockoutS = 0;
+    reason = "v2 ambiguous response (no lockout)";
   }
 
   archive.apiPreyDetected = (preyDetectedCount > 0) ? 1 : 0;
