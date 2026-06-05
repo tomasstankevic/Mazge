@@ -4082,16 +4082,12 @@ void loop() {
   // OK), reboot.
   {
 #define HTTP_LIVENESS_PROBE_MS  60000UL    // probe every 60s
-#define HTTP_LIVENESS_HANG_MS   180000UL   // reboot if no OK for 3min
+#define HTTP_LIVENESS_HANG_MS   300000UL   // reboot if no OK for 5min
     static unsigned long lastHttpProbeMs   = 0;
-    static unsigned long lastHttpLiveMs    = 0;  // seeded by first probe attempt
+    static unsigned long lastHttpLiveMs    = 0;  // 0 = never yet, do not reboot
     if (WiFi.isConnected() && !otaInProgress &&
         now - lastHttpProbeMs >= HTTP_LIVENESS_PROBE_MS) {
       lastHttpProbeMs = now;
-      // Seed lastHttpLiveMs on the FIRST attempt so a cold-boot freeze
-      // (httpd wedges before any successful probe) still trips the reboot
-      // path after HANG_MS. Otherwise lastHttpLiveMs stays 0 forever.
-      if (lastHttpLiveMs == 0) lastHttpLiveMs = now;
       WiFiClient probe;
       probe.setTimeout(2);  // seconds for arduino-esp32 WiFiClient
       IPAddress me = WiFi.localIP();
@@ -4099,11 +4095,13 @@ void loop() {
       probe.stop();  // always close, even on failed connect (avoid socket leak)
       if (ok) {
         lastHttpLiveMs = now;
-      } else {
+      } else if (lastHttpLiveMs != 0) {
         Serial.printf("HTTP-WDT: self-probe FAILED (lastOk=%lums ago)\n",
                       now - lastHttpLiveMs);
       }
-      if ((now - lastHttpLiveMs) > HTTP_LIVENESS_HANG_MS) {
+      // Only reboot once we've SEEN at least one successful probe; that
+      // way a heavy sdlist run on a fresh boot can't bootloop the device.
+      if (lastHttpLiveMs != 0 && (now - lastHttpLiveMs) > HTTP_LIVENESS_HANG_MS) {
         Serial.printf("HTTP-WDT: server unresponsive for %lums \u2014 rebooting\n",
                       now - lastHttpLiveMs);
         delay(200);
