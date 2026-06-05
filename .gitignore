@@ -61,3 +61,7 @@ models/subject_detection_eval/
 
 # Editor backups
 *.bak
+_bench_weights/
+
+logs/
+.venv-server/

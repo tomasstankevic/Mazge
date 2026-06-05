@@ -150,19 +150,34 @@ Status mapping:
 
 ## latency, timeout, and retry rules
 
+Targets are sized for the production server host (2016 13" MBP, Intel
+i5-6360U, 2C/4T, CPU-only) running ONNX Runtime. Measured per-stage
+latency on that hardware (synthetic 1-frame inputs, see
+`tools/bench_onnx_local.py`):
+
+- prey_v3 EfficientNet-B0 @ 224: p50 ≈ 33 ms, p95 ≈ 73 ms
+- yolo11s body detect @ 384:     p50 ≈ 131 ms, p95 ≈ 178 ms
+- yolo11s body detect @ 480:     p50 ≈ 208 ms, p95 ≈ 248 ms
+- yolo11s body detect @ 640:     p50 ≈ 394 ms, p95 ≈ 718 ms
+
+Production crops (`crops_yolo11s_rotcrop`) were generated at imgsz=640,
+so matching that gives p50 ≈ 430 ms / p95 ≈ 790 ms end-to-end. Targets
+below assume the @384 or @480 server path; the @640 path needs the
+budget relaxed or a retrained `bodyA_s` on smaller crops.
+
 Firmware side rules:
 
-- request timeout: 350 ms per frame
+- request timeout: 800 ms per frame
 - retry count: at most 1 retry
 - retry condition: timeout or 5xx only
-- retry backoff: fixed 60 ms
+- retry backoff: fixed 120 ms
 - retries must reuse the same X-Request-Id
 
 Server side rules:
 
-- target p50 latency <= 60 ms
-- target p95 latency <= 140 ms
-- if processing cannot complete before 300 ms budget, fail fast with 503
+- target p50 latency <= 200 ms
+- target p95 latency <= 350 ms
+- if processing cannot complete before 700 ms budget, fail fast with 503
 
 ## idempotency contract
 
