@@ -4433,6 +4433,43 @@ void loop() {
   }
   // =============================================================
 
+  // === HTTP server liveness watchdog ============================
+  // The ESP-IDF httpd runs on its own task. If it deadlocks (e.g. SD mutex
+  // contention, mbedTLS heap exhaustion) the main loop() keeps running and
+  // feeds the task WDT just fine, so the existing watchdogs never fire and
+  // the device "looks frozen" from the LAN side. This active probe opens
+  // a one-shot TCP connection to our own port 80 every PROBE_MS. If two
+  // probe windows in a row see no successful connect (>HANG_MS without an
+  // OK), reboot.
+  {
+#define HTTP_LIVENESS_PROBE_MS  60000UL    // probe every 60s
+#define HTTP_LIVENESS_HANG_MS   180000UL   // reboot if no OK for 3min
+    static unsigned long lastHttpProbeMs   = 0;
+    static unsigned long lastHttpLiveMs    = 0;  // 0 = never yet, ignore
+    if (WiFi.isConnected() && !otaInProgress &&
+        now - lastHttpProbeMs >= HTTP_LIVENESS_PROBE_MS) {
+      lastHttpProbeMs = now;
+      WiFiClient probe;
+      probe.setTimeout(2);  // seconds for arduino-esp32 WiFiClient
+      IPAddress me = WiFi.localIP();
+      bool ok = (me != IPAddress(0,0,0,0)) && probe.connect(me, 80, 1500);
+      if (ok) {
+        lastHttpLiveMs = now;
+        probe.stop();
+      } else {
+        Serial.printf("HTTP-WDT: self-probe FAILED (lastOk=%lums ago)\n",
+                      lastHttpLiveMs ? (now - lastHttpLiveMs) : 0);
+      }
+      if (lastHttpLiveMs != 0 && (now - lastHttpLiveMs) > HTTP_LIVENESS_HANG_MS) {
+        Serial.printf("HTTP-WDT: server unresponsive for %lums \u2014 rebooting\n",
+                      now - lastHttpLiveMs);
+        delay(200);
+        ESP.restart();
+      }
+    }
+  }
+  // =============================================================
+
   // Blynk: send door state on change
   if (blynkDoorChanged) {
     blynkDoorChanged = false;
