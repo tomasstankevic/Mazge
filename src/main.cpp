@@ -346,7 +346,14 @@ struct __attribute__((packed)) EventEntry {
   uint8_t  mode;       // 0=laptop (legacy, always 1 now), 1=autonomous
   int8_t   trend;      // 0=unknown, 1=entering (far→close), 2=exiting (close→far), 3=passing
   uint16_t latencyMs;  // API processing latency (apiDoneMs - apiCallMs), 0 = unknown
-}; // packed = exactly 20 bytes
+#ifdef PREY_V2_URL
+  // Shadow v2 inference summary per burst (for visibility — not used for door)
+  uint16_t v2MaxPreyX1000; // max prey_score across burst, scaled by 1000 (0..1000)
+  uint8_t  v2OkFrames;     // number of frames where v2 returned 200 OK
+  uint8_t  v2Flags;        // bit0=anyDetected, bit1=anyCatRecognized,
+                           // bits2-3=modalCatId (0=unknown,1=mazge,2=benis,3=other)
+#endif
+}; // packed = exactly 20 bytes (24 with v2)
 Preferences nvsPrefs;
 EventEntry eventLog[MAX_EVENTS];
 int eventCount = 0;
@@ -363,7 +370,17 @@ void loadEventLog() {
   eventCount = nvsPrefs.getInt("count", 0);
   if (eventCount > MAX_EVENTS) eventCount = MAX_EVENTS;
   if (eventCount > 0) {
-    nvsPrefs.getBytes("entries", eventLog, sizeof(EventEntry) * eventCount);
+    size_t storedBytes = nvsPrefs.getBytesLength("entries");
+    size_t expectedBytes = sizeof(EventEntry) * eventCount;
+    if (storedBytes != expectedBytes) {
+      // EventEntry layout changed (e.g. v2 shadow fields added). Drop old log
+      // to avoid mis-aligned reads. Acceptable: NVS event log is transient.
+      Serial.printf("EventLog: stored=%u expected=%u (struct changed?), dropping %d events\n",
+                    (unsigned)storedBytes, (unsigned)expectedBytes, eventCount);
+      eventCount = 0;
+    } else {
+      nvsPrefs.getBytes("entries", eventLog, expectedBytes);
+    }
   }
   nvsPrefs.end();
   Serial.printf("Loaded %d events from NVS\n", eventCount);
@@ -433,7 +450,11 @@ int classifyDistTrend(BurstArchive &archive) {
   return is_exit ? 2 : 1;
 }
 
-void addEvent(int gen, int frameCount, int result, int distMin, int distMax, int trend, bool autonomous, time_t epochOverride = 0, uint16_t latencyMs = 0) {
+void addEvent(int gen, int frameCount, int result, int distMin, int distMax, int trend, bool autonomous, time_t epochOverride = 0, uint16_t latencyMs = 0
+#ifdef PREY_V2_URL
+              , uint16_t v2MaxPreyX1000 = 0, uint8_t v2OkFrames = 0, uint8_t v2Flags = 0
+#endif
+              ) {
   if (eventCount >= MAX_EVENTS) {
     // Shift out oldest half to make room
     int keep = MAX_EVENTS / 2;
@@ -455,6 +476,11 @@ void addEvent(int gen, int frameCount, int result, int distMin, int distMax, int
   e.mode = autonomous ? 1 : 0;
   e.trend = (int8_t)trend;
   e.latencyMs = latencyMs;
+#ifdef PREY_V2_URL
+  e.v2MaxPreyX1000 = v2MaxPreyX1000;
+  e.v2OkFrames     = v2OkFrames;
+  e.v2Flags        = v2Flags;
+#endif
   eventCount++;
   saveEventLog();
 }
@@ -1725,14 +1751,11 @@ api_done:
   unsigned long latMs = (archive.apiDoneMs > archive.apiCallMs)
     ? (archive.apiDoneMs - archive.apiCallMs) : 0;
   if (latMs > 65535) latMs = 65535;
-  addEvent(archive.generation, archive.count, eventResult, dMin, dMax, trend, true, dirEpoch, (uint16_t)latMs);
-
-  // Blynk: push event telemetry (prey result + detail)
-  blynkPushEvent(archive.apiPreyDetected == 1 ? 1 : 0, preyFrameCount, archive.count, latMs);
 
 #ifdef PREY_V2_URL
   // Shadow v2 burst summary: max prey_score across frames, modal cat_id,
-  // number of frames where v2 "detected" matched legacy. Logged only.
+  // number of frames where v2 "detected" matched legacy. Logged AND packed
+  // into the event log so the events UI surfaces it without touching SD.
   int v2Ok = 0, v2Det = 0, v2CatRec = 0;
   float v2MaxPrey = -1.0f;
   int   v2MaxIdx = -1;
@@ -1756,15 +1779,39 @@ api_done:
                        : (catBenis >= catOther && catBenis > 0)                          ? "benis"
                        : (catOther > 0)                                                  ? "other"
                                                                                          : "?";
+  uint8_t modalCatBits = 0;  // 0=unknown
+  if      (catMazge >= catBenis && catMazge >= catOther && catMazge > 0) modalCatBits = 1;
+  else if (catBenis >= catOther && catBenis > 0)                          modalCatBits = 2;
+  else if (catOther > 0)                                                  modalCatBits = 3;
+  uint16_t v2MaxPreyX1000 = 0;
+  if (v2MaxPrey >= 0.0f) {
+    int s = (int)(v2MaxPrey * 1000.0f + 0.5f);
+    if (s < 0) s = 0;
+    if (s > 1000) s = 1000;
+    v2MaxPreyX1000 = (uint16_t)s;
+  }
+  uint8_t v2Flags = 0;
+  if (v2Det > 0)    v2Flags |= 0x01;
+  if (v2CatRec > 0) v2Flags |= 0x02;
+  v2Flags |= (modalCatBits & 0x03) << 2;
+  uint8_t v2OkFrames = (uint8_t)(v2Ok > 255 ? 255 : v2Ok);
   Serial.printf(
     "V2-SUMMARY gen=%d frames=%d v2ok=%d v2det=%d v2catRec=%d maxPrey=%.3f@f%d "
-    "cat=%s(m=%d/b=%d/o=%d) httpAvg=%lums srvAvg=%lums | legacyPrey=%d/%d \n",
+    "cat=%s(m=%d/b=%d/o=%d) httpAvg=%lums srvAvg=%lums | legacyPrey=%d/%d\n",
     archive.generation, archive.count, v2Ok, v2Det, v2CatRec,
     v2MaxPrey, v2MaxIdx, modalCat, catMazge, catBenis, catOther,
     v2Ok ? v2HttpTot / v2Ok : 0,
     v2Ok ? v2SrvTot / v2Ok  : 0,
     preyFrameCount, archive.count);
+  addEvent(archive.generation, archive.count, eventResult, dMin, dMax, trend, true,
+           dirEpoch, (uint16_t)latMs, v2MaxPreyX1000, v2OkFrames, v2Flags);
+#else
+  addEvent(archive.generation, archive.count, eventResult, dMin, dMax, trend, true,
+           dirEpoch, (uint16_t)latMs);
 #endif
+
+  // Blynk: push event telemetry (prey result + detail)
+  blynkPushEvent(archive.apiPreyDetected == 1 ? 1 : 0, preyFrameCount, archive.count, latMs);
 }
 
 // Guard: only one API task at a time (timestamp-based, auto-expires).
@@ -2224,7 +2271,11 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
             '<span style="color:#4cf">' + distStr + '</span> ' +
             '<span style="color:' + trendColors[tl] + '">' + trendLabels[tl] + '</span> ' +
             '<span style="color:' + resColor + '">' + resStr + '</span>' +
-            (e.lat > 0 ? ' <span style="color:#607296">' + (e.lat / 1000).toFixed(1) + 's</span>' : '');
+            (e.lat > 0 ? ' <span style="color:#607296">' + (e.lat / 1000).toFixed(1) + 's</span>' : '') +
+            (e.v2 && e.v2.okFrames > 0
+              ? ' <span style="color:#9af;font-size:0.85em">[v2 ' +
+                e.v2.maxPrey.toFixed(2) + ' ' + e.v2.catId + (e.v2.det ? ' \u26A0' : '') + ']</span>'
+              : (e.v2 ? ' <span style="color:#666;font-size:0.85em">[v2 \u2205]</span>' : ''));
           // Make rows with a real epoch clickable: load the burst on demand
           if (e.epoch && e.epoch > 1700000000) {
             div.style.cursor = 'pointer';
@@ -3620,14 +3671,29 @@ static esp_err_t getevents_handler(httpd_req_t *req) {
   unsigned long nowMs = millis();
   int hdrLen = snprintf(hdr, sizeof(hdr), "{\"epoch\":%ld,\"uptimeMs\":%lu,\"events\":[", (long)nowEpoch, nowMs);
   httpd_resp_send_chunk(req, hdr, hdrLen);
-  char buf[180];
+  char buf[260];
   for (int i = 0; i < eventCount; i++) {
     EventEntry &e = eventLog[i];
+#ifdef PREY_V2_URL
+    static const char *catNames[] = {"unknown", "mazge", "benis", "other"};
+    int catBits = (e.v2Flags >> 2) & 0x03;
+    int v2Det = (e.v2Flags & 0x01) ? 1 : 0;
+    int v2CatRec = (e.v2Flags & 0x02) ? 1 : 0;
+    int len = snprintf(buf, sizeof(buf),
+      "%s{\"t\":%lu,\"epoch\":%ld,\"ago\":%lu,\"gen\":%d,\"nf\":%d,\"res\":%d,\"dMin\":%d,\"dMax\":%d,\"mode\":%d,\"trend\":%d,\"lat\":%u,"
+      "\"v2\":{\"maxPrey\":%.3f,\"okFrames\":%u,\"det\":%d,\"catRec\":%d,\"catId\":\"%s\"}}",
+      i > 0 ? "," : "",
+      e.uptimeMs, (long)e.epochSec, (nowMs > e.uptimeMs) ? (nowMs - e.uptimeMs) : 0,
+      e.gen, e.frameCount, e.result, e.distMin, e.distMax, e.mode, e.trend, (unsigned)e.latencyMs,
+      e.v2MaxPreyX1000 / 1000.0f, (unsigned)e.v2OkFrames,
+      v2Det, v2CatRec, catNames[catBits]);
+#else
     int len = snprintf(buf, sizeof(buf),
       "%s{\"t\":%lu,\"epoch\":%ld,\"ago\":%lu,\"gen\":%d,\"nf\":%d,\"res\":%d,\"dMin\":%d,\"dMax\":%d,\"mode\":%d,\"trend\":%d,\"lat\":%u}",
       i > 0 ? "," : "",
       e.uptimeMs, (long)e.epochSec, (nowMs > e.uptimeMs) ? (nowMs - e.uptimeMs) : 0,
       e.gen, e.frameCount, e.result, e.distMin, e.distMax, e.mode, e.trend, (unsigned)e.latencyMs);
+#endif
     httpd_resp_send_chunk(req, buf, len);
   }
   httpd_resp_send_chunk(req, "]}", 2);
