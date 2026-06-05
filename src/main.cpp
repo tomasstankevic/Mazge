@@ -296,6 +296,20 @@ struct BurstArchive {
   unsigned long totalMs[RING_SIZE];
   unsigned long apiDoneMs;        // when autonomousApiCheck finished
   char sdPath[48];                 // SD card directory path for this burst
+#ifdef PREY_V2_URL
+  // Shadow v2 inference (does NOT feed door logic; logged only)
+  int8_t   v2Status[RING_SIZE];       // -1=not run, 0=http err, 1=ok
+  int8_t   v2Detected[RING_SIZE];     // -1=unknown, 0=false, 1=true
+  int8_t   v2CatRecognized[RING_SIZE]; // -1/0/1
+  float    v2PreyScore[RING_SIZE];    // 0..1 (NaN if unknown)
+  float    v2CatConfidence[RING_SIZE];
+  uint16_t v2DecisionMs[RING_SIZE];   // server-reported decision time
+  uint16_t v2HttpMs[RING_SIZE];       // wall-clock POST + parse
+  int16_t  v2HttpCode[RING_SIZE];     // raw HTTP status (0 if no conn)
+  char     v2CatId[RING_SIZE][12];    // "mazge"/"benis"/"unknown"
+  char     v2Severity[RING_SIZE][12]; // "none"/"low"/"medium"/"high"
+  char     v2DoorAction[RING_SIZE][12]; // "allow"/"block"/...
+#endif
 };
 BurstArchive burstArchives[BURST_ARCHIVES];
 volatile int burstArchiveCount = 0;
@@ -623,6 +637,21 @@ void freezeRingToArchive() {
   burstArchives[slot].apiCallMs = 0;
   burstArchives[slot].sdPath[0] = '\0';
   for (int i = 0; i < RING_SIZE; i++) burstArchives[slot].apiResults[i] = -1;
+#ifdef PREY_V2_URL
+  for (int i = 0; i < RING_SIZE; i++) {
+    burstArchives[slot].v2Status[i] = -1;
+    burstArchives[slot].v2Detected[i] = -1;
+    burstArchives[slot].v2CatRecognized[i] = -1;
+    burstArchives[slot].v2PreyScore[i] = -1.0f;
+    burstArchives[slot].v2CatConfidence[i] = -1.0f;
+    burstArchives[slot].v2DecisionMs[i] = 0;
+    burstArchives[slot].v2HttpMs[i] = 0;
+    burstArchives[slot].v2HttpCode[i] = 0;
+    burstArchives[slot].v2CatId[i][0] = '\0';
+    burstArchives[slot].v2Severity[i][0] = '\0';
+    burstArchives[slot].v2DoorAction[i][0] = '\0';
+  }
+#endif
 
   // Save ring frames (oldest first), skip blown-out frames
   int available = ringCount;
@@ -769,8 +798,37 @@ void saveBurstToSd(int archIdx) {
       if (dirFirst < 0) dirFirst = d;
       if (dirMin < 0 || d < dirMin) dirMin = d;
     }
-    mf.printf("],\"direction\":%d,\"directionMinDist\":%d,\"directionFirstDist\":%d}",
+    mf.printf("],\"direction\":%d,\"directionMinDist\":%d,\"directionFirstDist\":%d",
               direction, dirMin, dirFirst);
+#ifdef PREY_V2_URL
+    // Shadow v2 inference results (not used for door logic; for offline A/B).
+    mf.print(",\"v2\":{\"server\":\"" PREY_V2_URL "\",\"frames\":[");
+    for (int i = 0; i < arch.count; i++) {
+      if (i > 0) mf.print(",");
+      // Escape strings (only a-z + digits + dash expected, but be safe).
+      auto esc = [&](const char *s) {
+        mf.print('"');
+        for (const char *p = s; *p; ++p) {
+          if (*p == '"' || *p == '\\') mf.print('\\');
+          mf.print(*p);
+        }
+        mf.print('"');
+      };
+      mf.printf("{\"status\":%d,\"http\":%d,\"httpMs\":%u,\"decisionMs\":%u,"
+                "\"detected\":%d,\"catRecognized\":%d,"
+                "\"preyScore\":%.4f,\"catConfidence\":%.4f,",
+                (int)arch.v2Status[i], (int)arch.v2HttpCode[i],
+                (unsigned)arch.v2HttpMs[i], (unsigned)arch.v2DecisionMs[i],
+                (int)arch.v2Detected[i], (int)arch.v2CatRecognized[i],
+                arch.v2PreyScore[i], arch.v2CatConfidence[i]);
+      mf.print("\"catId\":");      esc(arch.v2CatId[i]);
+      mf.print(",\"severity\":");   esc(arch.v2Severity[i]);
+      mf.print(",\"doorAction\":"); esc(arch.v2DoorAction[i]);
+      mf.print('}');
+    }
+    mf.print("]}");
+#endif
+    mf.print("}");
     mf.close();
   }
   Serial.printf("SD: saved %d frames + meta to %s\n", arch.count, dirPath);
@@ -817,6 +875,10 @@ struct ApiWorkItem {
   uint8_t *prepBuf;      // preprocessed JPEG (worker frees)
   size_t prepLen;
   unsigned long enqueueMs;
+#ifdef PREY_V2_URL
+  BurstArchive *archive; // shadow v2 result destination (NULL = skip v2)
+  int archiveGen;        // sanity check (verify archive not recycled)
+#endif
 };
 struct ApiResultItem {
   int frameIdx;
@@ -939,6 +1001,13 @@ struct ApiWorker {
   int id;
   volatile bool resetTlsRequested; // set by other tasks; worker tears down on next iteration
   volatile bool prewarmRequested;  // set by other tasks; worker ensures TLS is connected
+#ifdef PREY_V2_URL
+  // Shadow client to the local LAN v2 inference server (plain HTTP, no TLS).
+  WiFiClient *v2_tcp;
+  HTTPClient *v2_http;
+  bool        v2_connected;
+  unsigned long v2_connectedAtMs;
+#endif
 };
 static ApiWorker apiWorkers[N_API_WORKERS];
 
@@ -1033,6 +1102,173 @@ static int callPreyApiWithWorker(ApiWorker *w,
   return prey ? 1 : 0;
 }
 
+#ifdef PREY_V2_URL
+// ===== Shadow v2 inference client =====
+//
+// Posts the same cropped JPEG to a local LAN server implementing the v2
+// contract (doc/inference_api_v2_contract.md). Result is recorded in the
+// BurstArchive but NEVER feeds the door logic. Purpose: shadow A/B against
+// the production cloud API while we accumulate signal on the new model.
+//
+// Endpoint expects raw image/jpeg body + X-* headers. Plain HTTP only —
+// the server runs on the same LAN and TLS would just burn CPU.
+
+#define V2_HTTP_TIMEOUT_MS 1500   // v2 server p95 ~320ms on the i5 box; 1.5s is generous
+#define V2_TLS_MAX_AGE_MS  (10UL * 60UL * 1000UL)
+
+static bool ensureWorkerV2Http(ApiWorker *w) {
+  unsigned long now = millis();
+  bool tooOld = w->v2_connected && (now - w->v2_connectedAtMs > V2_TLS_MAX_AGE_MS);
+  if (w->v2_connected && !tooOld && w->v2_tcp && w->v2_tcp->connected()) return true;
+  if (w->v2_http) { w->v2_http->end(); delete w->v2_http; w->v2_http = NULL; }
+  if (w->v2_tcp)  { w->v2_tcp->stop(); delete w->v2_tcp;  w->v2_tcp  = NULL; }
+  w->v2_connected = false;
+
+  w->v2_tcp = new WiFiClient();
+  if (!w->v2_tcp) return false;
+
+  w->v2_http = new HTTPClient();
+  w->v2_http->setReuse(true);
+  if (!w->v2_http->begin(*w->v2_tcp, PREY_V2_URL)) {
+    delete w->v2_http; w->v2_http = NULL;
+    delete w->v2_tcp;  w->v2_tcp  = NULL;
+    return false;
+  }
+  w->v2_http->setTimeout(V2_HTTP_TIMEOUT_MS);
+  w->v2_connected = true;
+  w->v2_connectedAtMs = millis();
+  return true;
+}
+
+// Tiny JSON helpers (no library dep). Robust enough for the v2 response
+// shape, which is generated server-side with separators=(',',':') style.
+static bool v2_extract_field(const String &body, const char *key, String &out) {
+  String pat = String("\"") + key + "\":";
+  int k = body.indexOf(pat);
+  if (k < 0) return false;
+  int p = k + pat.length();
+  while (p < (int)body.length() && body[p] == ' ') p++;
+  if (p >= (int)body.length()) return false;
+  if (body[p] == '"') {
+    int end = body.indexOf('"', p + 1);
+    if (end < 0) return false;
+    out = body.substring(p + 1, end);
+    return true;
+  }
+  int end = p;
+  while (end < (int)body.length() && body[end] != ',' && body[end] != '}'
+         && body[end] != '\n') end++;
+  out = body.substring(p, end);
+  out.trim();
+  return out.length() > 0;
+}
+
+static float v2_field_float(const String &body, const char *key, float dflt) {
+  String s; if (!v2_extract_field(body, key, s)) return dflt;
+  return s.toFloat();
+}
+static int v2_field_int(const String &body, const char *key, int dflt) {
+  String s; if (!v2_extract_field(body, key, s)) return dflt;
+  return s.toInt();
+}
+static int v2_field_bool(const String &body, const char *key) {
+  // returns -1 unknown, 0 false, 1 true
+  String s; if (!v2_extract_field(body, key, s)) return -1;
+  if (s == "true") return 1;
+  if (s == "false") return 0;
+  return -1;
+}
+static void v2_field_str(const String &body, const char *key,
+                         char *out, size_t cap) {
+  String s; if (!v2_extract_field(body, key, s)) { out[0] = '\0'; return; }
+  strncpy(out, s.c_str(), cap - 1);
+  out[cap - 1] = '\0';
+}
+
+static void v2_make_request_id(char *out, size_t cap) {
+  // RFC4122-shape uuid v4, sourced from esp_random(). Not crypto, fine for idem.
+  uint32_t a = esp_random(), b = esp_random(), c = esp_random(), d = esp_random();
+  snprintf(out, cap,
+           "%08x-%04x-%04x-%04x-%04x%08x",
+           a,
+           (b >> 16) & 0xffff,
+           ((b & 0x0fff) | 0x4000),               // version 4
+           ((c >> 16) & 0x3fff) | 0x8000,         // variant 10
+           c & 0xffff, d);
+}
+
+// Posts a single frame to the v2 endpoint and fills the archive slot.
+// jpgBuf is NOT freed by this function (caller still owns it).
+static void callPreyV2Shadow(ApiWorker *w, BurstArchive *arch, int frameIdx,
+                              const uint8_t *jpgBuf, size_t jpgLen) {
+  if (!arch || frameIdx < 0 || frameIdx >= RING_SIZE) return;
+  arch->v2Status[frameIdx] = 0;  // default to error until success
+
+  unsigned long t0 = millis();
+  if (!ensureWorkerV2Http(w)) {
+    arch->v2HttpCode[frameIdx] = 0;
+    arch->v2HttpMs[frameIdx]   = (uint16_t)(millis() - t0);
+    Serial.printf("V2[w%d] f[%d]: connect failed\n", w->id, frameIdx);
+    return;
+  }
+
+  char reqId[40];     v2_make_request_id(reqId, sizeof(reqId));
+  char tsBuf[24];     snprintf(tsBuf, sizeof(tsBuf), "%lld",
+                                (long long)((uint64_t)time(NULL) * 1000ULL));
+  char burstId[40];   snprintf(burstId, sizeof(burstId),
+                                "%lu_gen%d",
+                                (unsigned long)arch->triggerMs, arch->generation);
+  char fIdxBuf[8];    snprintf(fIdxBuf, sizeof(fIdxBuf), "%d", frameIdx);
+
+  w->v2_http->addHeader("Content-Type", "image/jpeg");
+  w->v2_http->addHeader("X-Contract-Version", "2");
+  w->v2_http->addHeader("X-Device-Id", PREY_V2_DEVICE_ID);
+  w->v2_http->addHeader("X-Burst-Id", burstId);
+  w->v2_http->addHeader("X-Frame-Index", fIdxBuf);
+  w->v2_http->addHeader("X-Frame-Ts-Ms", tsBuf);
+  w->v2_http->addHeader("X-Request-Id", reqId);
+
+  int httpCode = w->v2_http->POST(const_cast<uint8_t *>(jpgBuf), jpgLen);
+  unsigned long elapsed = millis() - t0;
+  arch->v2HttpCode[frameIdx] = (int16_t)httpCode;
+  arch->v2HttpMs[frameIdx]   = (uint16_t)(elapsed > 65535 ? 65535 : elapsed);
+
+  if (httpCode <= 0) {
+    Serial.printf("V2[w%d] f[%d]: POST err=%d (%lums)\n",
+                  w->id, frameIdx, httpCode, elapsed);
+    w->v2_connected = false;
+    return;
+  }
+  String body = w->v2_http->getString();
+  if (httpCode != 200) {
+    Serial.printf("V2[w%d] f[%d]: HTTP %d in %lums body=%s\n",
+                  w->id, frameIdx, httpCode, elapsed, body.c_str());
+    return;
+  }
+
+  arch->v2Status[frameIdx]        = 1;
+  arch->v2Detected[frameIdx]      = v2_field_bool(body, "detected");
+  arch->v2CatRecognized[frameIdx] = v2_field_bool(body, "cat_recognized");
+  arch->v2PreyScore[frameIdx]     = v2_field_float(body, "prey_score", -1.0f);
+  arch->v2CatConfidence[frameIdx] = v2_field_float(body, "cat_confidence", -1.0f);
+  arch->v2DecisionMs[frameIdx]    = (uint16_t)v2_field_int(body, "decision_ms", 0);
+  v2_field_str(body, "cat_id",      arch->v2CatId[frameIdx],      sizeof(arch->v2CatId[0]));
+  v2_field_str(body, "severity",    arch->v2Severity[frameIdx],   sizeof(arch->v2Severity[0]));
+  v2_field_str(body, "door_action", arch->v2DoorAction[frameIdx], sizeof(arch->v2DoorAction[0]));
+
+  Serial.printf(
+    "V2[w%d] f[%d]: %lums prey=%.3f cat=%s/%.2f sev=%s door=%s detected=%d (server=%ums)\n",
+    w->id, frameIdx, elapsed,
+    arch->v2PreyScore[frameIdx],
+    arch->v2CatId[frameIdx][0] ? arch->v2CatId[frameIdx] : "?",
+    arch->v2CatConfidence[frameIdx],
+    arch->v2Severity[frameIdx][0] ? arch->v2Severity[frameIdx] : "?",
+    arch->v2DoorAction[frameIdx][0] ? arch->v2DoorAction[frameIdx] : "?",
+    (int)arch->v2Detected[frameIdx],
+    (unsigned)arch->v2DecisionMs[frameIdx]);
+}
+#endif  // PREY_V2_URL
+
 // Worker task: drains apiWorkQueue, posts results to apiResultQueue.
 static void apiWorkerTask(void *arg) {
   ApiWorker *w = (ApiWorker *)arg;
@@ -1047,6 +1283,11 @@ static void apiWorkerTask(void *arg) {
       if (w->http) { w->http->end(); delete w->http; w->http = NULL; }
       if (w->tls)  { w->tls->stop(); delete w->tls;  w->tls  = NULL; }
       w->connected = false;
+#ifdef PREY_V2_URL
+      if (w->v2_http) { w->v2_http->end(); delete w->v2_http; w->v2_http = NULL; }
+      if (w->v2_tcp)  { w->v2_tcp->stop(); delete w->v2_tcp;  w->v2_tcp  = NULL; }
+      w->v2_connected = false;
+#endif
       Serial.printf("API[w%d]: TLS torn down on request (heap %u)\n",
                     w->id, (unsigned)ESP.getFreeHeap());
     }
@@ -1070,9 +1311,34 @@ static void apiWorkerTask(void *arg) {
       break;
     }
     unsigned long t0 = millis();
+#ifdef PREY_V2_URL
+    // Dup the cropped JPEG so the shadow v2 call can reuse it after the
+    // legacy call frees prepBuf. The dup lives in PSRAM (5-15 KB).
+    uint8_t *v2Buf = NULL;
+    size_t   v2Len = 0;
+    if (item.archive != NULL) {
+      v2Buf = (uint8_t *)ps_malloc(item.prepLen);
+      if (v2Buf) {
+        memcpy(v2Buf, item.prepBuf, item.prepLen);
+        v2Len = item.prepLen;
+      }
+    }
+#endif
     ApiTiming timing = {0, 0, 0};
     int res = callPreyApiWithWorker(w, item.prepBuf, item.prepLen, &timing);
     unsigned long total = millis() - t0;
+#ifdef PREY_V2_URL
+    if (v2Buf) {
+      // Fire shadow v2 call BEFORE posting the legacy result so the meta
+      // serializer (which runs after autonomousApiCheck collects results)
+      // sees both values for every frame. Pull-side wait is bounded by
+      // V2_HTTP_TIMEOUT_MS.
+      if (item.archive && item.archive->generation == item.archiveGen) {
+        callPreyV2Shadow(w, item.archive, item.frameIdx, v2Buf, v2Len);
+      }
+      free(v2Buf);
+    }
+#endif
     ApiResultItem r = {item.frameIdx, res, timing.b64Ms, timing.tlsMs,
                        timing.postMs, total};
     xQueueSend(apiResultQueue, &r, portMAX_DELAY);
@@ -1104,7 +1370,11 @@ static void stopApiWorkers() {
   if (!apiWorkersRunning) return;
   apiWorkersRunning = false;
   // Push sentinels so workers wake up and exit
-  ApiWorkItem stop = {-1, NULL, 0, 0};
+  ApiWorkItem stop = {-1, NULL, 0, 0
+#ifdef PREY_V2_URL
+    , NULL, 0
+#endif
+  };
   for (int i = 0; i < N_API_WORKERS; i++) {
     xQueueSend(apiWorkQueue, &stop, pdMS_TO_TICKS(100));
   }
@@ -1307,7 +1577,11 @@ void autonomousApiCheck(int archIdx) {
       if (!cropped) continue;
       archive.cropMs[i] = cropDt;
 
-      ApiWorkItem w = {i, cropped, croppedLen, millis()};
+      ApiWorkItem w = {i, cropped, croppedLen, millis()
+#ifdef PREY_V2_URL
+        , &archive, archive.generation
+#endif
+      };
       if (xQueueSend(apiWorkQueue, &w, pdMS_TO_TICKS(100)) == pdPASS) {
         inFlight++;
         sentSoFar++;
@@ -1455,6 +1729,42 @@ api_done:
 
   // Blynk: push event telemetry (prey result + detail)
   blynkPushEvent(archive.apiPreyDetected == 1 ? 1 : 0, preyFrameCount, archive.count, latMs);
+
+#ifdef PREY_V2_URL
+  // Shadow v2 burst summary: max prey_score across frames, modal cat_id,
+  // number of frames where v2 "detected" matched legacy. Logged only.
+  int v2Ok = 0, v2Det = 0, v2CatRec = 0;
+  float v2MaxPrey = -1.0f;
+  int   v2MaxIdx = -1;
+  int   catMazge = 0, catBenis = 0, catOther = 0;
+  unsigned long v2HttpTot = 0, v2SrvTot = 0;
+  for (int i = 0; i < archive.count; i++) {
+    if (archive.v2Status[i] != 1) continue;
+    v2Ok++;
+    if (archive.v2Detected[i] == 1) v2Det++;
+    if (archive.v2CatRecognized[i] == 1) v2CatRec++;
+    if (archive.v2PreyScore[i] > v2MaxPrey) {
+      v2MaxPrey = archive.v2PreyScore[i]; v2MaxIdx = i;
+    }
+    if      (!strcmp(archive.v2CatId[i], "mazge")) catMazge++;
+    else if (!strcmp(archive.v2CatId[i], "benis")) catBenis++;
+    else if (archive.v2CatId[i][0])                catOther++;
+    v2HttpTot += archive.v2HttpMs[i];
+    v2SrvTot  += archive.v2DecisionMs[i];
+  }
+  const char *modalCat = (catMazge >= catBenis && catMazge >= catOther && catMazge > 0) ? "mazge"
+                       : (catBenis >= catOther && catBenis > 0)                          ? "benis"
+                       : (catOther > 0)                                                  ? "other"
+                                                                                         : "?";
+  Serial.printf(
+    "V2-SUMMARY gen=%d frames=%d v2ok=%d v2det=%d v2catRec=%d maxPrey=%.3f@f%d "
+    "cat=%s(m=%d/b=%d/o=%d) httpAvg=%lums srvAvg=%lums | legacyPrey=%d/%d \n",
+    archive.generation, archive.count, v2Ok, v2Det, v2CatRec,
+    v2MaxPrey, v2MaxIdx, modalCat, catMazge, catBenis, catOther,
+    v2Ok ? v2HttpTot / v2Ok : 0,
+    v2Ok ? v2SrvTot / v2Ok  : 0,
+    preyFrameCount, archive.count);
+#endif
 }
 
 // Guard: only one API task at a time (timestamp-based, auto-expires).
