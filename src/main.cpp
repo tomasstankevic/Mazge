@@ -1027,13 +1027,6 @@ struct ApiWorker {
   int id;
   volatile bool resetTlsRequested; // set by other tasks; worker tears down on next iteration
   volatile bool prewarmRequested;  // set by other tasks; worker ensures TLS is connected
-#ifdef PREY_V2_URL
-  // Shadow client to the local LAN v2 inference server (plain HTTP, no TLS).
-  WiFiClient *v2_tcp;
-  HTTPClient *v2_http;
-  bool        v2_connected;
-  unsigned long v2_connectedAtMs;
-#endif
 };
 static ApiWorker apiWorkers[N_API_WORKERS];
 
@@ -1141,36 +1134,49 @@ static int callPreyApiWithWorker(ApiWorker *w,
 
 #define V2_HTTP_TIMEOUT_MS 400    // v2 server p95 ~320ms on the i5; tight bound
 #define V2_TLS_MAX_AGE_MS  (10UL * 60UL * 1000UL)
-#define V2_BURST_BREAKER_THRESHOLD 2  // skip v2 after this many consecutive errors per burst
+
+// Dedicated v2 transport state. Owned solely by v2Task — never touched from
+// any other task. This is the critical decoupling that prevents an httpd /
+// server hang from cascading into the API workers or main loop.
+static WiFiClient *g_v2_tcp  = NULL;
+static HTTPClient *g_v2_http = NULL;
+
+// Runtime toggle (persisted in NVS, loaded at boot). When false, jobs are
+// dropped at push time and v2Task never makes network calls.
+static volatile bool g_v2Enabled = true;
+
+// Lifetime stats for /diag visibility.
+static volatile uint32_t g_v2CallsTotal = 0;   // jobs picked up by task
+static volatile uint32_t g_v2OkTotal    = 0;   // 200 OK responses
+static volatile uint32_t g_v2ErrTotal   = 0;   // transport / non-200
+static volatile uint32_t g_v2DropsTotal = 0;   // queue overwrites + disabled-skips
+static volatile uint32_t g_v2InFlight   = 0;   // 0/1, used by addEvent wait
 
 // Build a fresh HTTPClient + WiFiClient for a single v2 POST.
 // Rationale: Arduino HTTPClient::addHeader() APPENDS to an internal header
-// list. Reusing the same client across calls (as we did initially) makes the
-// per-frame X-Burst-Id / X-Request-Id / X-Frame-Index headers pile up,
-// inflating the request and eventually overflowing buffers. Per-call rebuild
-// also sidesteps any half-closed-socket weirdness on the server side.
+// list. Reusing the same client across calls makes the per-frame
+// X-Burst-Id / X-Request-Id / X-Frame-Index headers pile up, inflating the
+// request and eventually overflowing buffers. Per-call rebuild also
+// sidesteps any half-closed-socket weirdness on the server side.
 //
 // Cost on LAN: ~5-15ms for socket open. Compared to the prey_v3 inference
 // p95 (~320ms), that's noise.
-static bool v2OpenForCall(ApiWorker *w) {
-  if (w->v2_http) { w->v2_http->end(); delete w->v2_http; w->v2_http = NULL; }
-  if (w->v2_tcp)  { w->v2_tcp->stop(); delete w->v2_tcp;  w->v2_tcp  = NULL; }
-  w->v2_connected = false;
+static bool v2OpenForCall() {
+  if (g_v2_http) { g_v2_http->end(); delete g_v2_http; g_v2_http = NULL; }
+  if (g_v2_tcp)  { g_v2_tcp->stop(); delete g_v2_tcp;  g_v2_tcp  = NULL; }
 
-  w->v2_tcp = new WiFiClient();
-  if (!w->v2_tcp) return false;
+  g_v2_tcp = new WiFiClient();
+  if (!g_v2_tcp) return false;
 
-  w->v2_http = new HTTPClient();
-  w->v2_http->setReuse(false);
-  if (!w->v2_http->begin(*w->v2_tcp, PREY_V2_URL)) {
-    delete w->v2_http; w->v2_http = NULL;
-    delete w->v2_tcp;  w->v2_tcp  = NULL;
+  g_v2_http = new HTTPClient();
+  g_v2_http->setReuse(false);
+  if (!g_v2_http->begin(*g_v2_tcp, PREY_V2_URL)) {
+    delete g_v2_http; g_v2_http = NULL;
+    delete g_v2_tcp;  g_v2_tcp  = NULL;
     return false;
   }
-  w->v2_http->setTimeout(V2_HTTP_TIMEOUT_MS);
-  w->v2_http->setConnectTimeout(V2_HTTP_TIMEOUT_MS);
-  w->v2_connected = true;
-  w->v2_connectedAtMs = millis();
+  g_v2_http->setTimeout(V2_HTTP_TIMEOUT_MS);
+  g_v2_http->setConnectTimeout(V2_HTTP_TIMEOUT_MS);
   return true;
 }
 
@@ -1233,18 +1239,18 @@ static void v2_make_request_id(char *out, size_t cap) {
 
 // Posts a single frame to the v2 endpoint and fills the archive slot.
 // jpgBuf is NOT freed by this function (caller still owns it).
-// Returns: 1 on success, 0 on transport/server error (used by caller for
-// per-burst circuit breaker).
-static int callPreyV2Shadow(ApiWorker *w, BurstArchive *arch, int frameIdx,
-                             const uint8_t *jpgBuf, size_t jpgLen) {
+// Returns: 1 on success, 0 on transport/server error.
+// Runs from v2Task only — owns g_v2_tcp / g_v2_http exclusively.
+static int callPreyV2Shadow(BurstArchive *arch, int frameIdx,
+                            const uint8_t *jpgBuf, size_t jpgLen) {
   if (!arch || frameIdx < 0 || frameIdx >= RING_SIZE) return 0;
   arch->v2Status[frameIdx] = 0;  // default to error until success
 
   unsigned long t0 = millis();
-  if (!v2OpenForCall(w)) {
+  if (!v2OpenForCall()) {
     arch->v2HttpCode[frameIdx] = 0;
     arch->v2HttpMs[frameIdx]   = (uint16_t)(millis() - t0);
-    Serial.printf("V2[w%d] f[%d]: open failed\n", w->id, frameIdx);
+    Serial.printf("V2 f[%d]: open failed\n", frameIdx);
     return 0;
   }
 
@@ -1256,29 +1262,28 @@ static int callPreyV2Shadow(ApiWorker *w, BurstArchive *arch, int frameIdx,
                                 (unsigned long)arch->triggerMs, arch->generation);
   char fIdxBuf[8];    snprintf(fIdxBuf, sizeof(fIdxBuf), "%d", frameIdx);
 
-  w->v2_http->addHeader("Content-Type", "image/jpeg");
-  w->v2_http->addHeader("X-Contract-Version", "2");
-  w->v2_http->addHeader("X-Device-Id", PREY_V2_DEVICE_ID);
-  w->v2_http->addHeader("X-Burst-Id", burstId);
-  w->v2_http->addHeader("X-Frame-Index", fIdxBuf);
-  w->v2_http->addHeader("X-Frame-Ts-Ms", tsBuf);
-  w->v2_http->addHeader("X-Request-Id", reqId);
+  g_v2_http->addHeader("Content-Type", "image/jpeg");
+  g_v2_http->addHeader("X-Contract-Version", "2");
+  g_v2_http->addHeader("X-Device-Id", PREY_V2_DEVICE_ID);
+  g_v2_http->addHeader("X-Burst-Id", burstId);
+  g_v2_http->addHeader("X-Frame-Index", fIdxBuf);
+  g_v2_http->addHeader("X-Frame-Ts-Ms", tsBuf);
+  g_v2_http->addHeader("X-Request-Id", reqId);
 
-  int httpCode = w->v2_http->POST(const_cast<uint8_t *>(jpgBuf), jpgLen);
+  int httpCode = g_v2_http->POST(const_cast<uint8_t *>(jpgBuf), jpgLen);
   unsigned long elapsed = millis() - t0;
   arch->v2HttpCode[frameIdx] = (int16_t)httpCode;
   arch->v2HttpMs[frameIdx]   = (uint16_t)(elapsed > 65535 ? 65535 : elapsed);
 
   if (httpCode <= 0) {
-    Serial.printf("V2[w%d] f[%d]: POST err=%d (%lums)\n",
-                  w->id, frameIdx, httpCode, elapsed);
-    w->v2_connected = false;
+    Serial.printf("V2 f[%d]: POST err=%d (%lums)\n",
+                  frameIdx, httpCode, elapsed);
     return 0;
   }
-  String body = w->v2_http->getString();
+  String body = g_v2_http->getString();
   if (httpCode != 200) {
-    Serial.printf("V2[w%d] f[%d]: HTTP %d in %lums body=%s\n",
-                  w->id, frameIdx, httpCode, elapsed, body.c_str());
+    Serial.printf("V2 f[%d]: HTTP %d in %lums body=%s\n",
+                  frameIdx, httpCode, elapsed, body.c_str());
     return 0;
   }
 
@@ -1293,8 +1298,8 @@ static int callPreyV2Shadow(ApiWorker *w, BurstArchive *arch, int frameIdx,
   v2_field_str(body, "door_action", arch->v2DoorAction[frameIdx], sizeof(arch->v2DoorAction[0]));
 
   Serial.printf(
-    "V2[w%d] f[%d]: %lums prey=%.3f cat=%s/%.2f sev=%s door=%s detected=%d (server=%ums)\n",
-    w->id, frameIdx, elapsed,
+    "V2 f[%d]: %lums prey=%.3f cat=%s/%.2f sev=%s door=%s detected=%d (server=%ums)\n",
+    frameIdx, elapsed,
     arch->v2PreyScore[frameIdx],
     arch->v2CatId[frameIdx][0] ? arch->v2CatId[frameIdx] : "?",
     arch->v2CatConfidence[frameIdx],
@@ -1305,9 +1310,48 @@ static int callPreyV2Shadow(ApiWorker *w, BurstArchive *arch, int frameIdx,
   return 1;
 }
 
-// Per-burst circuit breaker for v2 shadow calls. Reset when burst gen changes.
-static volatile int v2BreakerArchiveGen = -1;
-static volatile int v2BreakerErrors = 0;
+// ===== Parallel-task v2 dispatch =====
+// One job represents a single frame to shadow-score. jpg is ps_malloc'd by
+// the producer (apiWorkerTask) and owned by the v2 task once enqueued.
+struct V2Job {
+  BurstArchive *arch;
+  int archiveGen;
+  int frameIdx;
+  uint8_t *jpg;
+  size_t jpgLen;
+};
+
+// Single-slot queue with overwrite semantics: when the queue is full,
+// the newest frame replaces whatever was waiting. This keeps the producer
+// non-blocking and means we naturally score the latest-completing frame
+// of each burst (typically the cat is best framed near burst end).
+static QueueHandle_t v2Queue = NULL;
+static TaskHandle_t  v2TaskHandle = NULL;
+
+static void v2Task(void *arg) {
+  Serial.println("V2: task started");
+  // Build the WiFiClient lazily on first job to avoid touching WiFi
+  // before it's up.
+  while (true) {
+    V2Job job;
+    if (xQueueReceive(v2Queue, &job, portMAX_DELAY) != pdPASS) continue;
+    if (!job.jpg) continue;
+    g_v2InFlight = 1;
+    g_v2CallsTotal++;
+    bool ok = false;
+    if (job.arch && job.arch->generation == job.archiveGen) {
+      int rc = callPreyV2Shadow(job.arch, job.frameIdx, job.jpg, job.jpgLen);
+      ok = (rc == 1);
+    } else {
+      Serial.printf("V2: skipping stale job (gen=%d)\n", job.archiveGen);
+    }
+    if (ok) g_v2OkTotal++;
+    else    g_v2ErrTotal++;
+    free(job.jpg);
+    g_v2InFlight = 0;
+  }
+}
+
 #endif  // PREY_V2_URL
 
 // Worker task: drains apiWorkQueue, posts results to apiResultQueue.
@@ -1324,11 +1368,6 @@ static void apiWorkerTask(void *arg) {
       if (w->http) { w->http->end(); delete w->http; w->http = NULL; }
       if (w->tls)  { w->tls->stop(); delete w->tls;  w->tls  = NULL; }
       w->connected = false;
-#ifdef PREY_V2_URL
-      if (w->v2_http) { w->v2_http->end(); delete w->v2_http; w->v2_http = NULL; }
-      if (w->v2_tcp)  { w->v2_tcp->stop(); delete w->v2_tcp;  w->v2_tcp  = NULL; }
-      w->v2_connected = false;
-#endif
       Serial.printf("API[w%d]: TLS torn down on request (heap %u)\n",
                     w->id, (unsigned)ESP.getFreeHeap());
     }
@@ -1353,11 +1392,13 @@ static void apiWorkerTask(void *arg) {
     }
     unsigned long t0 = millis();
 #ifdef PREY_V2_URL
-    // Dup the cropped JPEG so the shadow v2 call can reuse it after the
-    // legacy call frees prepBuf. The dup lives in PSRAM (5-15 KB).
+    // Dup the cropped JPEG so the dedicated v2 task can score it after the
+    // legacy call frees prepBuf. Dup lives in PSRAM (~5-15 KB). The v2
+    // queue uses overwrite semantics: if the task is still processing the
+    // previous job, this one replaces whatever was waiting.
     uint8_t *v2Buf = NULL;
     size_t   v2Len = 0;
-    if (item.archive != NULL) {
+    if (g_v2Enabled && item.archive != NULL && v2Queue != NULL) {
       v2Buf = (uint8_t *)ps_malloc(item.prepLen);
       if (v2Buf) {
         memcpy(v2Buf, item.prepBuf, item.prepLen);
@@ -1370,32 +1411,17 @@ static void apiWorkerTask(void *arg) {
     unsigned long total = millis() - t0;
 #ifdef PREY_V2_URL
     if (v2Buf) {
-      // Fire shadow v2 call BEFORE posting the legacy result so the meta
-      // serializer (which runs after autonomousApiCheck collects results)
-      // sees both values for every frame. Pull-side wait is bounded by
-      // V2_HTTP_TIMEOUT_MS.
-      if (item.archive && item.archive->generation == item.archiveGen) {
-        // Reset circuit breaker on new burst
-        if (v2BreakerArchiveGen != item.archiveGen) {
-          v2BreakerArchiveGen = item.archiveGen;
-          v2BreakerErrors = 0;
-        }
-        if (v2BreakerErrors >= V2_BURST_BREAKER_THRESHOLD) {
-          // Skip — earlier frames in this burst already hit the v2 server
-          // hard enough that we're not going to learn anything new.
-          item.archive->v2Status[item.frameIdx] = 0;
-        } else {
-          int ok = callPreyV2Shadow(w, item.archive, item.frameIdx, v2Buf, v2Len);
-          if (!ok) {
-            v2BreakerErrors++;
-            if (v2BreakerErrors >= V2_BURST_BREAKER_THRESHOLD) {
-              Serial.printf("V2: breaker tripped for gen=%d after %d errors\n",
-                            item.archiveGen, v2BreakerErrors);
-            }
-          }
-        }
+      V2Job job = {item.archive, item.archiveGen, item.frameIdx, v2Buf, v2Len};
+      // xQueueOverwrite always succeeds on a length-1 queue. If a previous
+      // job was still pending, we pull it out and free its jpg so we don't
+      // leak. Then we push ours.
+      V2Job displaced;
+      if (xQueueReceive(v2Queue, &displaced, 0) == pdPASS) {
+        if (displaced.jpg) { free(displaced.jpg); }
+        g_v2DropsTotal++;
       }
-      free(v2Buf);
+      xQueueOverwrite(v2Queue, &job);
+      // ownership of v2Buf transferred to the v2 task
     }
 #endif
     ApiResultItem r = {item.frameIdx, res, timing.b64Ms, timing.tlsMs,
@@ -1411,6 +1437,17 @@ static void startApiWorkers() {
     apiWorkQueue   = xQueueCreate(16, sizeof(ApiWorkItem));
     apiResultQueue = xQueueCreate(16, sizeof(ApiResultItem));
   }
+#ifdef PREY_V2_URL
+  if (!v2Queue) {
+    v2Queue = xQueueCreate(1, sizeof(V2Job));  // single-slot, used with xQueueOverwrite
+  }
+  if (!v2TaskHandle) {
+    // Lower priority than apiw workers, same core (0) where WiFi/lwIP live.
+    xTaskCreatePinnedToCore(v2Task, "v2task", 8192, NULL,
+                             tskIDLE_PRIORITY + 1, &v2TaskHandle,
+                             /*core*/ 0);
+  }
+#endif
   if (apiWorkersRunning) return;
   apiWorkersRunning = true;
   for (int i = 0; i < N_API_WORKERS; i++) {
@@ -1786,6 +1823,17 @@ api_done:
   if (latMs > 65535) latMs = 65535;
 
 #ifdef PREY_V2_URL
+  // Brief bounded wait for the v2 task to finish the last queued job, so
+  // the event entry below carries a v2 result whenever the server kept up.
+  // Worst case: v2 server is slow → addEvent records v2Ok=0 (no harm to
+  // door logic, which already executed above).
+  {
+    unsigned long v2WaitStart = millis();
+    while ((millis() - v2WaitStart) < 600UL) {
+      if (g_v2InFlight == 0 && uxQueueMessagesWaiting(v2Queue) == 0) break;
+      vTaskDelay(pdMS_TO_TICKS(20));
+    }
+  }
   // Shadow v2 burst summary: max prey_score across frames, modal cat_id,
   // number of frames where v2 "detected" matched legacy. Logged AND packed
   // into the event log so the events UI surfaces it without touching SD.
@@ -2654,13 +2702,23 @@ static esp_err_t diag_handler(httpd_req_t *req) {
     "\"persistedRR\":%u,\"uptimeMs\":%lu,"
     "\"freeHeap\":%u,\"minFreeHeap\":%u,\"freePsram\":%u,\"minFreePsram\":%u,"
     "\"workerStackHW0\":%u,\"workerStackHW1\":%u,"
-    "\"apiAbandons\":%u,\"rssi\":%d}",
+    "\"apiAbandons\":%u,\"rssi\":%d"
+#ifdef PREY_V2_URL
+    ",\"v2Enabled\":%s,\"v2Calls\":%u,\"v2Ok\":%u,\"v2Err\":%u,\"v2Drops\":%u"
+#endif
+    "}",
     (unsigned)bootCounter, (unsigned)bootResetReason, rrName,
     (unsigned)lastRR, millis(),
     (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap(),
     (unsigned)ESP.getFreePsram(), (unsigned)ESP.getMinFreePsram(),
     (unsigned)w0, (unsigned)w1,
-    (unsigned)apiAbandonCount, (int)WiFi.RSSI());
+    (unsigned)apiAbandonCount, (int)WiFi.RSSI()
+#ifdef PREY_V2_URL
+    , g_v2Enabled ? "true" : "false",
+    (unsigned)g_v2CallsTotal, (unsigned)g_v2OkTotal,
+    (unsigned)g_v2ErrTotal,   (unsigned)g_v2DropsTotal
+#endif
+    );
   httpd_resp_set_type(req, "application/json");
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
   return httpd_resp_send(req, json, strlen(json));
@@ -3015,6 +3073,24 @@ static esp_err_t cmd_handler(httpd_req_t *req) {
     httpd_resp_send(req, "Rebooting...", 12);
     delay(500);
     ESP.restart();
+#ifdef PREY_V2_URL
+  } else if (httpd_query_key_value(buf, "v2", val, sizeof(val)) == ESP_OK) {
+    int v = atoi(val);
+    g_v2Enabled = (v != 0);
+    nvsPrefs.begin("state", false);
+    nvsPrefs.putBool("v2en", g_v2Enabled);
+    nvsPrefs.end();
+    Serial.printf("V2: runtime toggle -> %s\n", g_v2Enabled ? "enabled" : "disabled");
+    char body[40];
+    int n = snprintf(body, sizeof(body), "v2=%d ok=%lu err=%lu drops=%lu",
+                     g_v2Enabled ? 1 : 0,
+                     (unsigned long)g_v2OkTotal,
+                     (unsigned long)g_v2ErrTotal,
+                     (unsigned long)g_v2DropsTotal);
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    return httpd_resp_send(req, body, n);
+#endif
   } else if (httpd_query_key_value(buf, "formatsd", val, sizeof(val)) == ESP_OK) {
     httpd_resp_set_type(req, "text/plain");
     httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
@@ -4191,6 +4267,12 @@ void setup() {
     uint32_t bootCount = nvsPrefs.getUInt("bootCount", 0) + 1;
     nvsPrefs.putUInt("bootCount", bootCount);
     nvsPrefs.putUInt("lastRR", (uint32_t)rr);
+#ifdef PREY_V2_URL
+    // Load the persisted v2 shadow toggle (default: enabled). Set BEFORE
+    // workers start so the first burst already honors the saved choice.
+    g_v2Enabled = nvsPrefs.getBool("v2en", true);
+    Serial.printf("V2: loaded enable=%d from NVS\n", (int)g_v2Enabled);
+#endif
     nvsPrefs.end();
     bootResetReason = (uint32_t)rr;
     bootCounter = bootCount;
