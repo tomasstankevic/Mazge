@@ -1132,7 +1132,7 @@ static int callPreyApiWithWorker(ApiWorker *w,
 // Endpoint expects raw image/jpeg body + X-* headers. Plain HTTP only —
 // the server runs on the same LAN and TLS would just burn CPU.
 
-#define V2_HTTP_TIMEOUT_MS 400    // v2 server p95 ~320ms on the i5; tight bound
+#define V2_HTTP_TIMEOUT_MS 1500   // server p50 ~430ms full pipeline + raw frame upload
 #define V2_TLS_MAX_AGE_MS  (10UL * 60UL * 1000UL)
 
 // Dedicated v2 transport state. Owned solely by v2Task — never touched from
@@ -1151,6 +1151,34 @@ static volatile uint32_t g_v2OkTotal    = 0;   // 200 OK responses
 static volatile uint32_t g_v2ErrTotal   = 0;   // transport / non-200
 static volatile uint32_t g_v2DropsTotal = 0;   // queue overwrites + disabled-skips
 static volatile uint32_t g_v2InFlight   = 0;   // 0/1, used by addEvent wait
+
+// Rolling stats for the last V2_STATS_RING successful v2 calls. Append-only
+// from v2Task; readers (serial 'p' / /v2stats) copy then sort.
+#define V2_STATS_RING 32
+struct V2Stat {
+  uint16_t httpMs;     // wall-clock incl. socket open + request + response
+  uint16_t serverMs;   // decision_ms reported by server
+  uint16_t preyX1000;  // prey_score * 1000
+  uint8_t  catBits;    // 0=unknown, 1=mazge, 2=benis, 3=other
+  uint8_t  flags;      // bit0=detected, bit1=cat_recognized
+};
+static V2Stat   g_v2Ring[V2_STATS_RING];
+static volatile uint32_t g_v2RingCount = 0;   // total successful pushes (monotonic)
+
+// Per-burst rolling stats. One entry per burst that had >=1 v2 call.
+// Captured at the end of autonomousApiCheck after the bounded v2 wait.
+#define V2_BURST_RING 16
+struct V2BurstStat {
+  uint16_t totalMs;        // wall-clock from burst kickoff to v2-wait-end
+  uint8_t  framesSent;     // archive.apiFramesSent
+  uint8_t  v2Ok;           // # v2 frames with 200 OK
+  uint16_t maxPreyX1000;   // max prey_score across burst
+  uint16_t srvAvgMs;       // mean server decision_ms across ok frames
+  uint8_t  modalCatBits;   // 0=unknown 1=mazge 2=benis 3=other
+  uint8_t  flags;          // bit0=anyDetected bit1=anyCatRecognized
+};
+static V2BurstStat g_v2BurstRing[V2_BURST_RING];
+static volatile uint32_t g_v2BurstRingCount = 0;
 
 // Build a fresh HTTPClient + WiFiClient for a single v2 POST.
 // Rationale: Arduino HTTPClient::addHeader() APPENDS to an internal header
@@ -1276,8 +1304,8 @@ static int callPreyV2Shadow(BurstArchive *arch, int frameIdx,
   arch->v2HttpMs[frameIdx]   = (uint16_t)(elapsed > 65535 ? 65535 : elapsed);
 
   if (httpCode <= 0) {
-    Serial.printf("V2 f[%d]: POST err=%d (%lums)\n",
-                  frameIdx, httpCode, elapsed);
+    Serial.printf("V2 f[%d]: POST err=%d (%lums, body=%uB)\n",
+                  frameIdx, httpCode, elapsed, (unsigned)jpgLen);
     return 0;
   }
   String body = g_v2_http->getString();
@@ -1298,8 +1326,8 @@ static int callPreyV2Shadow(BurstArchive *arch, int frameIdx,
   v2_field_str(body, "door_action", arch->v2DoorAction[frameIdx], sizeof(arch->v2DoorAction[0]));
 
   Serial.printf(
-    "V2 f[%d]: %lums prey=%.3f cat=%s/%.2f sev=%s door=%s detected=%d (server=%ums)\n",
-    frameIdx, elapsed,
+    "V2 f[%d]: %lums body=%uB prey=%.3f cat=%s/%.2f sev=%s door=%s detected=%d (server=%ums)\n",
+    frameIdx, elapsed, (unsigned)jpgLen,
     arch->v2PreyScore[frameIdx],
     arch->v2CatId[frameIdx][0] ? arch->v2CatId[frameIdx] : "?",
     arch->v2CatConfidence[frameIdx],
@@ -1342,6 +1370,25 @@ static void v2Task(void *arg) {
     if (job.arch && job.arch->generation == job.archiveGen) {
       int rc = callPreyV2Shadow(job.arch, job.frameIdx, job.jpg, job.jpgLen);
       ok = (rc == 1);
+      if (ok) {
+        V2Stat s;
+        s.httpMs    = job.arch->v2HttpMs[job.frameIdx];
+        s.serverMs  = job.arch->v2DecisionMs[job.frameIdx];
+        float ps = job.arch->v2PreyScore[job.frameIdx];
+        if (ps < 0)      s.preyX1000 = 0;
+        else if (ps > 1) s.preyX1000 = 1000;
+        else             s.preyX1000 = (uint16_t)(ps * 1000.0f + 0.5f);
+        const char *id = job.arch->v2CatId[job.frameIdx];
+        if      (!strcmp(id, "mazge"))   s.catBits = 1;
+        else if (!strcmp(id, "benis"))   s.catBits = 2;
+        else if (!id[0] || !strcmp(id, "unknown")) s.catBits = 0;
+        else                             s.catBits = 3;
+        s.flags = 0;
+        if (job.arch->v2Detected[job.frameIdx] == 1)      s.flags |= 0x01;
+        if (job.arch->v2CatRecognized[job.frameIdx] == 1) s.flags |= 0x02;
+        g_v2Ring[g_v2RingCount % V2_STATS_RING] = s;
+        g_v2RingCount++;
+      }
     } else {
       Serial.printf("V2: skipping stale job (gen=%d)\n", job.archiveGen);
     }
@@ -1352,13 +1399,122 @@ static void v2Task(void *arg) {
   }
 }
 
+// Compute aggregate v2 stats from the ring. Output JSON with percentiles and
+// cat distribution. Used by serial 'p' command and /v2stats HTTP endpoint.
+// out must be at least 512 bytes. Returns written length.
+static size_t v2_render_stats_json(char *out, size_t cap) {
+  // Snapshot ring (lock-free; v2Task only appends so worst case is a torn
+  // entry we'll skip via timing > 0 check). Use the smaller of ring fill
+  // and V2_STATS_RING.
+  uint32_t pushed = g_v2RingCount;
+  uint32_t n = pushed < V2_STATS_RING ? pushed : V2_STATS_RING;
+  V2Stat snap[V2_STATS_RING];
+  for (uint32_t i = 0; i < n; i++) snap[i] = g_v2Ring[i];
+
+  // Sortable arrays for percentiles.
+  uint16_t httpArr[V2_STATS_RING], srvArr[V2_STATS_RING], preyArr[V2_STATS_RING];
+  uint32_t cMazge = 0, cBenis = 0, cOther = 0, cUnk = 0;
+  uint32_t detYes = 0, recYes = 0;
+  for (uint32_t i = 0; i < n; i++) {
+    httpArr[i] = snap[i].httpMs;
+    srvArr[i]  = snap[i].serverMs;
+    preyArr[i] = snap[i].preyX1000;
+    switch (snap[i].catBits) {
+      case 1: cMazge++; break;
+      case 2: cBenis++; break;
+      case 3: cOther++; break;
+      default: cUnk++;  break;
+    }
+    if (snap[i].flags & 0x01) detYes++;
+    if (snap[i].flags & 0x02) recYes++;
+  }
+  // Sort in-place (tiny n, insertion sort).
+  auto sort16 = [](uint16_t *a, uint32_t len) {
+    for (uint32_t i = 1; i < len; i++) {
+      uint16_t v = a[i]; int j = (int)i - 1;
+      while (j >= 0 && a[j] > v) { a[j+1] = a[j]; j--; }
+      a[j+1] = v;
+    }
+  };
+  sort16(httpArr, n);
+  sort16(srvArr,  n);
+  sort16(preyArr, n);
+  auto pct = [&](uint16_t *a, float p) -> uint16_t {
+    if (n == 0) return 0;
+    uint32_t idx = (uint32_t)(p * (n - 1));
+    return a[idx];
+  };
+  uint16_t hP50 = pct(httpArr, 0.50f), hP95 = pct(httpArr, 0.95f);
+  uint16_t sP50 = pct(srvArr,  0.50f), sP95 = pct(srvArr,  0.95f);
+  uint16_t pMax = n ? preyArr[n-1] : 0;
+  uint16_t pP50 = pct(preyArr, 0.50f);
+
+  // Per-burst snapshot
+  uint32_t bPushed = g_v2BurstRingCount;
+  uint32_t bN = bPushed < V2_BURST_RING ? bPushed : V2_BURST_RING;
+  V2BurstStat bSnap[V2_BURST_RING];
+  for (uint32_t i = 0; i < bN; i++) bSnap[i] = g_v2BurstRing[i];
+  uint16_t btTotal[V2_BURST_RING], btSrv[V2_BURST_RING], btPrey[V2_BURST_RING];
+  uint32_t bSentSum = 0, bOkSum = 0;
+  for (uint32_t i = 0; i < bN; i++) {
+    btTotal[i] = bSnap[i].totalMs;
+    btSrv[i]   = bSnap[i].srvAvgMs;
+    btPrey[i]  = bSnap[i].maxPreyX1000;
+    bSentSum  += bSnap[i].framesSent;
+    bOkSum    += bSnap[i].v2Ok;
+  }
+  sort16(btTotal, bN);
+  sort16(btSrv,   bN);
+  sort16(btPrey,  bN);
+  auto bpct = [&](uint16_t *a, float p) -> uint16_t {
+    if (bN == 0) return 0;
+    uint32_t idx = (uint32_t)(p * (bN - 1));
+    return a[idx];
+  };
+  uint16_t btP50 = bpct(btTotal, 0.50f), btP95 = bpct(btTotal, 0.95f);
+  uint16_t bsP50 = bpct(btSrv,   0.50f);
+  uint16_t bpMax = bN ? btPrey[bN - 1] : 0;
+  // Average frames-per-burst stats (×10 so we keep one decimal in int).
+  uint16_t avgSentX10 = (bN > 0) ? (uint16_t)((bSentSum * 10 + bN / 2) / bN) : 0;
+  uint16_t avgOkX10   = (bN > 0) ? (uint16_t)((bOkSum   * 10 + bN / 2) / bN) : 0;
+
+  return (size_t)snprintf(out, cap,
+    "{\"enabled\":%s,\"calls\":%u,\"ok\":%u,\"err\":%u,\"drops\":%u,"
+    "\"inflight\":%u,\"ringN\":%u,"
+    "\"httpMs\":{\"p50\":%u,\"p95\":%u},"
+    "\"serverMs\":{\"p50\":%u,\"p95\":%u},"
+    "\"preyScoreX1000\":{\"p50\":%u,\"max\":%u},"
+    "\"detected\":%u,\"catRecognized\":%u,"
+    "\"cats\":{\"mazge\":%u,\"benis\":%u,\"other\":%u,\"unknown\":%u},"
+    "\"burst\":{\"n\":%u,\"wallMs\":{\"p50\":%u,\"p95\":%u},"
+    "\"srvMeanMs\":%u,\"maxPreyX1000\":%u,"
+    "\"avgFramesSentX10\":%u,\"avgFramesOkX10\":%u}}",
+    g_v2Enabled ? "true" : "false",
+    (unsigned)g_v2CallsTotal, (unsigned)g_v2OkTotal,
+    (unsigned)g_v2ErrTotal,   (unsigned)g_v2DropsTotal,
+    (unsigned)g_v2InFlight,   (unsigned)n,
+    (unsigned)hP50, (unsigned)hP95,
+    (unsigned)sP50, (unsigned)sP95,
+    (unsigned)pP50, (unsigned)pMax,
+    (unsigned)detYes, (unsigned)recYes,
+    (unsigned)cMazge, (unsigned)cBenis, (unsigned)cOther, (unsigned)cUnk,
+    (unsigned)bN, (unsigned)btP50, (unsigned)btP95,
+    (unsigned)bsP50, (unsigned)bpMax,
+    (unsigned)avgSentX10, (unsigned)avgOkX10);
+}
+
 #endif  // PREY_V2_URL
 
 // Worker task: drains apiWorkQueue, posts results to apiResultQueue.
 static void apiWorkerTask(void *arg) {
   ApiWorker *w = (ApiWorker *)arg;
+#ifdef BENCH_BUILD
+  Serial.printf("API worker %d started (BENCH: v1 cloud DISABLED, v2-only)\n", w->id);
+#else
   Serial.printf("API worker %d started\n", w->id);
+#endif
   while (apiWorkersRunning) {
+#ifndef BENCH_BUILD
     // === Race-free self-managed TLS state ===
     // Other tasks (loop watchdog, idle-TLS-free, ToF pre-warm) may set
     // resetTlsRequested or prewarmRequested. We act on them here, with no
@@ -1380,6 +1536,12 @@ static void apiWorkerTask(void *arg) {
                       w->id, ok ? "OK" : "FAILED", millis() - t0);
       }
     }
+#else
+    // BENCH_BUILD: never touch TLS; just clear the request flags so other
+    // tasks setting them don't get stuck thinking a teardown is pending.
+    w->resetTlsRequested = false;
+    w->prewarmRequested  = false;
+#endif
 
     ApiWorkItem item;
     // Wait up to 100ms for work (so we can check apiWorkersRunning + flags)
@@ -1392,35 +1554,54 @@ static void apiWorkerTask(void *arg) {
     }
     unsigned long t0 = millis();
 #ifdef PREY_V2_URL
-    // Dup the cropped JPEG so the dedicated v2 task can score it after the
-    // legacy call frees prepBuf. Dup lives in PSRAM (~5-15 KB). The v2
-    // queue uses overwrite semantics: if the task is still processing the
-    // previous job, this one replaces whatever was waiting.
+    // Dup the RAW camera JPEG (not the cropped+rotated prepBuf) for the v2
+    // task. The v2 server does its own rotate+crop+detect pipeline; sending
+    // a pre-rotated grayscale 384x384 would make its CCW-rotate run twice
+    // and starve YOLO of useful pixels. Raw 640x480 color is ~12-80 KB
+    // which still fits server's 500 KB cap.
     uint8_t *v2Buf = NULL;
     size_t   v2Len = 0;
-    if (g_v2Enabled && item.archive != NULL && v2Queue != NULL) {
-      v2Buf = (uint8_t *)ps_malloc(item.prepLen);
+    if (g_v2Enabled && item.archive != NULL && v2Queue != NULL &&
+        item.frameIdx >= 0 && item.frameIdx < RING_SIZE &&
+        item.archive->images[item.frameIdx].buf != NULL) {
+      size_t rawLen = item.archive->images[item.frameIdx].len;
+      v2Buf = (uint8_t *)ps_malloc(rawLen);
       if (v2Buf) {
-        memcpy(v2Buf, item.prepBuf, item.prepLen);
-        v2Len = item.prepLen;
+        memcpy(v2Buf, item.archive->images[item.frameIdx].buf, rawLen);
+        v2Len = rawLen;
       }
     }
 #endif
     ApiTiming timing = {0, 0, 0};
+#ifdef BENCH_BUILD
+    // v1 cloud disabled: free the prep buffer (caller normally relies on
+    // callPreyApiWithWorker to consume it) and return "no prey".
+    int res = 0;
+    if (item.prepBuf) free(item.prepBuf);
+#else
     int res = callPreyApiWithWorker(w, item.prepBuf, item.prepLen, &timing);
+#endif
     unsigned long total = millis() - t0;
 #ifdef PREY_V2_URL
     if (v2Buf) {
       V2Job job = {item.archive, item.archiveGen, item.frameIdx, v2Buf, v2Len};
-      // xQueueOverwrite always succeeds on a length-1 queue. If a previous
-      // job was still pending, we pull it out and free its jpg so we don't
-      // leak. Then we push ours.
+#ifdef BENCH_BUILD
+      // Bench: score EVERY frame (deep queue, drop-on-full instead of
+      // overwrite). Gives us 5 v2 samples per burst for better percentiles.
+      if (xQueueSend(v2Queue, &job, 0) != pdPASS) {
+        free(v2Buf);
+        g_v2DropsTotal++;
+      }
+#else
+      // Production: single-slot overwrite. Newest frame wins; the v2 task
+      // is guaranteed not to back up.
       V2Job displaced;
       if (xQueueReceive(v2Queue, &displaced, 0) == pdPASS) {
         if (displaced.jpg) { free(displaced.jpg); }
         g_v2DropsTotal++;
       }
       xQueueOverwrite(v2Queue, &job);
+#endif
       // ownership of v2Buf transferred to the v2 task
     }
 #endif
@@ -1439,7 +1620,11 @@ static void startApiWorkers() {
   }
 #ifdef PREY_V2_URL
   if (!v2Queue) {
+#ifdef BENCH_BUILD
+    v2Queue = xQueueCreate(8, sizeof(V2Job));  // bench: deeper queue, score every frame
+#else
     v2Queue = xQueueCreate(1, sizeof(V2Job));  // single-slot, used with xQueueOverwrite
+#endif
   }
   if (!v2TaskHandle) {
     // Lower priority than apiw workers, same core (0) where WiFi/lwIP live.
@@ -1876,13 +2061,28 @@ api_done:
   if (v2CatRec > 0) v2Flags |= 0x02;
   v2Flags |= (modalCatBits & 0x03) << 2;
   uint8_t v2OkFrames = (uint8_t)(v2Ok > 255 ? 255 : v2Ok);
+  unsigned long v2BurstTotalMs = (archive.apiCallMs && millis() > archive.apiCallMs)
+                                   ? (millis() - archive.apiCallMs) : 0;
+  {
+    V2BurstStat bs;
+    bs.totalMs       = (uint16_t)(v2BurstTotalMs > 65535 ? 65535 : v2BurstTotalMs);
+    bs.framesSent    = (uint8_t)(archive.apiFramesSent > 255 ? 255 : archive.apiFramesSent);
+    bs.v2Ok          = v2OkFrames;
+    bs.maxPreyX1000  = v2MaxPreyX1000;
+    bs.srvAvgMs      = (uint16_t)(v2Ok ? v2SrvTot / v2Ok : 0);
+    bs.modalCatBits  = modalCatBits;
+    bs.flags         = (uint8_t)((v2Det > 0 ? 0x01 : 0) | (v2CatRec > 0 ? 0x02 : 0));
+    g_v2BurstRing[g_v2BurstRingCount % V2_BURST_RING] = bs;
+    g_v2BurstRingCount++;
+  }
   Serial.printf(
     "V2-SUMMARY gen=%d frames=%d v2ok=%d v2det=%d v2catRec=%d maxPrey=%.3f@f%d "
-    "cat=%s(m=%d/b=%d/o=%d) httpAvg=%lums srvAvg=%lums | legacyPrey=%d/%d\n",
+    "cat=%s(m=%d/b=%d/o=%d) httpAvg=%lums srvAvg=%lums burstWall=%lums | legacyPrey=%d/%d\n",
     archive.generation, archive.count, v2Ok, v2Det, v2CatRec,
     v2MaxPrey, v2MaxIdx, modalCat, catMazge, catBenis, catOther,
     v2Ok ? v2HttpTot / v2Ok : 0,
     v2Ok ? v2SrvTot / v2Ok  : 0,
+    v2BurstTotalMs,
     preyFrameCount, archive.count);
   addEvent(archive.generation, archive.count, eventResult, dMin, dMax, trend, true,
            dirEpoch, (uint16_t)latMs, v2MaxPreyX1000, v2OkFrames, v2Flags);
@@ -2353,10 +2553,35 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
             '<span style="color:' + trendColors[tl] + '">' + trendLabels[tl] + '</span> ' +
             '<span style="color:' + resColor + '">' + resStr + '</span>' +
             (e.lat > 0 ? ' <span style="color:#607296">' + (e.lat / 1000).toFixed(1) + 's</span>' : '') +
-            (e.v2 && e.v2.okFrames > 0
-              ? ' <span style="color:#9af;font-size:0.85em">[v2 ' +
-                e.v2.maxPrey.toFixed(2) + ' ' + e.v2.catId + (e.v2.det ? ' \u26A0' : '') + ']</span>'
-              : (e.v2 ? ' <span style="color:#666;font-size:0.85em">[v2 \u2205]</span>' : ''));
+            (function() {
+              if (!e.v2) return '';
+              // v2 telemetry chip. Several cases:
+              //   no okFrames     -> server unreachable / timed out
+              //   okFrames > 0    -> show cat status + max prey score
+              const v2 = e.v2;
+              if (v2.okFrames === 0) {
+                return ' <span title="v2 server did not respond" style="color:#888;font-size:0.85em">[v2 \u2205]</span>';
+              }
+              // Cat info
+              const catColors = { mazge: '#7c7', benis: '#6af', other: '#fc4', unknown: '#aaa' };
+              const catIcons  = { mazge: '\uD83D\uDC08', benis: '\uD83D\uDC08', other: '\uD83D\uDC3E', unknown: '\u2754' };
+              const cat = v2.catId || 'unknown';
+              const cc = catColors[cat] || '#aaa';
+              const ci = catIcons[cat] || '\u2754';
+              const prey = v2.maxPrey || 0;
+              // Prey marker: red if max >= 0.5, orange 0.3-0.5, green < 0.3
+              let preyColor = '#4f4';
+              if (prey >= 0.5) preyColor = '#f44';
+              else if (prey >= 0.3) preyColor = '#fa3';
+              const warn = v2.det ? ' \u26A0\uFE0F' : '';
+              const recBadge = v2.catRec ? '' : '<span title="cat not recognized" style="color:#888"> ?</span>';
+              return ' <span title="v2 shadow: ' + v2.okFrames + ' frames scored, max prey=' + prey.toFixed(3) + ', cat=' + cat + (v2.det ? ', PREY DETECTED' : '') + (v2.catRec ? '' : ', cat not recognized') + '" style="font-size:0.85em;background:#1a2030;padding:1px 6px;border-radius:8px;margin-left:4px">' +
+                '<span style="color:' + cc + '">' + ci + ' ' + cat + '</span>' + recBadge +
+                ' <span style="color:' + preyColor + ';font-weight:bold">' + prey.toFixed(2) + '</span>' +
+                warn +
+                ' <span style="color:#667">' + v2.okFrames + 'f</span>' +
+                '</span>';
+            })();
           // Make rows with a real epoch clickable: load the burst on demand
           if (e.epoch && e.epoch > 1700000000) {
             div.style.cursor = 'pointer';
@@ -2723,6 +2948,16 @@ static esp_err_t diag_handler(httpd_req_t *req) {
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
   return httpd_resp_send(req, json, strlen(json));
 }
+
+#ifdef PREY_V2_URL
+static esp_err_t v2stats_handler(httpd_req_t *req) {
+  char buf[1024];
+  size_t n = v2_render_stats_json(buf, sizeof(buf));
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  return httpd_resp_send(req, buf, n);
+}
+#endif
 
 static esp_err_t burstmeta_handler(httpd_req_t *req) {
   char buf[48];
@@ -4187,12 +4422,24 @@ void startUIServer() {
     .user_ctx = NULL
   };
 
+#ifdef PREY_V2_URL
+  httpd_uri_t v2stats_uri = {
+    .uri = "/v2stats",
+    .method = HTTP_GET,
+    .handler = v2stats_handler,
+    .user_ctx = NULL
+  };
+#endif
+
   if (httpd_start(&ui_httpd, &config) == ESP_OK) {
     httpd_register_uri_handler(ui_httpd, &index_uri);
     httpd_register_uri_handler(ui_httpd, &stats_uri);
     httpd_register_uri_handler(ui_httpd, &cmd_uri);
     httpd_register_uri_handler(ui_httpd, &burstmeta_uri);
     httpd_register_uri_handler(ui_httpd, &diag_uri);
+#ifdef PREY_V2_URL
+    httpd_register_uri_handler(ui_httpd, &v2stats_uri);
+#endif
     httpd_uri_t apitest_uri = {
       .uri = "/apitest",
       .method = HTTP_GET,
@@ -4471,6 +4718,112 @@ void loop() {
   // Feed the Task WDT first thing every loop iteration. If we ever fail to
   // reach this point within LOOP_WDT_TIMEOUT_S the chip hard-resets.
   esp_task_wdt_reset();
+
+#ifdef BENCH_BUILD
+  // Bench-only serial console. Type a single letter + Enter (or just letter)
+  // in the serial monitor to drive the device:
+  //   t = fake trigger
+  //   s = print summary
+  //   d = dump FreeRTOS task list
+  //   v = toggle v2
+  //   r = reboot
+  while (Serial.available()) {
+    int c = Serial.read();
+    if (c == '\n' || c == '\r' || c <= 0) continue;
+    if (c == 't') {
+      bool busy = burstCapturing || postTriggerRemaining != 0 || pendingFreezeAtMs != 0;
+      bool greenL = greenLightActive();
+      bool apiBz = apiTaskBusy();
+      if (busy || greenL || apiBz) {
+        Serial.printf("BENCH: trigger REJECTED busy=%d green=%d api=%d\n",
+                      busy, greenL, apiBz);
+      } else {
+        doorCloseNow("trigger (bench)");
+        lastBurstTriggerMs = now;
+        pendingBurstTriggerMs = now;
+        for (int i = 0; i < N_API_WORKERS; i++) {
+          if (!apiWorkers[i].connected) apiWorkers[i].prewarmRequested = true;
+        }
+        sensor_t *ss = esp_camera_sensor_get();
+        if (ss) { frozenAec = ss->status.aec_value; frozenGain = ss->status.agc_gain; }
+        pendingFreezeAtMs = millis() + BURST_SHIFT_MS;
+        Serial.println("BENCH: fake trigger queued");
+      }
+    } else if (c == 'T') {
+      // Forced trigger: bypass green-light and lockout checks. Still respects
+      // the hard "burst capture already in progress" guard since trying to
+      // re-enter that path would corrupt the ring.
+      bool busy = burstCapturing || postTriggerRemaining != 0 || pendingFreezeAtMs != 0;
+      bool apiBz = apiTaskBusy();
+      if (busy || apiBz) {
+        Serial.printf("BENCH: forced trigger DEFERRED busy=%d api=%d\n", busy, apiBz);
+      } else {
+        // Clear any green-light / lockout so the next burst runs cleanly.
+        greenLightUntilMs = 0;
+        preyLockoutUntilMs = 0;
+        doorCloseNow("trigger (bench forced)");
+        lastBurstTriggerMs = now;
+        pendingBurstTriggerMs = now;
+        for (int i = 0; i < N_API_WORKERS; i++) {
+          if (!apiWorkers[i].connected) apiWorkers[i].prewarmRequested = true;
+        }
+        sensor_t *ss = esp_camera_sensor_get();
+        if (ss) { frozenAec = ss->status.aec_value; frozenGain = ss->status.agc_gain; }
+        pendingFreezeAtMs = millis() + BURST_SHIFT_MS;
+        Serial.println("BENCH: forced trigger queued (green-light/lockout cleared)");
+      }
+    } else if (c == 's') {
+      Serial.printf("BENCH: up=%lus heap=%u/min=%u psram=%u rssi=%d wifi=%d "
+                    "apiBusy=%d burst=%d abandons=%u",
+                    now / 1000UL, ESP.getFreeHeap(), ESP.getMinFreeHeap(),
+                    ESP.getFreePsram(), WiFi.RSSI(), (int)WiFi.isConnected(),
+                    (int)apiTaskBusy(), (int)burstCapturing,
+                    (unsigned)apiAbandonCount);
+#ifdef PREY_V2_URL
+      Serial.printf(" v2en=%d calls=%u ok=%u err=%u drops=%u inflight=%u",
+                    (int)g_v2Enabled, (unsigned)g_v2CallsTotal,
+                    (unsigned)g_v2OkTotal, (unsigned)g_v2ErrTotal,
+                    (unsigned)g_v2DropsTotal, (unsigned)g_v2InFlight);
+#endif
+      Serial.printf(" ip=%s\n", WiFi.localIP().toString().c_str());
+    } else if (c == 'd') {
+      // Per-worker stack high-water marks; cheap and always available.
+      Serial.printf("BENCH: tasks (stack high-water free, smaller=closer to overflow)\n");
+      Serial.printf("  loop      = %u\n", (unsigned)uxTaskGetStackHighWaterMark(NULL));
+      for (int i = 0; i < N_API_WORKERS; i++) {
+        if (apiWorkers[i].task)
+          Serial.printf("  apiw%d     = %u\n", i,
+                        (unsigned)uxTaskGetStackHighWaterMark(apiWorkers[i].task));
+      }
+#ifdef PREY_V2_URL
+      if (v2TaskHandle)
+        Serial.printf("  v2task    = %u\n",
+                      (unsigned)uxTaskGetStackHighWaterMark(v2TaskHandle));
+#endif
+    } else if (c == 'v') {
+#ifdef PREY_V2_URL
+      g_v2Enabled = !g_v2Enabled;
+      Serial.printf("BENCH: v2 -> %s\n", g_v2Enabled ? "enabled" : "disabled");
+#else
+      Serial.println("BENCH: v2 not compiled in");
+#endif
+    } else if (c == 'p') {
+#ifdef PREY_V2_URL
+      char jbuf[1024];
+      v2_render_stats_json(jbuf, sizeof(jbuf));
+      Serial.printf("BENCH v2stats: %s\n", jbuf);
+#else
+      Serial.println("BENCH: v2 not compiled in");
+#endif
+    } else if (c == 'r') {
+      Serial.println("BENCH: rebooting");
+      delay(50);
+      ESP.restart();
+    } else {
+      Serial.printf("BENCH: unknown cmd '%c' (use t/T/s/d/v/p/r)\n", (char)c);
+    }
+  }
+#endif
 
   // During OTA: only handle OTA, skip everything else
   if (otaInProgress) {
