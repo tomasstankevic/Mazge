@@ -1139,13 +1139,20 @@ static int callPreyApiWithWorker(ApiWorker *w,
 // Endpoint expects raw image/jpeg body + X-* headers. Plain HTTP only —
 // the server runs on the same LAN and TLS would just burn CPU.
 
-#define V2_HTTP_TIMEOUT_MS 1500   // v2 server p95 ~320ms on the i5 box; 1.5s is generous
+#define V2_HTTP_TIMEOUT_MS 400    // v2 server p95 ~320ms on the i5; tight bound
 #define V2_TLS_MAX_AGE_MS  (10UL * 60UL * 1000UL)
+#define V2_BURST_BREAKER_THRESHOLD 2  // skip v2 after this many consecutive errors per burst
 
-static bool ensureWorkerV2Http(ApiWorker *w) {
-  unsigned long now = millis();
-  bool tooOld = w->v2_connected && (now - w->v2_connectedAtMs > V2_TLS_MAX_AGE_MS);
-  if (w->v2_connected && !tooOld && w->v2_tcp && w->v2_tcp->connected()) return true;
+// Build a fresh HTTPClient + WiFiClient for a single v2 POST.
+// Rationale: Arduino HTTPClient::addHeader() APPENDS to an internal header
+// list. Reusing the same client across calls (as we did initially) makes the
+// per-frame X-Burst-Id / X-Request-Id / X-Frame-Index headers pile up,
+// inflating the request and eventually overflowing buffers. Per-call rebuild
+// also sidesteps any half-closed-socket weirdness on the server side.
+//
+// Cost on LAN: ~5-15ms for socket open. Compared to the prey_v3 inference
+// p95 (~320ms), that's noise.
+static bool v2OpenForCall(ApiWorker *w) {
   if (w->v2_http) { w->v2_http->end(); delete w->v2_http; w->v2_http = NULL; }
   if (w->v2_tcp)  { w->v2_tcp->stop(); delete w->v2_tcp;  w->v2_tcp  = NULL; }
   w->v2_connected = false;
@@ -1154,13 +1161,14 @@ static bool ensureWorkerV2Http(ApiWorker *w) {
   if (!w->v2_tcp) return false;
 
   w->v2_http = new HTTPClient();
-  w->v2_http->setReuse(true);
+  w->v2_http->setReuse(false);
   if (!w->v2_http->begin(*w->v2_tcp, PREY_V2_URL)) {
     delete w->v2_http; w->v2_http = NULL;
     delete w->v2_tcp;  w->v2_tcp  = NULL;
     return false;
   }
   w->v2_http->setTimeout(V2_HTTP_TIMEOUT_MS);
+  w->v2_http->setConnectTimeout(V2_HTTP_TIMEOUT_MS);
   w->v2_connected = true;
   w->v2_connectedAtMs = millis();
   return true;
@@ -1225,17 +1233,19 @@ static void v2_make_request_id(char *out, size_t cap) {
 
 // Posts a single frame to the v2 endpoint and fills the archive slot.
 // jpgBuf is NOT freed by this function (caller still owns it).
-static void callPreyV2Shadow(ApiWorker *w, BurstArchive *arch, int frameIdx,
-                              const uint8_t *jpgBuf, size_t jpgLen) {
-  if (!arch || frameIdx < 0 || frameIdx >= RING_SIZE) return;
+// Returns: 1 on success, 0 on transport/server error (used by caller for
+// per-burst circuit breaker).
+static int callPreyV2Shadow(ApiWorker *w, BurstArchive *arch, int frameIdx,
+                             const uint8_t *jpgBuf, size_t jpgLen) {
+  if (!arch || frameIdx < 0 || frameIdx >= RING_SIZE) return 0;
   arch->v2Status[frameIdx] = 0;  // default to error until success
 
   unsigned long t0 = millis();
-  if (!ensureWorkerV2Http(w)) {
+  if (!v2OpenForCall(w)) {
     arch->v2HttpCode[frameIdx] = 0;
     arch->v2HttpMs[frameIdx]   = (uint16_t)(millis() - t0);
-    Serial.printf("V2[w%d] f[%d]: connect failed\n", w->id, frameIdx);
-    return;
+    Serial.printf("V2[w%d] f[%d]: open failed\n", w->id, frameIdx);
+    return 0;
   }
 
   char reqId[40];     v2_make_request_id(reqId, sizeof(reqId));
@@ -1263,13 +1273,13 @@ static void callPreyV2Shadow(ApiWorker *w, BurstArchive *arch, int frameIdx,
     Serial.printf("V2[w%d] f[%d]: POST err=%d (%lums)\n",
                   w->id, frameIdx, httpCode, elapsed);
     w->v2_connected = false;
-    return;
+    return 0;
   }
   String body = w->v2_http->getString();
   if (httpCode != 200) {
     Serial.printf("V2[w%d] f[%d]: HTTP %d in %lums body=%s\n",
                   w->id, frameIdx, httpCode, elapsed, body.c_str());
-    return;
+    return 0;
   }
 
   arch->v2Status[frameIdx]        = 1;
@@ -1292,7 +1302,12 @@ static void callPreyV2Shadow(ApiWorker *w, BurstArchive *arch, int frameIdx,
     arch->v2DoorAction[frameIdx][0] ? arch->v2DoorAction[frameIdx] : "?",
     (int)arch->v2Detected[frameIdx],
     (unsigned)arch->v2DecisionMs[frameIdx]);
+  return 1;
 }
+
+// Per-burst circuit breaker for v2 shadow calls. Reset when burst gen changes.
+static volatile int v2BreakerArchiveGen = -1;
+static volatile int v2BreakerErrors = 0;
 #endif  // PREY_V2_URL
 
 // Worker task: drains apiWorkQueue, posts results to apiResultQueue.
@@ -1360,7 +1375,25 @@ static void apiWorkerTask(void *arg) {
       // sees both values for every frame. Pull-side wait is bounded by
       // V2_HTTP_TIMEOUT_MS.
       if (item.archive && item.archive->generation == item.archiveGen) {
-        callPreyV2Shadow(w, item.archive, item.frameIdx, v2Buf, v2Len);
+        // Reset circuit breaker on new burst
+        if (v2BreakerArchiveGen != item.archiveGen) {
+          v2BreakerArchiveGen = item.archiveGen;
+          v2BreakerErrors = 0;
+        }
+        if (v2BreakerErrors >= V2_BURST_BREAKER_THRESHOLD) {
+          // Skip — earlier frames in this burst already hit the v2 server
+          // hard enough that we're not going to learn anything new.
+          item.archive->v2Status[item.frameIdx] = 0;
+        } else {
+          int ok = callPreyV2Shadow(w, item.archive, item.frameIdx, v2Buf, v2Len);
+          if (!ok) {
+            v2BreakerErrors++;
+            if (v2BreakerErrors >= V2_BURST_BREAKER_THRESHOLD) {
+              Serial.printf("V2: breaker tripped for gen=%d after %d errors\n",
+                            item.archiveGen, v2BreakerErrors);
+            }
+          }
+        }
       }
       free(v2Buf);
     }
