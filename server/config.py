@@ -38,6 +38,7 @@ class Config:
     mqtt_pass: str
     log_dir: Path
     idempotency_ttl_s: int
+    debug_dump_dir: Path | None
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -58,4 +59,5 @@ class Config:
             mqtt_pass=os.environ.get("MAZGE_MQTT_PASS", ""),
             log_dir=Path(os.environ.get("MAZGE_LOG_DIR", str(ROOT / "logs" / "server"))),
             idempotency_ttl_s=int(os.environ.get("MAZGE_IDEMPOTENCY_TTL_S", "300")),
+            debug_dump_dir=_path("MAZGE_DEBUG_DUMP_DIR"),
         )

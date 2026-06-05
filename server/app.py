@@ -8,8 +8,10 @@ Run:
 from __future__ import annotations
 
 import base64
+import datetime as _dt
 import json
 import logging
+import logging.handlers
 import time
 import uuid
 from pathlib import Path
@@ -34,9 +36,31 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
+def _dump_jpeg(
+    dump_dir: Path, device: str, burst: str, frame_index: int, jpeg: bytes
+) -> str:
+    """Write JPEG into <dump_dir>/YYYY-MM-DD/<basename>.jpg, return absolute path str."""
+    day = _dt.datetime.utcnow().strftime("%Y-%m-%d")
+    day_dir = dump_dir / day
+    day_dir.mkdir(parents=True, exist_ok=True)
+    basename = (
+        f"{device}_{burst}_f{frame_index:02d}_{_now_ms()}.jpg".replace("/", "_")
+    )
+    path = day_dir / basename
+    path.write_bytes(jpeg)
+    return str(path)
+
+
 def _setup_logging(log_dir: Path) -> None:
     log_dir.mkdir(parents=True, exist_ok=True)
-    handler = logging.FileHandler(log_dir / "server.jsonl")
+    handler = logging.handlers.TimedRotatingFileHandler(
+        log_dir / "server.jsonl",
+        when="midnight",
+        utc=True,
+        backupCount=30,
+        encoding="utf-8",
+    )
+    handler.suffix = "%Y-%m-%d"
     handler.setFormatter(logging.Formatter("%(message)s"))
     root = logging.getLogger()
     root.setLevel(logging.INFO)
@@ -67,6 +91,10 @@ def create_app(cfg: Config | None = None) -> FastAPI:
     idem = IdempotencyCache(cfg.idempotency_ttl_s)
     mqtt = MqttPublisher(cfg)
     started_at = time.time()
+    dump_dir: Path | None = cfg.debug_dump_dir
+    if dump_dir is not None:
+        dump_dir.mkdir(parents=True, exist_ok=True)
+        logger.warning("MAZGE_DEBUG_DUMP_DIR=%s — every incoming JPEG will be saved", dump_dir)
 
     app = FastAPI(title="mazge-server", version="0.1.0")
 
@@ -117,6 +145,11 @@ def create_app(cfg: Config | None = None) -> FastAPI:
             return JSONResponse(
                 {"detected": False, "error": "bad_request"}, status_code=400
             )
+        image_path = (
+            _dump_jpeg(dump_dir, "v1", "compat", 0, jpeg)
+            if dump_dir is not None
+            else None
+        )
         t0 = time.perf_counter()
         try:
             result = pipeline.infer(jpeg)
@@ -132,12 +165,19 @@ def create_app(cfg: Config | None = None) -> FastAPI:
                 "ep": "/v1/compat",
                 "ts_ms": _now_ms(),
                 "decision_ms": ms,
-                "prey_score": result.prey_score,
+                "jpeg_bytes": len(jpeg),
+                "prey_score": round(result.prey_score, 4),
                 "cat_id": decision.cat_id,
                 "cat_recognized": decision.cat_recognized,
+                "cat_confidence": round(decision.cat_confidence, 4),
+                "cat_softmax": [round(p, 4) for p in result.cat_logits_softmax],
                 "severity": decision.severity,
+                "lockout_seconds": decision.lockout_seconds,
                 "door_action": decision.door_action,
+                "should_continue_burst": decision.should_continue_burst,
+                "reason": decision.reason,
                 "detected": decision.detected,
+                "image_path": image_path,
                 "status_code": 200,
             }
         )
@@ -178,6 +218,11 @@ def create_app(cfg: Config | None = None) -> FastAPI:
         if not jpeg:
             return _error(request_id, 400, "bad_request", "empty body")
 
+        if dump_dir is not None:
+            image_path = _dump_jpeg(dump_dir, x_device_id, x_burst_id, frame_index, jpeg)
+        else:
+            image_path = None
+
         payload_hash = IdempotencyCache.hash_bytes(jpeg)
         cached = idem.get(request_id, payload_hash)
         if cached and cached[0] == "hit":
@@ -206,14 +251,21 @@ def create_app(cfg: Config | None = None) -> FastAPI:
                 "device_id": x_device_id,
                 "burst_id": x_burst_id,
                 "frame_index": frame_index,
+                "frame_ts_ms": int(x_frame_ts_ms) if x_frame_ts_ms.isdigit() else None,
                 "decision_ms": ms,
-                "prey_score": result.prey_score,
+                "jpeg_bytes": len(jpeg),
+                "prey_score": round(result.prey_score, 4),
                 "cat_id": decision.cat_id,
                 "cat_recognized": decision.cat_recognized,
+                "cat_confidence": round(decision.cat_confidence, 4),
+                "cat_softmax": [round(p, 4) for p in result.cat_logits_softmax],
                 "severity": decision.severity,
                 "lockout_seconds": decision.lockout_seconds,
                 "door_action": decision.door_action,
+                "should_continue_burst": decision.should_continue_burst,
+                "reason": decision.reason,
                 "detected": decision.detected,
+                "image_path": image_path,
                 "status_code": 200,
             }
         )
