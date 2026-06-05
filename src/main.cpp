@@ -2998,17 +2998,21 @@ static esp_err_t sdlist_handler(httpd_req_t *req) {
     httpd_query_key_value(qbuf, "dir", dir_q, sizeof(dir_q));
   }
 
-  // Long sweep: take SD mutex for the whole walk (60s timeout).
-  if (!sdMutex || xSemaphoreTake(sdMutex, pdMS_TO_TICKS(60000)) != pdTRUE) {
-    httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"SD busy\"}");
-    return ESP_OK;
-  }
-  httpd_resp_send_chunk(req, "{\"ok\":true,\"files\":[", -1);
+  // Mutex policy: take + release per top-level directory so a burst write
+  // can grab the SD bus between our directory walks. The full root walk
+  // can take 10+s on a card with hundreds of bursts; holding the mutex for
+  // that long causes saveBurstToSd() to time out and skip writing the
+  // burst directory entirely (event log gets a "dir not found" entry).
   char entry_buf[128];
   bool first = true;
 
   if (dir_q[0]) {
-    // List a single subfolder
+    // List a single subfolder \u2014 one short mutex window
+    if (!sdMutex || xSemaphoreTake(sdMutex, pdMS_TO_TICKS(5000)) != pdTRUE) {
+      httpd_resp_sendstr(req, "{\"ok\":false,\"error\":\"SD busy\"}");
+      return ESP_OK;
+    }
+    httpd_resp_send_chunk(req, "{\"ok\":true,\"files\":[", -1);
     char path[80];
     snprintf(path, sizeof(path), "/%s", dir_q);
     File sub = SD_MMC.open(path);
@@ -3025,48 +3029,78 @@ static esp_err_t sdlist_handler(httpd_req_t *req) {
       }
     }
     if (sub) sub.close();
+    xSemaphoreGive(sdMutex);
   } else {
-    File root = SD_MMC.open("/");
-    int dirCount = 0;
-    while (true) {
-      File entry = root.openNextFile();
-      if (!entry) break;
-      if (entry.isDirectory()) {
-        const char *eName = entry.name();
-        char ePath[64];
-        snprintf(ePath, sizeof(ePath), "/%s", eName);
-        entry.close();
-        File sub = SD_MMC.open(ePath);
-        if (sub) {
-          while (true) {
-            File sf = sub.openNextFile();
-            if (!sf) break;
-            if (!sf.isDirectory()) {
-              int len = snprintf(entry_buf, sizeof(entry_buf), "%s\"%s/%s\"",
-                first ? "" : ",", eName, sf.name());
-              httpd_resp_send_chunk(req, entry_buf, len);
-              first = false;
-            }
-            sf.close();
-          }
-          sub.close();
-        }
-        dirCount++;
-        if (dirCount % 10 == 0) vTaskDelay(1);  // yield to prevent WDT
-      } else {
-        int len = snprintf(entry_buf, sizeof(entry_buf), "%s\"%s\"",
-          first ? "" : ",", entry.name());
-        httpd_resp_send_chunk(req, entry_buf, len);
-        first = false;
-        entry.close();
-      }
+    httpd_resp_send_chunk(req, "{\"ok\":true,\"files\":[", -1);
+    // Phase 1: collect top-level names under a SHORT mutex hold.
+    const int MAX_TOP = 256;
+    char (*dirNames)[64] = (char(*)[64])heap_caps_malloc(MAX_TOP * 64, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    char (*topFiles)[64] = (char(*)[64])heap_caps_malloc(MAX_TOP * 64, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!dirNames || !topFiles) {
+      if (dirNames) free(dirNames);
+      if (topFiles) free(topFiles);
+      httpd_resp_send_chunk(req, "]}", -1);
+      httpd_resp_send_chunk(req, NULL, 0);
+      return ESP_OK;
     }
-    root.close();
+    int nDirs = 0, nTopFiles = 0;
+    if (sdMutex && xSemaphoreTake(sdMutex, pdMS_TO_TICKS(5000)) == pdTRUE) {
+      File root = SD_MMC.open("/");
+      if (root) {
+        File entry;
+        while ((entry = root.openNextFile()) && (nDirs + nTopFiles) < MAX_TOP) {
+          const char *nm = entry.name();
+          if (entry.isDirectory()) {
+            strlcpy(dirNames[nDirs++], nm, sizeof(dirNames[0]));
+          } else {
+            strlcpy(topFiles[nTopFiles++], nm, sizeof(topFiles[0]));
+          }
+          entry.close();
+        }
+        root.close();
+      }
+      xSemaphoreGive(sdMutex);
+    }
+
+    // Emit top-level files (mutex-free; just JSON formatting)
+    for (int i = 0; i < nTopFiles; i++) {
+      int len = snprintf(entry_buf, sizeof(entry_buf), "%s\"%s\"",
+        first ? "" : ",", topFiles[i]);
+      httpd_resp_send_chunk(req, entry_buf, len);
+      first = false;
+    }
+
+    // Phase 2: per-directory mutex grab/release so a concurrent
+    // saveBurstToSd() can interleave between our directory reads.
+    for (int d = 0; d < nDirs; d++) {
+      if (!sdMutex || xSemaphoreTake(sdMutex, pdMS_TO_TICKS(5000)) != pdTRUE) continue;
+      char ePath[80];
+      snprintf(ePath, sizeof(ePath), "/%s", dirNames[d]);
+      File sub = SD_MMC.open(ePath);
+      if (sub) {
+        File sf;
+        while ((sf = sub.openNextFile())) {
+          if (!sf.isDirectory()) {
+            int len = snprintf(entry_buf, sizeof(entry_buf), "%s\"%s/%s\"",
+              first ? "" : ",", dirNames[d], sf.name());
+            httpd_resp_send_chunk(req, entry_buf, len);
+            first = false;
+          }
+          sf.close();
+        }
+        sub.close();
+      }
+      xSemaphoreGive(sdMutex);
+      // Tiny yield so a higher-priority writer task waiting on the mutex
+      // we just released actually gets scheduled before we re-grab it.
+      vTaskDelay(1);
+    }
+    free(dirNames);
+    free(topFiles);
   }
 
   httpd_resp_send_chunk(req, "]}", -1);
   httpd_resp_send_chunk(req, NULL, 0);
-  xSemaphoreGive(sdMutex);
   return ESP_OK;
 }
 
@@ -4050,22 +4084,26 @@ void loop() {
 #define HTTP_LIVENESS_PROBE_MS  60000UL    // probe every 60s
 #define HTTP_LIVENESS_HANG_MS   180000UL   // reboot if no OK for 3min
     static unsigned long lastHttpProbeMs   = 0;
-    static unsigned long lastHttpLiveMs    = 0;  // 0 = never yet, ignore
+    static unsigned long lastHttpLiveMs    = 0;  // seeded by first probe attempt
     if (WiFi.isConnected() && !otaInProgress &&
         now - lastHttpProbeMs >= HTTP_LIVENESS_PROBE_MS) {
       lastHttpProbeMs = now;
+      // Seed lastHttpLiveMs on the FIRST attempt so a cold-boot freeze
+      // (httpd wedges before any successful probe) still trips the reboot
+      // path after HANG_MS. Otherwise lastHttpLiveMs stays 0 forever.
+      if (lastHttpLiveMs == 0) lastHttpLiveMs = now;
       WiFiClient probe;
       probe.setTimeout(2);  // seconds for arduino-esp32 WiFiClient
       IPAddress me = WiFi.localIP();
       bool ok = (me != IPAddress(0,0,0,0)) && probe.connect(me, 80, 1500);
+      probe.stop();  // always close, even on failed connect (avoid socket leak)
       if (ok) {
         lastHttpLiveMs = now;
-        probe.stop();
       } else {
         Serial.printf("HTTP-WDT: self-probe FAILED (lastOk=%lums ago)\n",
-                      lastHttpLiveMs ? (now - lastHttpLiveMs) : 0);
+                      now - lastHttpLiveMs);
       }
-      if (lastHttpLiveMs != 0 && (now - lastHttpLiveMs) > HTTP_LIVENESS_HANG_MS) {
+      if ((now - lastHttpLiveMs) > HTTP_LIVENESS_HANG_MS) {
         Serial.printf("HTTP-WDT: server unresponsive for %lums \u2014 rebooting\n",
                       now - lastHttpLiveMs);
         delay(200);
