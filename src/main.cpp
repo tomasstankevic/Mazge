@@ -7,9 +7,7 @@
 #include "esp_wifi.h"
 #include "img_converters.h"
 #include <lwip/sockets.h>
-#include <WiFiClientSecure.h>
 #include <HTTPClient.h>
-#include "mbedtls/base64.h"
 #include <Preferences.h>
 #include "SD_MMC.h"
 #include "secrets.h"
@@ -297,7 +295,7 @@ struct BurstArchive {
   unsigned long apiDoneMs;        // when autonomousApiCheck finished
   char sdPath[48];                 // SD card directory path for this burst
 #ifdef PREY_V2_URL
-  // Shadow v2 inference (does NOT feed door logic; logged only)
+  // v2 inference (now PRIMARY door decision source, not shadow).
   int8_t   v2Status[RING_SIZE];       // -1=not run, 0=http err, 1=ok
   int8_t   v2Detected[RING_SIZE];     // -1=unknown, 0=false, 1=true
   int8_t   v2CatRecognized[RING_SIZE]; // -1/0/1
@@ -306,9 +304,10 @@ struct BurstArchive {
   uint16_t v2DecisionMs[RING_SIZE];   // server-reported decision time
   uint16_t v2HttpMs[RING_SIZE];       // wall-clock POST + parse
   int16_t  v2HttpCode[RING_SIZE];     // raw HTTP status (0 if no conn)
+  uint16_t v2LockoutSec[RING_SIZE];   // server-prescribed lockout per frame
   char     v2CatId[RING_SIZE][12];    // "mazge"/"benis"/"unknown"
   char     v2Severity[RING_SIZE][12]; // "none"/"low"/"medium"/"high"
-  char     v2DoorAction[RING_SIZE][12]; // "allow"/"block"/...
+  char     v2DoorAction[RING_SIZE][12]; // "allow"/"deny"
 #endif
 };
 BurstArchive burstArchives[BURST_ARCHIVES];
@@ -673,6 +672,7 @@ void freezeRingToArchive() {
     burstArchives[slot].v2DecisionMs[i] = 0;
     burstArchives[slot].v2HttpMs[i] = 0;
     burstArchives[slot].v2HttpCode[i] = 0;
+    burstArchives[slot].v2LockoutSec[i] = 0;
     burstArchives[slot].v2CatId[i][0] = '\0';
     burstArchives[slot].v2Severity[i][0] = '\0';
     burstArchives[slot].v2DoorAction[i][0] = '\0';
@@ -861,265 +861,17 @@ void saveBurstToSd(int archIdx) {
   if (sdMutex) xSemaphoreGive(sdMutex);
 }
 
-// ===== Autonomous prey API call (when laptop absent) =====
-// HTTP event handler for collecting response body
-static char apiResponseBuf[256];
-static int apiResponseLen = 0;
-static int lastApiEspErr = 0;
-static int lastApiHttpStatus = 0;
-
-// ===== Concurrent API infrastructure =====
-// Pool of N persistent TLS clients, each owned by one worker task.
-// Frame work items pushed to a FreeRTOS queue; workers pull and process.
-// N=3 caused crashes (TLS heap pressure). N=2 is stable and gives ~1.75x speedup.
-#define N_API_WORKERS 2
-
-static EventGroupHandle_t apiEventGroup = NULL;
-#define API_PREY_BIT   BIT0
-#define API_DONE_BIT1  BIT1
-#define API_DONE_BIT2  BIT2
-#define API_DONE_BIT3  BIT3
-#define API_ALL_DONE   (API_DONE_BIT1 | API_DONE_BIT2 | API_DONE_BIT3)
-
-struct ApiTaskParam {
-  int frameIdx;
-  int archIdx;
-  uint8_t *prepBuf;
-  size_t prepLen;
-  int result;
-  unsigned long cropMs;
-  unsigned long b64Ms;
-  unsigned long tlsMs;
-  unsigned long postMs;
-  unsigned long totalMs;
-  EventBits_t doneBit;
-};
-
-// Work item for the concurrent worker pool
-struct ApiWorkItem {
-  int frameIdx;          // ring index of source frame
-  uint8_t *prepBuf;      // preprocessed JPEG (worker frees)
-  size_t prepLen;
-  unsigned long enqueueMs;
-#ifdef PREY_V2_URL
-  BurstArchive *archive; // shadow v2 result destination (NULL = skip v2)
-  int archiveGen;        // sanity check (verify archive not recycled)
-#endif
-};
-struct ApiResultItem {
-  int frameIdx;
-  int result;            // -1 err, 0 no prey, 1 prey
-  unsigned long b64Ms;
-  unsigned long tlsMs;
-  unsigned long postMs;
-  unsigned long totalMs;
-};
-
-static QueueHandle_t apiWorkQueue = NULL;     // ApiWorkItem
-static QueueHandle_t apiResultQueue = NULL;   // ApiResultItem
-static volatile bool apiWorkersRunning = false;
-
-// ===== Persistent TLS connection for prey API =====
-static WiFiClientSecure *tlsClient = NULL;
-static HTTPClient *httpApi = NULL;
-static bool tlsConnected = false;
-static unsigned long lastTlsConnectMs = 0;
-
-// Ensure TLS connection is alive, reconnect if needed
-static bool ensureTlsConnection() {
-  if (tlsConnected && tlsClient && tlsClient->connected()) {
-    return true;
-  }
-  Serial.println("TLS: (re)connecting...");
-  unsigned long t0 = millis();
-
-  if (httpApi) { httpApi->end(); delete httpApi; httpApi = NULL; }
-  if (tlsClient) { tlsClient->stop(); delete tlsClient; tlsClient = NULL; }
-  tlsConnected = false;
-
-  tlsClient = new WiFiClientSecure();
-  if (!tlsClient) { Serial.println("TLS: alloc failed"); return false; }
-  tlsClient->setInsecure();
-
-  httpApi = new HTTPClient();
-  httpApi->setReuse(true); // enable HTTP keep-alive
-
-  if (!httpApi->begin(*tlsClient, PREY_API_URL)) {
-    Serial.println("TLS: begin failed");
-    delete httpApi; httpApi = NULL;
-    delete tlsClient; tlsClient = NULL;
-    return false;
-  }
-
-  char authHeader[128];
-  snprintf(authHeader, sizeof(authHeader), "Bearer %s", PREY_API_KEY);
-  httpApi->addHeader("Content-Type", "application/json");
-  httpApi->addHeader("Authorization", authHeader);
-  httpApi->addHeader("Connection", "keep-alive");
-  httpApi->setTimeout(10000);  // 10s — keep total burst latency bounded
-
-  tlsConnected = true;
-  lastTlsConnectMs = millis();
-  Serial.printf("TLS: connected in %lums\n", millis() - t0);
-  return true;
-}
-
-// ===== Crop JPEG for API =====
-// From 640x480: remove right 128px (occluded), then center-crop to 384x384.
-// All offsets MCU-aligned (16x8 for 4:2:2 YCbCr).
-// Crop region in original image: x=64..448, y=48..432.
-// Returns new JPEG in PSRAM (caller must free). Sets outLen. NULL on failure.
-// Output: 384x384 grayscale JPEG, rotated 90 CCW (camera mounted sideways).
-#define CROP_X  64    // left margin (64px, MCU-aligned)
-#define CROP_Y  48    // top margin  (48px, MCU-aligned)
-#define CROP_SZ 384   // output 384x384
-
-#include "jpeg_lossless_crop.h"
-#include "jpeg_lossless_rotate.h"
-#include "pipeline_tests.h"
-
-static uint8_t *cropJpegForApi(const uint8_t *jpgBuf, size_t jpgLen, size_t *outLen) {
-  unsigned long t0 = millis();
-  *outLen = 0;
-
-  // Lossless DCT crop + 90 CCW rotate + drop chroma — single pass, no IDCT/DCT.
-  // Validated to produce 6/10 hits on prey burst vs 1/10 for crop-only baseline.
-  // ~70ms on ESP32-S3 (vs ~324ms for decode-and-re-encode pipeline).
-  uint8_t *result = jpeg_lossless_crop_rotate_gray(jpgBuf, jpgLen,
-    CROP_X, CROP_Y, CROP_SZ, CROP_SZ, outLen);
-
-  unsigned long t1 = millis();
-
-  if (!result) {
-    Serial.println("Crop+Rot: lossless rotate failed");
-    return NULL;
-  }
-
-  Serial.printf("Crop+Rot: 640x480→384x384 grayscale JPEG %uB→%uB (lossless %lums)\n",
-    jpgLen, *outLen, t1 - t0);
-  return result;
-}
-
-// Timing breakdown for a single API call
-struct ApiTiming {
-  unsigned long b64Ms;
-  unsigned long tlsMs;
-  unsigned long postMs;
-};
-
-// ===== Per-worker TLS client (one per concurrent worker) =====
-// Each worker keeps a persistent WiFiClientSecure + HTTPClient pair. Workers
-// use these directly (instead of the shared tlsClient/httpApi).
+// ===== Prey API (v2-only) =====
+// Door decision is driven entirely by the local LAN inference server via the
+// v2 contract (doc/inference_api_v2_contract.md). v1 cloud Cloudflare Worker
+// is fully removed; rollback target tagged as `v1-last-deployed`.
 //
-// IMPORTANT: only the worker task itself ever touches w->tls / w->http
-// (allocates, calls, frees). Other tasks (loop()'s watchdog, idle-TLS-free
-// path, ToF-trigger pre-warm) communicate by setting the volatile request
-// flags below. The worker checks them between queue iterations and acts on
-// them locally. This avoids a use-after-free race that previously caused
-// PANIC crashes when the API watchdog tore down TLS pointers while the
-// worker was mid-POST.
-struct ApiWorker {
-  WiFiClientSecure *tls;
-  HTTPClient *http;
-  bool connected;
-  unsigned long connectedAtMs;     // when this TLS session was opened
-  TaskHandle_t task;
-  int id;
-  volatile bool resetTlsRequested; // set by other tasks; worker tears down on next iteration
-  volatile bool prewarmRequested;  // set by other tasks; worker ensures TLS is connected
-};
-static ApiWorker apiWorkers[N_API_WORKERS];
+// Worker concurrency is gone: v2 has fast (~150ms p50) plain-HTTP responses,
+// so autonomousApiCheck dispatches frames sequentially from its own task.
 
-// Force a fresh TLS connection if the existing one is older than this.
-// Long-idle TLS connections often get silently dropped by the server but
-// the client still thinks they are alive. 5 minutes is a reasonable balance.
-#define WORKER_TLS_MAX_AGE_MS (5UL * 60UL * 1000UL)
+#define API_TASK_DEADLINE_MS 30000
 
-static bool ensureWorkerTls(ApiWorker *w) {
-  unsigned long now = millis();
-  bool tooOld = w->connected && (now - w->connectedAtMs > WORKER_TLS_MAX_AGE_MS);
-  if (w->connected && !tooOld && w->tls && w->tls->connected()) return true;
-  if (tooOld) {
-    Serial.printf("API[w%d]: TLS aged out (%lus), reconnecting\n",
-                  w->id, (now - w->connectedAtMs) / 1000);
-  }
-  if (w->http) { w->http->end(); delete w->http; w->http = NULL; }
-  if (w->tls)  { w->tls->stop(); delete w->tls;  w->tls  = NULL; }
-  w->connected = false;
 
-  w->tls = new WiFiClientSecure();
-  if (!w->tls) return false;
-  w->tls->setInsecure();
-
-  w->http = new HTTPClient();
-  w->http->setReuse(true);
-  if (!w->http->begin(*w->tls, PREY_API_URL)) {
-    delete w->http; w->http = NULL;
-    delete w->tls;  w->tls  = NULL;
-    return false;
-  }
-  char authHeader[128];
-  snprintf(authHeader, sizeof(authHeader), "Bearer %s", PREY_API_KEY);
-  w->http->addHeader("Content-Type", "application/json");
-  w->http->addHeader("Authorization", authHeader);
-  w->http->addHeader("Connection", "keep-alive");
-  w->http->setTimeout(10000);  // 10s per call — bounds worst-case latency
-  w->connected = true;
-  w->connectedAtMs = millis();
-  return true;
-}
-
-// Worker variant: call API using the worker's own TLS client.
-// Returns: -1=error, 0=no prey, 1=prey. Frees prepBuf.
-static int callPreyApiWithWorker(ApiWorker *w,
-                                  uint8_t *prepBuf, size_t prepLen,
-                                  ApiTiming *timing) {
-  // Base64 encode (PSRAM)
-  unsigned long tb0 = millis();
-  size_t b64Len = 0;
-  mbedtls_base64_encode(NULL, 0, &b64Len, prepBuf, prepLen);
-  char *b64Buf = (char *)ps_malloc(b64Len + 1);
-  if (!b64Buf) { free(prepBuf); return -1; }
-  mbedtls_base64_encode((unsigned char *)b64Buf, b64Len + 1, &b64Len, prepBuf, prepLen);
-  b64Buf[b64Len] = 0;
-  free(prepBuf);
-  size_t jsonLen = b64Len + 32;
-  char *jsonBody = (char *)ps_malloc(jsonLen);
-  if (!jsonBody) { free(b64Buf); return -1; }
-  snprintf(jsonBody, jsonLen, "{\"image_base64\":\"%s\"}", b64Buf);
-  free(b64Buf);
-  unsigned long tb1 = millis();
-
-  unsigned long tt0 = millis();
-  if (!ensureWorkerTls(w)) { free(jsonBody); return -1; }
-  unsigned long tt1 = millis();
-
-  unsigned long startMs = millis();
-  int httpCode = w->http->POST((uint8_t *)jsonBody, strlen(jsonBody));
-  free(jsonBody);
-  unsigned long elapsed = millis() - startMs;
-
-  if (timing) {
-    timing->b64Ms = tb1 - tb0;
-    timing->tlsMs = tt1 - tt0;
-    timing->postMs = elapsed;
-  }
-
-  if (httpCode <= 0) {
-    Serial.printf("API[w%d]: POST failed err=%d (%lums)\n", w->id, httpCode, elapsed);
-    w->connected = false;
-    return -1;
-  }
-  String response = w->http->getString();
-  if (httpCode != 200) {
-    Serial.printf("API[w%d]: HTTP %d in %lums\n", w->id, httpCode, elapsed);
-    return -1;
-  }
-  bool prey = response.indexOf("\"detected\":true") >= 0 ||
-              response.indexOf("\"detected\": true") >= 0;
-  Serial.printf("API[w%d]: %lums result=%d\n", w->id, elapsed, prey ? 1 : 0);
-  return prey ? 1 : 0;
-}
 
 #ifdef PREY_V2_URL
 // ===== Shadow v2 inference client =====
@@ -1150,7 +902,6 @@ static volatile uint32_t g_v2CallsTotal = 0;   // jobs picked up by task
 static volatile uint32_t g_v2OkTotal    = 0;   // 200 OK responses
 static volatile uint32_t g_v2ErrTotal   = 0;   // transport / non-200
 static volatile uint32_t g_v2DropsTotal = 0;   // queue overwrites + disabled-skips
-static volatile uint32_t g_v2InFlight   = 0;   // 0/1, used by addEvent wait
 
 // Rolling stats for the last V2_STATS_RING successful v2 calls. Append-only
 // from v2Task; readers (serial 'p' / /v2stats) copy then sort.
@@ -1268,9 +1019,9 @@ static void v2_make_request_id(char *out, size_t cap) {
 // Posts a single frame to the v2 endpoint and fills the archive slot.
 // jpgBuf is NOT freed by this function (caller still owns it).
 // Returns: 1 on success, 0 on transport/server error.
-// Runs from v2Task only — owns g_v2_tcp / g_v2_http exclusively.
-static int callPreyV2Shadow(BurstArchive *arch, int frameIdx,
-                            const uint8_t *jpgBuf, size_t jpgLen) {
+// Runs from the apiCheckTask (autonomousApiCheck) and owns g_v2_tcp / g_v2_http exclusively.
+static int callPreyV2(BurstArchive *arch, int frameIdx,
+                      const uint8_t *jpgBuf, size_t jpgLen) {
   if (!arch || frameIdx < 0 || frameIdx >= RING_SIZE) return 0;
   arch->v2Status[frameIdx] = 0;  // default to error until success
 
@@ -1321,6 +1072,12 @@ static int callPreyV2Shadow(BurstArchive *arch, int frameIdx,
   arch->v2PreyScore[frameIdx]     = v2_field_float(body, "prey_score", -1.0f);
   arch->v2CatConfidence[frameIdx] = v2_field_float(body, "cat_confidence", -1.0f);
   arch->v2DecisionMs[frameIdx]    = (uint16_t)v2_field_int(body, "decision_ms", 0);
+  {
+    int ls = v2_field_int(body, "lockout_seconds", 0);
+    if (ls < 0) ls = 0;
+    if (ls > 65535) ls = 65535;
+    arch->v2LockoutSec[frameIdx] = (uint16_t)ls;
+  }
   v2_field_str(body, "cat_id",      arch->v2CatId[frameIdx],      sizeof(arch->v2CatId[0]));
   v2_field_str(body, "severity",    arch->v2Severity[frameIdx],   sizeof(arch->v2Severity[0]));
   v2_field_str(body, "door_action", arch->v2DoorAction[frameIdx], sizeof(arch->v2DoorAction[0]));
@@ -1336,67 +1093,6 @@ static int callPreyV2Shadow(BurstArchive *arch, int frameIdx,
     (int)arch->v2Detected[frameIdx],
     (unsigned)arch->v2DecisionMs[frameIdx]);
   return 1;
-}
-
-// ===== Parallel-task v2 dispatch =====
-// One job represents a single frame to shadow-score. jpg is ps_malloc'd by
-// the producer (apiWorkerTask) and owned by the v2 task once enqueued.
-struct V2Job {
-  BurstArchive *arch;
-  int archiveGen;
-  int frameIdx;
-  uint8_t *jpg;
-  size_t jpgLen;
-};
-
-// Single-slot queue with overwrite semantics: when the queue is full,
-// the newest frame replaces whatever was waiting. This keeps the producer
-// non-blocking and means we naturally score the latest-completing frame
-// of each burst (typically the cat is best framed near burst end).
-static QueueHandle_t v2Queue = NULL;
-static TaskHandle_t  v2TaskHandle = NULL;
-
-static void v2Task(void *arg) {
-  Serial.println("V2: task started");
-  // Build the WiFiClient lazily on first job to avoid touching WiFi
-  // before it's up.
-  while (true) {
-    V2Job job;
-    if (xQueueReceive(v2Queue, &job, portMAX_DELAY) != pdPASS) continue;
-    if (!job.jpg) continue;
-    g_v2InFlight = 1;
-    g_v2CallsTotal++;
-    bool ok = false;
-    if (job.arch && job.arch->generation == job.archiveGen) {
-      int rc = callPreyV2Shadow(job.arch, job.frameIdx, job.jpg, job.jpgLen);
-      ok = (rc == 1);
-      if (ok) {
-        V2Stat s;
-        s.httpMs    = job.arch->v2HttpMs[job.frameIdx];
-        s.serverMs  = job.arch->v2DecisionMs[job.frameIdx];
-        float ps = job.arch->v2PreyScore[job.frameIdx];
-        if (ps < 0)      s.preyX1000 = 0;
-        else if (ps > 1) s.preyX1000 = 1000;
-        else             s.preyX1000 = (uint16_t)(ps * 1000.0f + 0.5f);
-        const char *id = job.arch->v2CatId[job.frameIdx];
-        if      (!strcmp(id, "mazge"))   s.catBits = 1;
-        else if (!strcmp(id, "benis"))   s.catBits = 2;
-        else if (!id[0] || !strcmp(id, "unknown")) s.catBits = 0;
-        else                             s.catBits = 3;
-        s.flags = 0;
-        if (job.arch->v2Detected[job.frameIdx] == 1)      s.flags |= 0x01;
-        if (job.arch->v2CatRecognized[job.frameIdx] == 1) s.flags |= 0x02;
-        g_v2Ring[g_v2RingCount % V2_STATS_RING] = s;
-        g_v2RingCount++;
-      }
-    } else {
-      Serial.printf("V2: skipping stale job (gen=%d)\n", job.archiveGen);
-    }
-    if (ok) g_v2OkTotal++;
-    else    g_v2ErrTotal++;
-    free(job.jpg);
-    g_v2InFlight = 0;
-  }
 }
 
 // Compute aggregate v2 stats from the ring. Output JSON with percentiles and
@@ -1492,7 +1188,7 @@ static size_t v2_render_stats_json(char *out, size_t cap) {
     g_v2Enabled ? "true" : "false",
     (unsigned)g_v2CallsTotal, (unsigned)g_v2OkTotal,
     (unsigned)g_v2ErrTotal,   (unsigned)g_v2DropsTotal,
-    (unsigned)g_v2InFlight,   (unsigned)n,
+    0u,                       (unsigned)n,
     (unsigned)hP50, (unsigned)hP95,
     (unsigned)sP50, (unsigned)sP95,
     (unsigned)pP50, (unsigned)pMax,
@@ -1505,287 +1201,18 @@ static size_t v2_render_stats_json(char *out, size_t cap) {
 
 #endif  // PREY_V2_URL
 
-// Worker task: drains apiWorkQueue, posts results to apiResultQueue.
-static void apiWorkerTask(void *arg) {
-  ApiWorker *w = (ApiWorker *)arg;
-#ifdef BENCH_BUILD
-  Serial.printf("API worker %d started (BENCH: v1 cloud DISABLED, v2-only)\n", w->id);
-#else
-  Serial.printf("API worker %d started\n", w->id);
-#endif
-  while (apiWorkersRunning) {
-#ifndef BENCH_BUILD
-    // === Race-free self-managed TLS state ===
-    // Other tasks (loop watchdog, idle-TLS-free, ToF pre-warm) may set
-    // resetTlsRequested or prewarmRequested. We act on them here, with no
-    // other task touching w->tls / w->http.
-    if (w->resetTlsRequested) {
-      w->resetTlsRequested = false;
-      if (w->http) { w->http->end(); delete w->http; w->http = NULL; }
-      if (w->tls)  { w->tls->stop(); delete w->tls;  w->tls  = NULL; }
-      w->connected = false;
-      Serial.printf("API[w%d]: TLS torn down on request (heap %u)\n",
-                    w->id, (unsigned)ESP.getFreeHeap());
-    }
-    if (w->prewarmRequested) {
-      w->prewarmRequested = false;
-      if (!w->connected) {
-        unsigned long t0 = millis();
-        bool ok = ensureWorkerTls(w);
-        Serial.printf("API[w%d]: pre-warm TLS %s in %lums\n",
-                      w->id, ok ? "OK" : "FAILED", millis() - t0);
-      }
-    }
-#else
-    // BENCH_BUILD: never touch TLS; just clear the request flags so other
-    // tasks setting them don't get stuck thinking a teardown is pending.
-    w->resetTlsRequested = false;
-    w->prewarmRequested  = false;
-#endif
-
-    ApiWorkItem item;
-    // Wait up to 100ms for work (so we can check apiWorkersRunning + flags)
-    if (xQueueReceive(apiWorkQueue, &item, pdMS_TO_TICKS(100)) != pdPASS) {
-      continue;
-    }
-    if (item.frameIdx < 0) {
-      // Sentinel: stop signal
-      break;
-    }
-    unsigned long t0 = millis();
-#ifdef PREY_V2_URL
-    // Dup the RAW camera JPEG (not the cropped+rotated prepBuf) for the v2
-    // task. The v2 server does its own rotate+crop+detect pipeline; sending
-    // a pre-rotated grayscale 384x384 would make its CCW-rotate run twice
-    // and starve YOLO of useful pixels. Raw 640x480 color is ~12-80 KB
-    // which still fits server's 500 KB cap.
-    uint8_t *v2Buf = NULL;
-    size_t   v2Len = 0;
-    if (g_v2Enabled && item.archive != NULL && v2Queue != NULL &&
-        item.frameIdx >= 0 && item.frameIdx < RING_SIZE &&
-        item.archive->images[item.frameIdx].buf != NULL) {
-      size_t rawLen = item.archive->images[item.frameIdx].len;
-      v2Buf = (uint8_t *)ps_malloc(rawLen);
-      if (v2Buf) {
-        memcpy(v2Buf, item.archive->images[item.frameIdx].buf, rawLen);
-        v2Len = rawLen;
-      }
-    }
-#endif
-    ApiTiming timing = {0, 0, 0};
-#ifdef BENCH_BUILD
-    // v1 cloud disabled: free the prep buffer (caller normally relies on
-    // callPreyApiWithWorker to consume it) and return "no prey".
-    int res = 0;
-    if (item.prepBuf) free(item.prepBuf);
-#else
-    int res = callPreyApiWithWorker(w, item.prepBuf, item.prepLen, &timing);
-#endif
-    unsigned long total = millis() - t0;
-#ifdef PREY_V2_URL
-    if (v2Buf) {
-      V2Job job = {item.archive, item.archiveGen, item.frameIdx, v2Buf, v2Len};
-#ifdef BENCH_BUILD
-      // Bench: score EVERY frame (deep queue, drop-on-full instead of
-      // overwrite). Gives us 5 v2 samples per burst for better percentiles.
-      if (xQueueSend(v2Queue, &job, 0) != pdPASS) {
-        free(v2Buf);
-        g_v2DropsTotal++;
-      }
-#else
-      // Production: single-slot overwrite. Newest frame wins; the v2 task
-      // is guaranteed not to back up.
-      V2Job displaced;
-      if (xQueueReceive(v2Queue, &displaced, 0) == pdPASS) {
-        if (displaced.jpg) { free(displaced.jpg); }
-        g_v2DropsTotal++;
-      }
-      xQueueOverwrite(v2Queue, &job);
-#endif
-      // ownership of v2Buf transferred to the v2 task
-    }
-#endif
-    ApiResultItem r = {item.frameIdx, res, timing.b64Ms, timing.tlsMs,
-                       timing.postMs, total};
-    xQueueSend(apiResultQueue, &r, portMAX_DELAY);
-  }
-  Serial.printf("API worker %d exiting\n", w->id);
-  vTaskDelete(NULL);
-}
-
-static void startApiWorkers() {
-  if (!apiWorkQueue) {
-    apiWorkQueue   = xQueueCreate(16, sizeof(ApiWorkItem));
-    apiResultQueue = xQueueCreate(16, sizeof(ApiResultItem));
-  }
-#ifdef PREY_V2_URL
-  if (!v2Queue) {
-#ifdef BENCH_BUILD
-    v2Queue = xQueueCreate(8, sizeof(V2Job));  // bench: deeper queue, score every frame
-#else
-    v2Queue = xQueueCreate(1, sizeof(V2Job));  // single-slot, used with xQueueOverwrite
-#endif
-  }
-  if (!v2TaskHandle) {
-    // Lower priority than apiw workers, same core (0) where WiFi/lwIP live.
-    xTaskCreatePinnedToCore(v2Task, "v2task", 8192, NULL,
-                             tskIDLE_PRIORITY + 1, &v2TaskHandle,
-                             /*core*/ 0);
-  }
-#endif
-  if (apiWorkersRunning) return;
-  apiWorkersRunning = true;
-  for (int i = 0; i < N_API_WORKERS; i++) {
-    apiWorkers[i].id = i;
-    apiWorkers[i].task = NULL;
-    char name[16];
-    snprintf(name, sizeof(name), "apiw%d", i);
-    xTaskCreatePinnedToCore(apiWorkerTask, name, 16384,
-                             &apiWorkers[i],
-                             tskIDLE_PRIORITY + 2, &apiWorkers[i].task,
-                             /*core*/ 0);
-  }
-}
-
-static void stopApiWorkers() {
-  if (!apiWorkersRunning) return;
-  apiWorkersRunning = false;
-  // Push sentinels so workers wake up and exit
-  ApiWorkItem stop = {-1, NULL, 0, 0
-#ifdef PREY_V2_URL
-    , NULL, 0
-#endif
-  };
-  for (int i = 0; i < N_API_WORKERS; i++) {
-    xQueueSend(apiWorkQueue, &stop, pdMS_TO_TICKS(100));
-  }
-}
-
-// Free per-worker TLS clients while keeping the worker tasks alive.
-// Each WiFiClientSecure + HTTPClient pair holds ~50-60KB of internal heap
-// (mbedTLS context). The first burst of a triggers reinitialises them in
-// ~1s; for back-to-back triggers the per-worker keep-alive avoids redundant
-// reconnects. After GREEN_LIGHT_MS of inactivity (no burst, no cat) we can
-// safely drop these to claw back ~120KB of internal heap.
-//
-// SIGNAL ONLY: we never touch w->tls / w->http from this task. We just set
-// the request flag; the worker tears down its own pointers from its own
-// task. This eliminates the use-after-free race that previously crashed
-// during back-to-back bursts.
-static void freeIdleWorkerTls() {
-  uint32_t signaled = 0;
-  for (int i = 0; i < N_API_WORKERS; i++) {
-    ApiWorker *w = &apiWorkers[i];
-    if (w->connected || w->http || w->tls) {
-      w->resetTlsRequested = true;
-      signaled++;
-    }
-  }
-  if (signaled) {
-    Serial.printf("API: requested %u workers to free TLS (will happen within 100ms)\n",
-                  (unsigned)signaled);
-  }
-}
-
-// Send a JPEG frame to the prey API. If croppedJpg/croppedLen provided, skip cropping.
-// Returns: -1=error, 0=no prey, 1=prey
-static int callPreyApi(const uint8_t *jpgBuf, size_t jpgLen,
-                       const uint8_t *preCropped = NULL, size_t preCroppedLen = 0,
-                       ApiTiming *timing = NULL) {
-  const uint8_t *sendBuf;
-  size_t sendLen;
-  uint8_t *croppedJpg = NULL;
-
-  if (preCropped && preCroppedLen > 0) {
-    sendBuf = preCropped;
-    sendLen = preCroppedLen;
-    Serial.printf("API: sending %uB (pre-cropped)\n", sendLen);
-  } else {
-    size_t cl = 0;
-    croppedJpg = cropJpegForApi(jpgBuf, jpgLen, &cl);
-    sendBuf = croppedJpg ? croppedJpg : jpgBuf;
-    sendLen = croppedJpg ? cl : jpgLen;
-    Serial.printf("API: sending %uB %s\n", sendLen, croppedJpg ? "(cropped)" : "(original)");
-  }
-
-  // Base64 encode
-  unsigned long tb0 = millis();
-  size_t b64Len = 0;
-  mbedtls_base64_encode(NULL, 0, &b64Len, sendBuf, sendLen);
-  char *b64Buf = (char *)ps_malloc(b64Len + 1);
-  if (!b64Buf) { if (croppedJpg) free(croppedJpg); Serial.println("API: base64 malloc failed"); return -1; }
-  mbedtls_base64_encode((unsigned char *)b64Buf, b64Len + 1, &b64Len, sendBuf, sendLen);
-  b64Buf[b64Len] = 0;
-  if (croppedJpg) free(croppedJpg);
-
-  // Build JSON body
-  size_t jsonLen = b64Len + 32;
-  char *jsonBody = (char *)ps_malloc(jsonLen);
-  if (!jsonBody) { free(b64Buf); Serial.println("API: json malloc failed"); return -1; }
-  snprintf(jsonBody, jsonLen, "{\"image_base64\":\"%s\"}", b64Buf);
-  free(b64Buf);
-  unsigned long tb1 = millis();
-
-  // Ensure persistent TLS connection
-  unsigned long tt0 = millis();
-  if (!ensureTlsConnection()) {
-    free(jsonBody);
-    lastApiEspErr = -1;
-    return -1;
-  }
-  unsigned long tt1 = millis();
-
-  apiResponseLen = 0;
-  apiResponseBuf[0] = 0;
-  lastApiEspErr = 0;
-  lastApiHttpStatus = 0;
-
-  unsigned long startMs = millis();
-  int httpCode = httpApi->POST((uint8_t *)jsonBody, strlen(jsonBody));
-  free(jsonBody);
-
-  unsigned long elapsed = millis() - startMs;
-  lastApiHttpStatus = httpCode;
-
-  if (timing) {
-    timing->b64Ms = tb1 - tb0;
-    timing->tlsMs = tt1 - tt0;
-    timing->postMs = elapsed;
-  }
-  Serial.printf("API: timing b64=%lums tls=%lums post=%lums\n", tb1 - tb0, tt1 - tt0, elapsed);
-
-  if (httpCode <= 0) {
-    Serial.printf("API: POST failed, error=%d (%lums): %s\n",
-      httpCode, elapsed, httpApi->errorToString(httpCode).c_str());
-    lastApiEspErr = httpCode;
-    // Connection broken — force reconnect next time
-    tlsConnected = false;
-    return -1;
-  }
-
-  String response = httpApi->getString();
-
-  strncpy(apiResponseBuf, response.c_str(), sizeof(apiResponseBuf) - 1);
-  apiResponseBuf[sizeof(apiResponseBuf) - 1] = 0;
-  apiResponseLen = response.length();
-
-  Serial.printf("API: HTTP %d, %dB in %lums: %s\n",
-    httpCode, apiResponseLen, elapsed, apiResponseBuf);
-
-  if (httpCode != 200) return -1;
-
-  if (strstr(apiResponseBuf, "\"detected\":true") || strstr(apiResponseBuf, "\"detected\": true"))
-    return 1;
-  return 0;
-}
-
 // Forward decls for the API watchdog (full definitions further below).
 extern volatile bool apiAbandonRequested;
 extern volatile uint32_t apiAbandonCount;
-#define API_TASK_DEADLINE_MS 30000
 
-// Send frames in priority order with concurrent first batch.
-// First API_CONCURRENT frames sent in parallel, then sequential if no prey found.
+// v2-only burst check: dispatches up to MAX_API_FRAMES frames to the local
+// inference server SEQUENTIALLY, aggregates per-frame door_action and
+// lockout_seconds from the server response, applies door decision.
+//
+// Fail behaviour: if 0 frames return 200 OK (server unreachable / all errors),
+// fall back to CLOSED door with a default lockout so the cat retries on the
+// next ToF trigger rather than getting in unverified.
+#define V2_FAIL_CLOSED_LOCKOUT_S 120  // matches server "medium" severity
 void autonomousApiCheck(int archIdx) {
   if (archIdx < 0 || archIdx >= burstArchiveCount) return;
   BurstArchive &archive = burstArchives[archIdx];
@@ -1795,183 +1222,147 @@ void autonomousApiCheck(int archIdx) {
   archive.apiPreyDetected = 0;
   apiAbandonRequested = false;  // fresh task, clear any stale abandon flag
 
-  Serial.printf("API: autonomous check, %d frames ready, archive %d (gen %d)\n",
+  Serial.printf("API: v2 check, %d frames ready, archive %d (gen %d)\n",
     archive.count, archIdx, archive.generation);
 
-  // Build frame order: prioritize by EMPIRICAL prey-detection hit rate from
-  // analysis of 11 confirmed-prey bursts on the production pipeline:
-  //   f08=82%  f07=64%  f09=55%  f05=45%  f06=45%  f03=36%  f04=36%
-  //   f02=18%  f01=9%   f00=9%
-  // Trying high-hit frames first reduces average latency to first prey detection.
+  // Empirical hit-rate order from prey-burst analysis.
   static const int order[RING_SIZE] = {8, 7, 9, 5, 6, 3, 4, 2, 1, 0};
-  int orderCount = RING_SIZE;
-  int orderIdx = 0;
 
-  // === Phase 2: Concurrent worker pool ===
-  // N_API_WORKERS persistent TLS clients run in parallel. We push up to
-  // MAX_API_FRAMES preprocessed frames to a queue and collect results.
-  // Early-exit when PREY_FRAMES_THRESHOLD prey-flagged frames received.
-  startApiWorkers();
-  // Drain any stale items from previous runs
-  ApiWorkItem dummy;
-  while (xQueueReceive(apiResultQueue, &dummy, 0) == pdPASS) {}
-  while (xQueueReceive(apiWorkQueue,   &dummy, 0) == pdPASS) {}
-
-  {
-  int preySoFar = 0;
-  int sentSoFar = 0;
-  int receivedSoFar = 0;
-  int inFlight = 0;
-
-  // Keep pushing frames as long as we have capacity, frames left, and no
-  // threshold met. Receive results between pushes.
   unsigned long apiTaskBeganMs = millis();
-  while (true) {
-    bool haveCapacity = (inFlight < N_API_WORKERS);
-    bool moreToSend  = (sentSoFar < MAX_API_FRAMES) && (orderIdx < orderCount);
-    bool thresholdHit = (preySoFar >= PREY_FRAMES_THRESHOLD);
-    bool deadlineHit = (millis() - apiTaskBeganMs) > API_TASK_DEADLINE_MS;
+  int sentSoFar = 0;
+  int okSoFar = 0;
+  int anyDeny = 0;
+  int anyAllow = 0;
+  int catRecognizedCount = 0;
+  int preyDetectedCount = 0;
+  uint16_t maxLockoutS = 0;
+  float maxPreyScore = 0.0f;
 
-    if (thresholdHit) {
-      Serial.println("API: threshold reached \u2014 stopping early");
+  for (int o = 0; o < RING_SIZE && sentSoFar < MAX_API_FRAMES; o++) {
+    if (apiAbandonRequested) {
+      Serial.printf("API: ABANDON (watchdog) after %lums (sent=%d ok=%d)\n",
+                    millis() - apiTaskBeganMs, sentSoFar, okSoFar);
+      apiAbandonCount++;
       break;
     }
-    if (apiAbandonRequested || deadlineHit) {
-      Serial.printf("API: ABANDON (%s) after %lums (sent=%d, recv=%d, prey=%d)\n",
-                    apiAbandonRequested ? "watchdog" : "deadline",
-                    millis() - apiTaskBeganMs,
-                    sentSoFar, receivedSoFar, preySoFar);
+    if ((millis() - apiTaskBeganMs) > API_TASK_DEADLINE_MS) {
+      Serial.printf("API: deadline hit after %lums (sent=%d ok=%d)\n",
+                    millis() - apiTaskBeganMs, sentSoFar, okSoFar);
       apiAbandonCount++;
       break;
     }
 
-    // Push a new frame if we have capacity and frames to send
-    if (haveCapacity && moreToSend) {
-      int i = order[orderIdx++];
-      if (i >= archive.count || !archive.images[i].buf) continue;
+    int i = order[o];
+    if (i >= archive.count || !archive.images[i].buf) continue;
 
-      unsigned long ct0 = millis();
-      size_t croppedLen = 0;
-      uint8_t *cropped = cropJpegForApi(archive.images[i].buf,
-                                         archive.images[i].len, &croppedLen);
-      unsigned long cropDt = millis() - ct0;
-      if (!cropped) continue;
-      archive.cropMs[i] = cropDt;
+    sentSoFar++;
+    archive.apiFramesSent++;
+    g_v2CallsTotal++;
 
-      ApiWorkItem w = {i, cropped, croppedLen, millis()
-#ifdef PREY_V2_URL
-        , &archive, archive.generation
-#endif
-      };
-      if (xQueueSend(apiWorkQueue, &w, pdMS_TO_TICKS(100)) == pdPASS) {
-        inFlight++;
-        sentSoFar++;
-        archive.apiFramesSent++;
-        Serial.printf("API: queued frame[%d] (inFlight=%d, sent=%d/%d)\n",
-                      i, inFlight, sentSoFar, MAX_API_FRAMES);
-      } else {
-        free(cropped);
-        Serial.println("API: queue full, dropping frame");
-      }
-      continue;  // try to push more before blocking on receive
-    }
-
-    // Nothing more to push. If nothing in flight, we're done.
-    if (inFlight == 0) break;
-
-    // Block waiting for a result
-    ApiResultItem r;
-    if (xQueueReceive(apiResultQueue, &r, pdMS_TO_TICKS(2000)) != pdPASS) {
-      // Don't error — just loop back so the deadline/abandon check fires.
-      // Workers may take up to setTimeout() (10s) per call.
-      if ((millis() - apiTaskBeganMs) > API_TASK_DEADLINE_MS) continue;
-      Serial.println("API: still waiting for worker result...");
+    int rc = callPreyV2(&archive, i, archive.images[i].buf, archive.images[i].len);
+    if (rc != 1) {
+      g_v2ErrTotal++;
+      // legacy apiResults stays at -1 (not checked); v2Status[i]=0 marks error
       continue;
     }
-    inFlight--;
-    receivedSoFar++;
-    if (r.frameIdx >= 0 && r.frameIdx < RING_SIZE) {
-      archive.apiResults[r.frameIdx] = r.result;
-      archive.b64Ms[r.frameIdx]    = r.b64Ms;
-      archive.tlsMs[r.frameIdx]    = r.tlsMs;
-      archive.postMs[r.frameIdx]   = r.postMs;
-      archive.totalMs[r.frameIdx]  = r.totalMs;
-    }
-    if (r.result == 1) preySoFar++;
-    Serial.printf("API: got frame[%d] result=%d (preySoFar=%d/%d, recv=%d, inFlight=%d)\n",
-      r.frameIdx, r.result, preySoFar, PREY_FRAMES_THRESHOLD,
-      receivedSoFar, inFlight);
-  }
+    okSoFar++;
+    g_v2OkTotal++;
 
-  // Clean up any results still in flight (don't leak buffers)
-  // The workers themselves free prepBuf inside callPreyApiWithWorker, so we
-  // just drain remaining results without acting on them. Bounded wait so a
-  // hung worker can't pin this task forever.
-  unsigned long drainStart = millis();
-  while (inFlight > 0 && (millis() - drainStart) < 5000) {
-    ApiResultItem r;
-    if (xQueueReceive(apiResultQueue, &r, pdMS_TO_TICKS(1000)) == pdPASS) {
-      inFlight--;
-      // Optionally record late results (cheap to do)
-      if (r.frameIdx >= 0 && r.frameIdx < RING_SIZE && archive.apiResults[r.frameIdx] == -1) {
-        archive.apiResults[r.frameIdx] = r.result;
-      }
-    }
-  }
-  if (inFlight > 0) {
-    Serial.printf("API: %d worker(s) still in flight after drain \u2014 leaving for next loop\n", inFlight);
-  }
-  }  // end Phase 2 scope
-
-api_done:
-  // Count frames flagged as prey (threshold-based decision)
-  int preyFrameCount = 0;
-  for (int i = 0; i < archive.count; i++) {
-    if (archive.apiResults[i] == 1) preyFrameCount++;
-  }
-  Serial.printf("API: done. %d frames sent, %d flagged prey (threshold=%d)\n",
-    archive.apiFramesSent, preyFrameCount, PREY_FRAMES_THRESHOLD);
-  archive.apiDoneMs = millis();
-
-  // Door logic: tiered confidence lockout.
-  //   - 0 prey frames: open (normal behavior)
-  //   - 1 prey frame : short lockout (3 min)
-  //   - >=2 frames   : long lockout (15 min)
-  bool preyAny = (preyFrameCount >= 1);
-  bool preyHighConfidence = (preyFrameCount >= PREY_FRAMES_THRESHOLD);
-  // Keep apiPreyDetected as "any prey evidence" for event logs.
-  archive.apiPreyDetected = preyAny ? 1 : 0;
-  if (preyAny) {
-    unsigned long lockoutMs = preyHighConfidence ? PREY_LONG_LOCKOUT_MS : PREY_SHORT_LOCKOUT_MS;
-    preyLockoutUntilMs = millis() + lockoutMs;
-    if (preyLockoutUntilMs == 0) preyLockoutUntilMs = 1;  // avoid sentinel
-    // Persist absolute end-time as epoch so the lockout survives a reboot.
+    // Push to per-frame stats ring.
     {
+      V2Stat s;
+      s.httpMs    = archive.v2HttpMs[i];
+      s.serverMs  = archive.v2DecisionMs[i];
+      float ps = archive.v2PreyScore[i];
+      if (ps < 0)      s.preyX1000 = 0;
+      else if (ps > 1) s.preyX1000 = 1000;
+      else             s.preyX1000 = (uint16_t)(ps * 1000.0f + 0.5f);
+      const char *id = archive.v2CatId[i];
+      if      (!strcmp(id, "mazge"))                       s.catBits = 1;
+      else if (!strcmp(id, "benis"))                       s.catBits = 2;
+      else if (!id[0] || !strcmp(id, "unknown"))           s.catBits = 0;
+      else                                                  s.catBits = 3;
+      s.flags = 0;
+      if (archive.v2Detected[i] == 1)      s.flags |= 0x01;
+      if (archive.v2CatRecognized[i] == 1) s.flags |= 0x02;
+      g_v2Ring[g_v2RingCount % V2_STATS_RING] = s;
+      g_v2RingCount++;
+    }
+
+    // Aggregate server-side decision.
+    const char *action = archive.v2DoorAction[i];
+    if      (!strcmp(action, "deny"))  anyDeny  = 1;
+    else if (!strcmp(action, "allow")) anyAllow = 1;
+    if (archive.v2LockoutSec[i] > maxLockoutS) maxLockoutS = archive.v2LockoutSec[i];
+    if (archive.v2CatRecognized[i] == 1) catRecognizedCount++;
+    if (archive.v2Detected[i] == 1)      preyDetectedCount++;
+    if (archive.v2PreyScore[i] > maxPreyScore) maxPreyScore = archive.v2PreyScore[i];
+
+    // Legacy apiResults compat for SD meta / event log: 1 = prey detected.
+    archive.apiResults[i] = (archive.v2Detected[i] == 1) ? 1 : 0;
+
+    // Early-exit when server is confident (high or critical severity).
+    if (!strcmp(archive.v2Severity[i], "high") || !strcmp(archive.v2Severity[i], "critical")) {
+      Serial.printf("API: server signaled %s severity \u2014 stopping early\n",
+                    archive.v2Severity[i]);
+      break;
+    }
+  }
+
+  archive.apiDoneMs = millis();
+  Serial.printf("API: done. %d frames sent, %d ok (denies=%d allows=%d catRec=%d preyDet=%d maxLock=%us)\n",
+    archive.apiFramesSent, okSoFar, anyDeny, anyAllow,
+    catRecognizedCount, preyDetectedCount, (unsigned)maxLockoutS);
+
+  // Door decision (contract-driven):
+  //   - any frame said "deny": deny + apply max lockout_seconds
+  //   - all responding frames said "allow": open
+  //   - 0 frames responded (server unreachable / errors): FAIL-CLOSED
+  bool open = false;
+  uint16_t lockoutS = 0;
+  const char *reason;
+  if (okSoFar == 0) {
+    open = false;
+    lockoutS = V2_FAIL_CLOSED_LOCKOUT_S;
+    reason = "v2 server unreachable (fail-closed)";
+  } else if (anyDeny) {
+    open = false;
+    lockoutS = maxLockoutS > 0 ? maxLockoutS : V2_FAIL_CLOSED_LOCKOUT_S;
+    reason = "v2 deny";
+  } else if (anyAllow) {
+    open = true;
+    lockoutS = 0;
+    reason = "v2 allow";
+  } else {
+    // Responses came back but none said allow OR deny (shouldn't happen per
+    // contract, but be safe).
+    open = false;
+    lockoutS = V2_FAIL_CLOSED_LOCKOUT_S;
+    reason = "v2 ambiguous response (fail-closed)";
+  }
+
+  archive.apiPreyDetected = (preyDetectedCount > 0) ? 1 : 0;
+
+  if (!open) {
+    if (lockoutS > 0) {
+      preyLockoutUntilMs = millis() + (unsigned long)lockoutS * 1000UL;
+      if (preyLockoutUntilMs == 0) preyLockoutUntilMs = 1;
       time_t nowEpoch;
       time(&nowEpoch);
-      persistLockoutEpoch((int32_t)nowEpoch + (int32_t)(lockoutMs / 1000UL));
+      persistLockoutEpoch((int32_t)nowEpoch + (int32_t)lockoutS);
     }
-    greenLightUntilMs = 0;  // clear any pending green light
-    char reason[80];
-    snprintf(
-      reason,
-      sizeof(reason),
-      "prey on %d frame(s): %s lockout",
-      preyFrameCount,
-      preyHighConfidence ? "15 min" : "3 min"
-    );
-    doorCloseNow(reason);
+    greenLightUntilMs = 0;
+    char reasonBuf[96];
+    snprintf(reasonBuf, sizeof(reasonBuf), "%s (%us lockout)", reason, (unsigned)lockoutS);
+    doorCloseNow(reasonBuf);
   } else {
     if (doorLockoutActive()) {
-      Serial.println("Door: stay closed (lockout still active)");
+      Serial.println("Door: stay closed (existing lockout still active)");
     } else {
-      doorOpenNow("no prey detected");
+      doorOpenNow(reason);
     }
-    // Start green-light window: cat may retry within GREEN_LIGHT_MS without
-    // any door close on trigger. Lets the cat back off + retry without the
-    // 7s analysis delay each time.
     greenLightUntilMs = millis() + GREEN_LIGHT_MS;
-    if (greenLightUntilMs == 0) greenLightUntilMs = 1;  // avoid sentinel
+    if (greenLightUntilMs == 0) greenLightUntilMs = 1;
     Serial.printf("Green light: door stays open on next %lus of triggers\n",
                   GREEN_LIGHT_MS / 1000);
   }
@@ -1988,7 +1379,12 @@ api_done:
   if (dMin > dMax) { dMin = -1; dMax = -1; }
   int trend = classifyDistTrend(archive);
   // result encodes prey-frame count: -1=pending, 0=clear, N=N prey frames
-  int eventResult = (archive.apiPreyDetected < 0) ? -1 : preyFrameCount;
+  // Count v2-detected frames for the legacy event encoding.
+  int v2DetCount = 0;
+  for (int i = 0; i < archive.count; i++) {
+    if (archive.v2Detected[i] == 1) v2DetCount++;
+  }
+  int eventResult = (archive.apiPreyDetected < 0) ? -1 : v2DetCount;
   // Parse dir epoch from sdPath ("/YYYYMMDD_HHMMSS_genN") so the UI can
   // reconstruct the SD dir name exactly without searching.
   time_t dirEpoch = 0;
@@ -2008,20 +1404,8 @@ api_done:
   if (latMs > 65535) latMs = 65535;
 
 #ifdef PREY_V2_URL
-  // Brief bounded wait for the v2 task to finish the last queued job, so
-  // the event entry below carries a v2 result whenever the server kept up.
-  // Worst case: v2 server is slow → addEvent records v2Ok=0 (no harm to
-  // door logic, which already executed above).
-  {
-    unsigned long v2WaitStart = millis();
-    while ((millis() - v2WaitStart) < 600UL) {
-      if (g_v2InFlight == 0 && uxQueueMessagesWaiting(v2Queue) == 0) break;
-      vTaskDelay(pdMS_TO_TICKS(20));
-    }
-  }
-  // Shadow v2 burst summary: max prey_score across frames, modal cat_id,
-  // number of frames where v2 "detected" matched legacy. Logged AND packed
-  // into the event log so the events UI surfaces it without touching SD.
+  // v2 burst summary: max prey_score across frames, modal cat_id, etc.
+  // All v2 calls are synchronous now — no bounded wait needed.
   int v2Ok = 0, v2Det = 0, v2CatRec = 0;
   float v2MaxPrey = -1.0f;
   int   v2MaxIdx = -1;
@@ -2077,13 +1461,12 @@ api_done:
   }
   Serial.printf(
     "V2-SUMMARY gen=%d frames=%d v2ok=%d v2det=%d v2catRec=%d maxPrey=%.3f@f%d "
-    "cat=%s(m=%d/b=%d/o=%d) httpAvg=%lums srvAvg=%lums burstWall=%lums | legacyPrey=%d/%d\n",
+    "cat=%s(m=%d/b=%d/o=%d) httpAvg=%lums srvAvg=%lums burstWall=%lums\n",
     archive.generation, archive.count, v2Ok, v2Det, v2CatRec,
     v2MaxPrey, v2MaxIdx, modalCat, catMazge, catBenis, catOther,
     v2Ok ? v2HttpTot / v2Ok : 0,
     v2Ok ? v2SrvTot / v2Ok  : 0,
-    v2BurstTotalMs,
-    preyFrameCount, archive.count);
+    v2BurstTotalMs);
   addEvent(archive.generation, archive.count, eventResult, dMin, dMax, trend, true,
            dirEpoch, (uint16_t)latMs, v2MaxPreyX1000, v2OkFrames, v2Flags);
 #else
@@ -2092,7 +1475,7 @@ api_done:
 #endif
 
   // Blynk: push event telemetry (prey result + detail)
-  blynkPushEvent(archive.apiPreyDetected == 1 ? 1 : 0, preyFrameCount, archive.count, latMs);
+  blynkPushEvent(archive.apiPreyDetected == 1 ? 1 : 0, v2DetCount, archive.count, latMs);
 }
 
 // Guard: only one API task at a time (timestamp-based, auto-expires).
@@ -2117,20 +1500,11 @@ static inline bool apiTaskBusy() {
   return true;
 }
 
-// Force-tear down the legacy shared TLS client and request worker tear down.
-// Used by the watchdog after abandoning an in-flight analysis. The next call
-// will reconnect from scratch.
-//
-// Worker TLS is torn down via a flag the worker checks itself — never from
-// this task — to avoid use-after-free races while the worker is mid-POST.
+// v2-only: there's no persistent state to tear down per-burst (callPreyV2
+// rebuilds the WiFiClient+HTTPClient every call). Watchdog still pokes this
+// for log continuity so we can correlate "abandons" with v2 server hangs.
 static void resetAllApiConnections(const char *reason) {
-  Serial.printf("API: resetting TLS connections (%s)\n", reason);
-  tlsConnected = false;
-  if (httpApi)   { httpApi->end();   delete httpApi;   httpApi   = NULL; }
-  if (tlsClient) { tlsClient->stop(); delete tlsClient; tlsClient = NULL; }
-  for (int i = 0; i < N_API_WORKERS; i++) {
-    apiWorkers[i].resetTlsRequested = true;
-  }
+  Serial.printf("API: reset request (%s) — v2 has no persistent state\n", reason);
 }
 
 // FreeRTOS task wrapper for autonomousApiCheck
@@ -2899,9 +2273,7 @@ static esp_err_t stats_handler(httpd_req_t *req) {
 // stack high-water marks. Lets us correlate crashes over time without serial.
 static esp_err_t diag_handler(httpd_req_t *req) {
   char json[512];
-  UBaseType_t w0 = apiWorkers[0].task ? uxTaskGetStackHighWaterMark(apiWorkers[0].task) : 0;
-  UBaseType_t w1 = (N_API_WORKERS > 1 && apiWorkers[N_API_WORKERS > 1 ? 1 : 0].task)
-                     ? uxTaskGetStackHighWaterMark(apiWorkers[N_API_WORKERS > 1 ? 1 : 0].task) : 0;
+  UBaseType_t loopHW = uxTaskGetStackHighWaterMark(NULL);
   uint32_t storedBoot = 0;
   uint32_t lastRR = 0;
   nvsPrefs.begin("state", true);
@@ -2926,7 +2298,7 @@ static esp_err_t diag_handler(httpd_req_t *req) {
     "{\"bootCount\":%u,\"resetReason\":%u,\"resetReasonName\":\"%s\","
     "\"persistedRR\":%u,\"uptimeMs\":%lu,"
     "\"freeHeap\":%u,\"minFreeHeap\":%u,\"freePsram\":%u,\"minFreePsram\":%u,"
-    "\"workerStackHW0\":%u,\"workerStackHW1\":%u,"
+    "\"loopStackHW\":%u,"
     "\"apiAbandons\":%u,\"rssi\":%d"
 #ifdef PREY_V2_URL
     ",\"v2Enabled\":%s,\"v2Calls\":%u,\"v2Ok\":%u,\"v2Err\":%u,\"v2Drops\":%u"
@@ -2936,7 +2308,7 @@ static esp_err_t diag_handler(httpd_req_t *req) {
     (unsigned)lastRR, millis(),
     (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap(),
     (unsigned)ESP.getFreePsram(), (unsigned)ESP.getMinFreePsram(),
-    (unsigned)w0, (unsigned)w1,
+    (unsigned)loopHW,
     (unsigned)apiAbandonCount, (int)WiFi.RSSI()
 #ifdef PREY_V2_URL
     , g_v2Enabled ? "true" : "false",
@@ -3041,184 +2413,6 @@ static esp_err_t burstmeta_handler(httpd_req_t *req) {
   return httpd_resp_send(req, json, strlen(json));
 }
 
-// ===== API test endpoint — single frame capture → crop → API call =====
-static esp_err_t apitest_handler(httpd_req_t *req) {
-  char json[512];
-  // Grab a frame from camera
-  camera_fb_t *fb = esp_camera_fb_get();
-  if (!fb) {
-    snprintf(json, sizeof(json), "{\"error\":\"camera_fail\"}");
-    httpd_resp_set_type(req, "application/json");
-    return httpd_resp_send(req, json, strlen(json));
-  }
-  size_t origLen = fb->len;
-
-  // callPreyApi handles cropping internally
-  unsigned long t1 = millis();
-  int result = callPreyApi(fb->buf, fb->len);
-  unsigned long apiMs = millis() - t1;
-  esp_camera_fb_return(fb);
-
-  // Escape quotes in apiResponseBuf for valid JSON embedding
-  char escapedResp[384];
-  int ei = 0;
-  for (int i = 0; apiResponseBuf[i] && ei < (int)sizeof(escapedResp) - 2; i++) {
-    if (apiResponseBuf[i] == '"') { escapedResp[ei++] = '\\'; }
-    escapedResp[ei++] = apiResponseBuf[i];
-  }
-  escapedResp[ei] = 0;
-
-  snprintf(json, sizeof(json),
-    "{\"result\":%d,\"origLen\":%u,\"apiMs\":%lu,\"freePsram\":%u,\"espErr\":\"0x%x\",\"httpStatus\":%d,\"apiResponse\":\"%s\"}",
-    result, origLen, apiMs, ESP.getFreePsram(), lastApiEspErr, lastApiHttpStatus, escapedResp);
-  httpd_resp_set_type(req, "application/json");
-  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-  return httpd_resp_send(req, json, strlen(json));
-}
-
-// ===== Pipeline test endpoint =====
-// POST /pipetest?pipe=A|B|C|D|E|F|H&iters=N&out=0|1
-// Body: raw JPEG bytes (640x480 grayscale expected)
-// Response: JSON with timings (out=0) or processed JPEG (out=1, last iter)
-
-// Run pipeline on a dedicated high-stack task to avoid httpd stack overflow
-struct PipeTaskArg {
-  int variant;
-  const uint8_t *jpg;
-  size_t jpgLen;
-  int iters;
-  unsigned long *times_us;
-  size_t *out_lens;
-  uint8_t **lastOut;
-  size_t *lastOutLen;
-  TaskHandle_t caller;
-};
-
-static void pipeTaskFn(void *arg) {
-  PipeTaskArg *a = (PipeTaskArg *)arg;
-  uint8_t *lastOut = NULL;
-  for (int i = 0; i < a->iters; i++) {
-    if (lastOut) { free(lastOut); lastOut = NULL; }
-    int64_t t0 = esp_timer_get_time();
-    size_t outLen = 0;
-    uint8_t *out = pipeline_run(a->variant, a->jpg, a->jpgLen, &outLen);
-    int64_t t1 = esp_timer_get_time();
-    a->times_us[i] = (unsigned long)(t1 - t0);
-    a->out_lens[i] = outLen;
-    lastOut = out;
-    if (!out) break;
-  }
-  *a->lastOut = lastOut;
-  if (lastOut) *a->lastOutLen = a->out_lens[a->iters - 1];
-  xTaskNotifyGive(a->caller);
-  vTaskDelete(NULL);
-}
-
-static esp_err_t pipetest_handler(httpd_req_t *req) {
-  char query[64];
-  char val[16];
-  int variant = 'A';
-  int iters = 1;
-  int wantOut = 0;
-  int qlen = httpd_req_get_url_query_len(req) + 1;
-  if (qlen > 1 && qlen <= (int)sizeof(query)) {
-    httpd_req_get_url_query_str(req, query, sizeof(query));
-    if (httpd_query_key_value(query, "pipe", val, sizeof(val)) == ESP_OK) {
-      variant = (int)val[0];
-    }
-    if (httpd_query_key_value(query, "iters", val, sizeof(val)) == ESP_OK) {
-      iters = atoi(val);
-      if (iters < 1) iters = 1;
-      if (iters > 20) iters = 20;
-    }
-    if (httpd_query_key_value(query, "out", val, sizeof(val)) == ESP_OK) {
-      wantOut = atoi(val);
-    }
-  }
-
-  // Receive POST body (JPEG)
-  int contentLen = req->content_len;
-  if (contentLen <= 0 || contentLen > 200 * 1024) {
-    httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad content length");
-    return ESP_FAIL;
-  }
-  uint8_t *jpgBuf = (uint8_t *)heap_caps_malloc(contentLen, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-  if (!jpgBuf) {
-    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "no psram");
-    return ESP_FAIL;
-  }
-  int received = 0;
-  while (received < contentLen) {
-    int r = httpd_req_recv(req, (char *)(jpgBuf + received), contentLen - received);
-    if (r <= 0) {
-      free(jpgBuf);
-      httpd_resp_send_err(req, HTTPD_408_REQ_TIMEOUT, "recv fail");
-      return ESP_FAIL;
-    }
-    received += r;
-  }
-
-  // Run pipeline iters times
-  unsigned long times_us[20] = {0};
-  size_t out_lens[20] = {0};
-  uint8_t *lastOut = NULL;
-  size_t lastOutLen = 0;
-  uint32_t freeHeapBefore = ESP.getFreeHeap();
-  uint32_t freePsramBefore = ESP.getFreePsram();
-
-  PipeTaskArg pa = {variant, jpgBuf, (size_t)contentLen, iters,
-                    times_us, out_lens, &lastOut, &lastOutLen,
-                    xTaskGetCurrentTaskHandle()};
-  // Use a large stack — esp_jpg_decode + fmt2jpg need significant stack
-  TaskHandle_t th = NULL;
-  BaseType_t rc = xTaskCreatePinnedToCore(pipeTaskFn, "pipetest", 32768,
-                                          &pa, tskIDLE_PRIORITY + 2, &th, 0);
-  if (rc != pdPASS) {
-    free(jpgBuf);
-    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "task create fail");
-    return ESP_FAIL;
-  }
-  // Wait up to 30s for task to finish
-  ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(30000));
-
-  if (wantOut && lastOut) {
-    httpd_resp_set_type(req, "image/jpeg");
-    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-    char hdr[32];
-    snprintf(hdr, sizeof(hdr), "%lu", times_us[iters - 1]);
-    httpd_resp_set_hdr(req, "X-Pipe-Time-Us", hdr);
-    snprintf(hdr, sizeof(hdr), "%u", (unsigned)lastOutLen);
-    httpd_resp_set_hdr(req, "X-Pipe-Out-Len", hdr);
-    httpd_resp_send(req, (const char *)lastOut, lastOutLen);
-    free(lastOut);
-    free(jpgBuf);
-    return ESP_OK;
-  }
-
-  if (lastOut) free(lastOut);
-
-  // Build JSON response
-  char json[1024];
-  int n = snprintf(json, sizeof(json),
-    "{\"pipe\":\"%c\",\"iters\":%d,\"input_len\":%d,"
-    "\"free_heap_before\":%u,\"free_psram_before\":%u,"
-    "\"times_us\":[",
-    variant, iters, contentLen, freeHeapBefore, freePsramBefore);
-  for (int i = 0; i < iters; i++) {
-    n += snprintf(json + n, sizeof(json) - n, "%s%lu", i ? "," : "", times_us[i]);
-  }
-  n += snprintf(json + n, sizeof(json) - n, "],\"out_lens\":[");
-  for (int i = 0; i < iters; i++) {
-    n += snprintf(json + n, sizeof(json) - n, "%s%u", i ? "," : "", (unsigned)out_lens[i]);
-  }
-  n += snprintf(json + n, sizeof(json) - n, "]}");
-
-  free(jpgBuf);
-  httpd_resp_set_type(req, "application/json");
-  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-  return httpd_resp_send(req, json, n);
-}
-
 static esp_err_t cmd_handler(httpd_req_t *req) {
   char buf[64];
   int len = httpd_req_get_url_query_len(req) + 1;
@@ -3269,11 +2463,6 @@ static esp_err_t cmd_handler(httpd_req_t *req) {
     blynkSetTriggerActive();
     lastBurstTriggerMs = nowMs;
     pendingBurstTriggerMs = nowMs;
-    // Pre-warm worker TLS during the BURST_SHIFT_MS + capture window so the
-    // first API POST does not pay TLS handshake cost.
-    for (int i = 0; i < N_API_WORKERS; i++) {
-      if (!apiWorkers[i].connected) apiWorkers[i].prewarmRequested = true;
-    }
     // Lock current exposure for the shift window so post-trigger frames
     // don't auto-brighten when ToF object leaves range.
     sensor_t *s = esp_camera_sensor_get();
@@ -4440,19 +3629,6 @@ void startUIServer() {
 #ifdef PREY_V2_URL
     httpd_register_uri_handler(ui_httpd, &v2stats_uri);
 #endif
-    httpd_uri_t apitest_uri = {
-      .uri = "/apitest",
-      .method = HTTP_GET,
-      .handler = apitest_handler,
-    };
-    httpd_register_uri_handler(ui_httpd, &apitest_uri);
-    httpd_uri_t pipetest_uri = {
-      .uri = "/pipetest",
-      .method = HTTP_POST,
-      .handler = pipetest_handler,
-      .user_ctx = NULL
-    };
-    httpd_register_uri_handler(ui_httpd, &pipetest_uri);
     httpd_uri_t prey24h_uri = { .uri = "/burstinfo", .method = HTTP_GET, .handler = burstinfo_handler, .user_ctx = NULL };
     httpd_register_uri_handler(ui_httpd, &prey24h_uri);
     httpd_uri_t raminfo_uri = { .uri = "/raminfo", .method = HTTP_GET, .handler = raminfo_handler, .user_ctx = NULL };
@@ -4741,9 +3917,6 @@ void loop() {
         doorCloseNow("trigger (bench)");
         lastBurstTriggerMs = now;
         pendingBurstTriggerMs = now;
-        for (int i = 0; i < N_API_WORKERS; i++) {
-          if (!apiWorkers[i].connected) apiWorkers[i].prewarmRequested = true;
-        }
         sensor_t *ss = esp_camera_sensor_get();
         if (ss) { frozenAec = ss->status.aec_value; frozenGain = ss->status.agc_gain; }
         pendingFreezeAtMs = millis() + BURST_SHIFT_MS;
@@ -4764,9 +3937,6 @@ void loop() {
         doorCloseNow("trigger (bench forced)");
         lastBurstTriggerMs = now;
         pendingBurstTriggerMs = now;
-        for (int i = 0; i < N_API_WORKERS; i++) {
-          if (!apiWorkers[i].connected) apiWorkers[i].prewarmRequested = true;
-        }
         sensor_t *ss = esp_camera_sensor_get();
         if (ss) { frozenAec = ss->status.aec_value; frozenGain = ss->status.agc_gain; }
         pendingFreezeAtMs = millis() + BURST_SHIFT_MS;
@@ -4780,26 +3950,17 @@ void loop() {
                     (int)apiTaskBusy(), (int)burstCapturing,
                     (unsigned)apiAbandonCount);
 #ifdef PREY_V2_URL
-      Serial.printf(" v2en=%d calls=%u ok=%u err=%u drops=%u inflight=%u",
+      Serial.printf(" v2en=%d calls=%u ok=%u err=%u drops=%u",
                     (int)g_v2Enabled, (unsigned)g_v2CallsTotal,
                     (unsigned)g_v2OkTotal, (unsigned)g_v2ErrTotal,
-                    (unsigned)g_v2DropsTotal, (unsigned)g_v2InFlight);
+                    (unsigned)g_v2DropsTotal);
 #endif
       Serial.printf(" ip=%s\n", WiFi.localIP().toString().c_str());
     } else if (c == 'd') {
-      // Per-worker stack high-water marks; cheap and always available.
-      Serial.printf("BENCH: tasks (stack high-water free, smaller=closer to overflow)\n");
+      // Loop task stack high-water; v2 path has no persistent task so loop
+      // is the only long-lived one besides the system tasks.
+      Serial.printf("BENCH: stack high-water free (smaller=closer to overflow)\n");
       Serial.printf("  loop      = %u\n", (unsigned)uxTaskGetStackHighWaterMark(NULL));
-      for (int i = 0; i < N_API_WORKERS; i++) {
-        if (apiWorkers[i].task)
-          Serial.printf("  apiw%d     = %u\n", i,
-                        (unsigned)uxTaskGetStackHighWaterMark(apiWorkers[i].task));
-      }
-#ifdef PREY_V2_URL
-      if (v2TaskHandle)
-        Serial.printf("  v2task    = %u\n",
-                      (unsigned)uxTaskGetStackHighWaterMark(v2TaskHandle));
-#endif
     } else if (c == 'v') {
 #ifdef PREY_V2_URL
       g_v2Enabled = !g_v2Enabled;
@@ -4926,25 +4087,6 @@ void loop() {
   }
   greenLightWasActive = greenLightNow;
 
-  // Free idle worker TLS to reclaim ~120KB internal heap during quiet periods.
-  // Trigger condition: no API task busy, no burst capturing, no green light or
-  // lockout active, and >IDLE_TLS_FREE_MS since the last trigger. Re-init on
-  // next burst costs ~1s of TLS handshake (per worker, in parallel) which is
-  // hidden behind the BURST_SHIFT_MS pre-capture window.
-#define IDLE_TLS_FREE_MS (90UL * 1000UL)
-  static unsigned long lastTlsFreeCheckMs = 0;
-  if (now - lastTlsFreeCheckMs > 5000) {  // check every 5s
-    lastTlsFreeCheckMs = now;
-    bool idle = !apiTaskBusy() && !burstCapturing && !greenLightNow &&
-                !doorLockoutActive() && (postTriggerRemaining == 0) &&
-                (pendingFreezeAtMs == 0);
-    bool quiet = (lastBurstTriggerMs == 0) ||
-                 ((now - lastBurstTriggerMs) > IDLE_TLS_FREE_MS);
-    if (idle && quiet) {
-      freeIdleWorkerTls();
-    }
-  }
-
   // Heartbeat: log key state once a minute so a serial capture can show
   // exactly how far the firmware got before any crash. Cheap (one Serial.printf).
   static unsigned long lastHeartbeat = 0;
@@ -4958,20 +4100,17 @@ void loop() {
     int rssi            = WiFi.RSSI();
     long lockRemainS    = doorLockoutActive() ? (long)((preyLockoutUntilMs - now) / 1000UL) : 0;
     long greenRemainS   = greenLightActive() ? (long)((greenLightUntilMs - now) / 1000UL) : 0;
-    // Worker stack high-water (smallest stack free observed so far per worker)
-    UBaseType_t w0 = apiWorkers[0].task ? uxTaskGetStackHighWaterMark(apiWorkers[0].task) : 0;
-    UBaseType_t w1 = (N_API_WORKERS > 1 && apiWorkers[N_API_WORKERS > 1 ? 1 : 0].task)
-                       ? uxTaskGetStackHighWaterMark(apiWorkers[N_API_WORKERS > 1 ? 1 : 0].task) : 0;
+    UBaseType_t loopHW  = uxTaskGetStackHighWaterMark(NULL);
     Serial.printf("HB up=%lus epoch=%ld door=%s lock=%lds green=%lds "
                   "heap=%u/min=%u psram=%u rssi=%ddBm wifi=%d blynk=%d "
-                  "apiBusy=%d burst=%d abandons=%u boot=#%u rr=%u wHW=%u/%u\n",
+                  "apiBusy=%d burst=%d abandons=%u boot=#%u rr=%u loopHW=%u\n",
                   now / 1000UL, (long)hbEpoch, doorOpen ? "OPEN" : "CLOSED",
                   lockRemainS, greenRemainS,
                   (unsigned)freeHeap, (unsigned)minHeap, (unsigned)freePsram, rssi,
                   (int)WiFi.isConnected(), (int)Blynk.connected(),
                   (int)apiTaskBusy(), (int)burstCapturing,
                   (unsigned)apiAbandonCount, (unsigned)bootCounter,
-                  (unsigned)bootResetReason, (unsigned)w0, (unsigned)w1);
+                  (unsigned)bootResetReason, (unsigned)loopHW);
   }
 
   // Blynk: V1 — reset prey frame count to 0 when lockout expires
@@ -5078,13 +4217,6 @@ void loop() {
       lastBurstTriggerMs = now;
       pendingBurstTriggerMs = now;
       tofCloseCount = 0;
-      // Pre-warm worker TLS NOW: BURST_SHIFT_MS (200ms) + capture (~1s) gives
-      // the workers ~1.2s to complete a TLS handshake before the first API
-      // POST is issued. Hides the freeIdleWorkerTls cost on cold bursts and
-      // restores pre-2026-05-21 API latency (~3-4s/burst instead of 5-6s).
-      for (int i = 0; i < N_API_WORKERS; i++) {
-        if (!apiWorkers[i].connected) apiWorkers[i].prewarmRequested = true;
-      }
       sensor_t *s = esp_camera_sensor_get();
       if (s) {
         frozenAec  = s->status.aec_value;
@@ -5135,14 +4267,7 @@ void loop() {
     aecProbeStart = now;
   }
 
-  // === TLS pre-connect: keep connection warm so first API call is fast ===
-  static unsigned long lastTlsCheck = 0;
-  if (!burstCapturing && now - lastTlsCheck >= 10000) {
-    lastTlsCheck = now;
-    if (!tlsConnected) {
-      ensureTlsConnection();
-    }
-  }
+  // === TLS pre-connect: removed (v1 cloud is gone; v2 builds connection per-call).
 
   // Continuously fill ring buffer with JPEG frames
   static unsigned long lastRing = 0;
