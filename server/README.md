@@ -203,11 +203,12 @@ Covers every item from the v2 contract's "conformance checklist".
 2016 13" MBP, Intel i5-6360U (2C/4T), 8 GiB RAM, macOS 12.7.6, ONNX Runtime
 CPU. Synthetic frames; real JPEG decode adds 5–10 ms.
 
-| pipeline | p50 | p95 |
-|---|---:|---:|
-| yolo11s @ 640 + prey_v3 @ 224 | ~430 ms | ~790 ms |
-| yolo11s @ 480 + prey_v3 @ 224 | ~240 ms | ~320 ms |
-| yolo11s @ 384 + prey_v3 @ 224 | ~165 ms | ~250 ms |
+| pipeline | p50 | p95 | note |
+|---|---:|---:|---|
+| **yolo11s @ 480 + prey_v3 bodyA_s480 @ 224** | **~240 ms** | **~320 ms** | **current production** — zero prey leaks in 655-burst eval |
+| yolo11s @ 640 + prey_v3 bodyA_s @ 224 | ~430 ms | ~790 ms | previous; 1 prey leak |
+| yolo11s @ 384 + prey_v3 bodyA @ 224 | ~165 ms | ~250 ms | fastest, but bodyA mismatched with yolo11s detector |
 
-The @640 config matches the training crops in `crops_yolo11s_rotcrop/`.
-Smaller imgsz needs a retrained `bodyA_s` on smaller crops.
+First inference after a reload is **5–18 s cold** as ORT initializes mkldnn
+kernels; subsequent calls drop to the warm numbers above. The launchd plist's
+warmup pre-runs both models once at startup so the first real frame is warm.

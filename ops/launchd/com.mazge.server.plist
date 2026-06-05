@@ -25,11 +25,11 @@
         <key>MAZGE_MODEL_BACKEND</key>
         <string>onnx</string>
         <key>MAZGE_YOLO_ONNX</key>
-        <string>/Users/tomas/Mazge/_bench_weights/yolo11s_640.onnx</string>
+        <string>/Users/tomas/Mazge/_bench_weights/yolo11s_480.onnx</string>
         <key>MAZGE_PREY_ONNX</key>
-        <string>/Users/tomas/Mazge/_bench_weights/prey_v3_bodyA_224.onnx</string>
+        <string>/Users/tomas/Mazge/_bench_weights/prey_v3_bodyA_s480_224.onnx</string>
         <key>MAZGE_YOLO_IMGSZ</key>
-        <string>640</string>
+        <string>480</string>
         <key>MAZGE_THREADS</key>
         <string>2</string>
         <key>MAZGE_PORT</key>
