@@ -273,10 +273,9 @@ def main():
                         frame_finished_ms = time.time() * 1000
                         img = Image.open(io.BytesIO(data))
                         img = img.transpose(Image.Transpose.ROTATE_90)
-                        # Crop 20% from top (after rotation) — occluded by cat flap frame
+                        # Match training crop (build_crops.CROP_TOP_AFTER_ROT=160).
                         w_img, h_img = img.size
-                        crop_top = int(h_img * 0.20)
-                        img = img.crop((0, crop_top, w_img, h_img))
+                        img = img.crop((0, 160, w_img, h_img))
                         img.save(path, 'JPEG', quality=97)
                         sz = path.stat().st_size
                         frame_timings.append({
