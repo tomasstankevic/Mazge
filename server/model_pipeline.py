@@ -99,10 +99,9 @@ class OnnxPipeline:
         frame_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
         if frame_bgr is None:
             raise ValueError("jpeg decode failed")
-        # Same to_upright as build_crops.py: rotate 90 CCW + drop top strip.
+        # Same to_upright as build_crops.py: rotate 90 CCW + drop top 160 px.
         upright = cv2.rotate(frame_bgr, cv2.ROTATE_90_COUNTERCLOCKWISE)
-        h = upright.shape[0]
-        upright = upright[int(h * 0.20) :, :, :]
+        upright = upright[160:, :, :]
 
         body = self._detect_body(upright)
         if body is None:
