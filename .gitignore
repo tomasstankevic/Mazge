@@ -63,5 +63,7 @@ models/subject_detection_eval/
 *.bak
 _bench_weights/
 
-logs/
+logs/server/debug-dump/
+logs/server/*.log
+logs/server/launchd.*.log
 .venv-server/
