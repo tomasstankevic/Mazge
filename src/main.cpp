@@ -1320,9 +1320,12 @@ void autonomousApiCheck(int archIdx) {
   //     (cat retries on next ToF trigger; covers transient server hiccups)
   //   - any frame detected prey: deny + apply server's lockout_seconds
   //     (server returns higher lockout for higher severity)
-  //   - anyDeny WITHOUT prey detection (no cat recognized, off-frame, etc.):
-  //     deny THIS burst but NO lockout. Cat retries on next ToF trigger.
-  //   - anyAllow + no deny: open
+  //   - any frame said allow (= cat cleanly recognized + no prey on that
+  //     frame): open. ONE clean allow is sufficient proof. Mixed bursts
+  //     where some frames had low cat-conf (server said deny + no_cat)
+  //     should still open as long as at least one frame is clean.
+  //   - anyDeny WITHOUT prey AND WITHOUT any allow: deny THIS burst but NO
+  //     lockout. Cat retries on next ToF trigger.
   bool open = false;
   uint16_t lockoutS = 0;
   const char *reason;
@@ -1334,14 +1337,14 @@ void autonomousApiCheck(int archIdx) {
     open = false;
     lockoutS = maxLockoutS;  // server-prescribed; scales with severity
     reason = "v2 prey detected";
-  } else if (anyDeny) {
-    open = false;
-    lockoutS = 0;  // no cat recognized but no prey -> don't penalize
-    reason = "v2 deny (no cat recognized, no lockout)";
   } else if (anyAllow) {
     open = true;
     lockoutS = 0;
     reason = "v2 allow";
+  } else if (anyDeny) {
+    open = false;
+    lockoutS = 0;  // no cat recognized anywhere, no prey -> don't penalize
+    reason = "v2 deny (no cat recognized, no lockout)";
   } else {
     // Responses came back but none said allow OR deny (shouldn't happen per
     // contract, but be safe).
