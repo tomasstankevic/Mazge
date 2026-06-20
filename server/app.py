@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException, Request, Response
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 from .bursts import BurstIndex, safe_dump_path
 from .config import Config
@@ -31,6 +31,84 @@ CONTRACT_VERSION = 2
 MAX_BODY_BYTES = 512_000
 
 logger = logging.getLogger("mazge.server")
+
+
+_DASHBOARD_HTML = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<title>mazge</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+ body{font:14px/1.4 -apple-system,sans-serif;margin:0;padding:12px;background:#111;color:#eee}
+ h1{font-size:16px;margin:0 0 8px}
+ .status{background:#1c1c1c;padding:8px 10px;border-radius:6px;margin-bottom:12px;
+   display:flex;flex-wrap:wrap;gap:10px 18px;font-size:13px}
+ .status b{color:#9cf}
+ .burst{background:#1c1c1c;border-radius:6px;padding:8px;margin-bottom:10px}
+ .burst h2{font-size:13px;margin:0 0 6px;font-weight:600}
+ .burst h2 .sev{padding:1px 6px;border-radius:3px;margin-left:6px;font-size:11px}
+ .sev-none{background:#345}.sev-low{background:#564}.sev-med,.sev-medium{background:#a72}
+ .sev-high{background:#a33}.sev-critical{background:#c22}
+ .frames{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:6px}
+ .frame{background:#000;border-radius:4px;overflow:hidden;font-size:11px}
+ .frame img{width:100%;display:block;background:#222;aspect-ratio:1/1;object-fit:cover;transform:rotate(-90deg)}
+ .frame .meta{padding:3px 5px;color:#bbb}
+ .frame .det{color:#f99}
+ .err{color:#f88;padding:10px}
+ a{color:#9cf}
+ .row{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px}
+ button{background:#333;color:#eee;border:1px solid #555;border-radius:4px;
+   padding:4px 10px;cursor:pointer;font:inherit}
+</style></head><body>
+<div class="row"><h1>mazge server</h1>
+ <div><label>auto-refresh
+ <select id="iv"><option value="0">off</option><option value="10">10s</option>
+ <option value="30" selected>30s</option><option value="60">1m</option></select></label>
+ <button onclick="load()">refresh</button></div></div>
+<div id="status" class="status">loading…</div>
+<div id="bursts"></div>
+<script>
+const fmt = ms => ms ? new Date(ms).toLocaleString() : "—";
+const sevClass = s => "sev sev-" + (s||"none");
+async function load(){
+ try{
+  const [st,br] = await Promise.all([
+   fetch("/v1/status").then(r=>r.json()),
+   fetch("/v1/bursts/recent?limit=20").then(r=>r.json())]);
+  const ld = st.latest_decision || {};
+  document.getElementById("status").innerHTML =
+   `<span><b>backend</b> ${st.backend}</span>`+
+   `<span><b>uptime</b> ${Math.round(st.uptime_s/60)}m</span>`+
+   `<span><b>last frame</b> ${fmt(ld.frame_ts_ms||ld.ts_ms)}</span>`+
+   `<span><b>last sev</b> ${ld.severity||"—"}</span>`+
+   `<span><b>last action</b> ${ld.door_action||"—"}</span>`+
+   `<span><a href="/v1/latest_frame.jpg" target="_blank">latest jpg</a></span>`;
+  const root = document.getElementById("bursts");
+  if(!br.bursts || !br.bursts.length){ root.innerHTML = "<div class=err>no bursts yet</div>"; return; }
+  root.innerHTML = br.bursts.map(b => `
+   <div class="burst">
+    <h2>${b.device_id} · ${b.burst_id}
+     <span class="${sevClass(b.severity)}">${b.severity}</span>
+     <span style="color:#888;font-weight:400"> · ${b.frame_count} frames · max ${b.max_prey_score} · ${b.door_action} · ${fmt(b.latest_ts_ms)}</span></h2>
+    <div class="frames">${b.frames.map(f => `
+     <div class="frame">
+      ${f.image_url ? `<a href="${f.image_url}" target="_blank"><img loading="lazy" src="${f.image_url}"></a>` : `<div style="aspect-ratio:1/1;display:flex;align-items:center;justify-content:center;color:#666">no jpg</div>`}
+      <div class="meta">f${f.frame_index} · ${f.prey_score}${f.detected?` <span class=det>DET</span>`:""}</div>
+     </div>`).join("")}</div>
+   </div>`).join("");
+ }catch(e){
+  document.getElementById("status").innerHTML = `<span class=err>error: ${e}</span>`;
+ }
+}
+let timer=null;
+function setIv(){
+ if(timer){clearInterval(timer);timer=null;}
+ const s = parseInt(document.getElementById("iv").value,10);
+ if(s>0) timer = setInterval(load, s*1000);
+}
+document.getElementById("iv").addEventListener("change", setIv);
+load(); setIv();
+</script>
+</body></html>"""
 
 
 def _now_ms() -> int:
@@ -102,6 +180,10 @@ def create_app(cfg: Config | None = None) -> FastAPI:
     if loaded:
         logger.info("burst index hydrated from %d recent audits", loaded)
     mqtt.publish_server_online(pipeline.backend)
+
+    if cfg.esp_host:
+        from . import esp_proxy
+        esp_proxy.start_in_thread(cfg.esp_host, cfg.esp_proxy_port)
 
     app = FastAPI(title="mazge-server", version="0.1.0")
 
@@ -288,6 +370,10 @@ def create_app(cfg: Config | None = None) -> FastAPI:
         _audit(audit_record)
         bursts.record(audit_record)
         return JSONResponse(body)
+
+    @app.get("/", response_class=HTMLResponse)
+    def dashboard() -> HTMLResponse:
+        return HTMLResponse(_DASHBOARD_HTML)
 
     @app.get("/v1/bursts/recent")
     def recent_bursts(limit: int = 20) -> dict[str, Any]:

@@ -39,6 +39,8 @@ class Config:
     log_dir: Path
     idempotency_ttl_s: int
     debug_dump_dir: Path | None
+    esp_host: str
+    esp_proxy_port: int
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -60,4 +62,6 @@ class Config:
             log_dir=Path(os.environ.get("MAZGE_LOG_DIR", str(ROOT / "logs" / "server"))),
             idempotency_ttl_s=int(os.environ.get("MAZGE_IDEMPOTENCY_TTL_S", "300")),
             debug_dump_dir=_path("MAZGE_DEBUG_DUMP_DIR"),
+            esp_host=os.environ.get("MAZGE_ESP_HOST", "").strip(),
+            esp_proxy_port=int(os.environ.get("MAZGE_ESP_PROXY_PORT", "8081")),
         )
