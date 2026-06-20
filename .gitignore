@@ -65,5 +65,20 @@ _bench_weights/
 
 logs/server/debug-dump/
 logs/server/*.log
+logs/server/server.jsonl*
 logs/server/launchd.*.log
 .venv-server/
+
+# Home Assistant runtime state (only the templates we author are tracked)
+ops/home-assistant/.cloud/
+ops/home-assistant/.storage/
+ops/home-assistant/deps/
+ops/home-assistant/tts/
+ops/home-assistant/www/
+ops/home-assistant/blueprints/
+ops/home-assistant/custom_components/
+ops/home-assistant/home-assistant.log*
+ops/home-assistant/home-assistant_v2.db*
+ops/home-assistant/secrets.yaml
+ops/home-assistant/known_devices.yaml
+ops/home-assistant/.HA_VERSION

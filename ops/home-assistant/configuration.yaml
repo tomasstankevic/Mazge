@@ -1,0 +1,137 @@
+# Home Assistant main config for the Mazge cat door.
+#
+# Reload after editing: Developer Tools \u2192 YAML \u2192 "All YAML configuration".
+
+default_config:
+
+lovelace:
+  mode: storage
+  dashboards:
+    mazge:
+      mode: yaml
+      title: Mazge
+      icon: mdi:cat
+      show_in_sidebar: true
+      filename: dashboards/mazge.yaml
+
+http:
+  use_x_forwarded_for: true
+  trusted_proxies:
+    - 127.0.0.1
+    - ::1
+    - 100.64.0.0/10   # Tailscale CGNAT range
+
+# ---------------------------------------------------------------------------
+# MQTT entities. Broker connection itself is added once from the UI
+# (Settings \u2192 Devices \u2192 Add Integration \u2192 MQTT) using the creds in
+# secrets.yaml.
+# ---------------------------------------------------------------------------
+mqtt:
+  binary_sensor:
+    - name: "Mazge server"
+      unique_id: mazge_server_online
+      state_topic: "mazge/server/status"
+      payload_on: "online"
+      payload_off: "offline"
+      device_class: connectivity
+      icon: mdi:server-network
+
+    - name: "Mazge prey detected"
+      unique_id: mazge_prey_detected
+      state_topic: "mazge/decision/detected"
+      payload_on: "ON"
+      payload_off: "OFF"
+      device_class: motion
+      icon: mdi:bird
+
+  sensor:
+    - name: "Mazge backend"
+      unique_id: mazge_backend
+      state_topic: "mazge/server/backend"
+      icon: mdi:engine
+
+    - name: "Mazge prey score"
+      unique_id: mazge_prey_score
+      state_topic: "mazge/decision/prey_score"
+      icon: mdi:gauge
+
+    - name: "Mazge cat ID"
+      unique_id: mazge_cat_id
+      state_topic: "mazge/decision/cat_id"
+      icon: mdi:cat
+
+    - name: "Mazge severity"
+      unique_id: mazge_severity
+      state_topic: "mazge/decision/severity"
+      icon: mdi:alert
+
+    - name: "Mazge door action"
+      unique_id: mazge_door_action
+      state_topic: "mazge/decision/door_action"
+      icon: mdi:door
+
+    - name: "Mazge lockout seconds"
+      unique_id: mazge_lockout_seconds
+      state_topic: "mazge/decision/lockout_seconds"
+      unit_of_measurement: "s"
+      icon: mdi:timer-lock
+
+    - name: "Mazge last burst id"
+      unique_id: mazge_last_burst_id
+      state_topic: "mazge/decision/burst_id"
+      icon: mdi:identifier
+
+  # Door command buttons. Topics are reserved; the ESP32 firmware will start
+  # subscribing once it is reflashed with MQTT support.
+  button:
+    - name: "Mazge door open"
+      unique_id: mazge_door_open
+      command_topic: "mazge/door/cmd"
+      payload_press: "open"
+      icon: mdi:door-open
+    - name: "Mazge door close"
+      unique_id: mazge_door_close
+      command_topic: "mazge/door/cmd"
+      payload_press: "close"
+      icon: mdi:door-closed
+
+# ---------------------------------------------------------------------------
+# Camera: pull the latest analyzed JPEG straight from the Mazge server.
+# Cache-buster forces HA to re-fetch on each refresh.
+# ---------------------------------------------------------------------------
+camera:
+  - platform: generic
+    name: "Mazge latest frame"
+    still_image_url: "http://host.lima.internal:8080/v1/latest_frame.jpg?cb={{ now().timestamp() | int }}"
+    verify_ssl: false
+    framerate: 0.5
+
+# ---------------------------------------------------------------------------
+# REST sensors: pull burst gallery JSON for the markdown card.
+# ---------------------------------------------------------------------------
+rest:
+  - resource: http://host.lima.internal:8080/v1/bursts/recent?limit=12
+    scan_interval: 30
+    sensor:
+      - name: "Mazge recent bursts"
+        unique_id: mazge_recent_bursts
+        value_template: "{{ value_json.bursts | length }}"
+        json_attributes:
+          - bursts
+          - backend
+          - server_ts_ms
+        icon: mdi:image-multiple
+
+  - resource: http://host.lima.internal:8080/v1/status
+    scan_interval: 30
+    sensor:
+      - name: "Mazge server uptime"
+        unique_id: mazge_server_uptime
+        value_template: "{{ value_json.uptime_s }}"
+        unit_of_measurement: s
+        json_attributes:
+          - latest_image_url
+          - latest_decision
+        icon: mdi:clock-outline
+
+automation: !include automations.yaml

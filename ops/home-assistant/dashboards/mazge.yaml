@@ -1,0 +1,89 @@
+# Mazge dashboard. Set as default from Profile \u2192 Dashboards if desired.
+title: Mazge
+views:
+  - title: Door
+    path: door
+    icon: mdi:cat
+    cards:
+      # --- top row: status tiles ----------------------------------------
+      - type: horizontal-stack
+        cards:
+          - type: tile
+            entity: binary_sensor.mazge_server
+            name: Server
+            color: green
+          - type: tile
+            entity: sensor.mazge_backend
+            name: Backend
+            icon: mdi:engine
+          - type: tile
+            entity: sensor.mazge_server_uptime
+            name: Uptime
+            icon: mdi:clock-outline
+
+      # --- live frame ---------------------------------------------------
+      - type: picture-entity
+        entity: camera.mazge_latest_frame
+        name: Latest analyzed frame
+        show_state: false
+        show_name: true
+        camera_view: live
+
+      # --- last decision ------------------------------------------------
+      - type: entities
+        title: Last decision
+        show_header_toggle: false
+        entities:
+          - entity: binary_sensor.mazge_prey_detected
+            name: Prey detected
+          - entity: sensor.mazge_prey_score
+            name: Prey score
+          - entity: sensor.mazge_cat_id
+            name: Cat
+          - entity: sensor.mazge_severity
+            name: Severity
+          - entity: sensor.mazge_door_action
+            name: Door action
+          - entity: sensor.mazge_lockout_seconds
+            name: Lockout
+          - entity: sensor.mazge_last_burst_id
+            name: Burst id
+
+      # --- door control (placeholder until firmware MQTT) --------------
+      - type: horizontal-stack
+        cards:
+          - type: button
+            name: Open door
+            icon: mdi:door-open
+            tap_action:
+              action: call-service
+              service: button.press
+              data:
+                entity_id: button.mazge_door_open
+          - type: button
+            name: Close door
+            icon: mdi:door-closed
+            tap_action:
+              action: call-service
+              service: button.press
+              data:
+                entity_id: button.mazge_door_close
+
+      # --- recent bursts gallery ---------------------------------------
+      - type: markdown
+        title: Recent bursts
+        content: |
+          {% set base = "http://host.lima.internal:8080" %}
+          {% set bursts = state_attr('sensor.mazge_recent_bursts', 'bursts') or [] %}
+          {% if bursts %}
+          {% for b in bursts[:10] %}
+          ### `{{ b.burst_id }}` \u2014 {{ b.severity }} / {{ b.door_action }}
+          cat: **{{ b.cat_id }}** \u00b7 max prey: **{{ '%.2f' % b.max_prey_score }}** \u00b7 frames: {{ b.frame_count }} \u00b7 detected: {{ 'yes' if b.any_detected else 'no' }}
+
+          {% for f in b.frames %}![f{{ f.frame_index }}]({{ base }}{{ f.image_url }}){% endfor %}
+
+          ---
+          {% endfor %}
+          {% else %}
+          _No bursts yet._
+          {% endif %}

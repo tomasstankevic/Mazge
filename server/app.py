@@ -18,8 +18,9 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, Header, HTTPException, Request, Response
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 
+from .bursts import BurstIndex, safe_dump_path
 from .config import Config
 from .decisions import Decision, decide
 from .idempotency import IdempotencyCache
@@ -95,6 +96,12 @@ def create_app(cfg: Config | None = None) -> FastAPI:
     if dump_dir is not None:
         dump_dir.mkdir(parents=True, exist_ok=True)
         logger.warning("MAZGE_DEBUG_DUMP_DIR=%s — every incoming JPEG will be saved", dump_dir)
+
+    bursts = BurstIndex()
+    loaded = bursts.hydrate_from_jsonl(cfg.log_dir)
+    if loaded:
+        logger.info("burst index hydrated from %d recent audits", loaded)
+    mqtt.publish_server_online(pipeline.backend)
 
     app = FastAPI(title="mazge-server", version="0.1.0")
 
@@ -242,9 +249,19 @@ def create_app(cfg: Config | None = None) -> FastAPI:
         ms = int((time.perf_counter() - t0) * 1000)
         body = _decision_response(decision, request_id, ms, x_device_id, x_burst_id, frame_index)
         idem.put(request_id, payload_hash, body)
-        mqtt.publish_decision(x_device_id, x_burst_id, decision)
-        _audit(
-            {
+        image_url = (
+            f"/v1/bursts/{Path(image_path).parent.name}/{Path(image_path).name}"
+            if image_path
+            else None
+        )
+        mqtt.publish_decision(
+            x_device_id,
+            x_burst_id,
+            decision,
+            frame_index=frame_index,
+            image_url=image_url,
+        )
+        audit_record = {
                 "ep": "/v2/frame",
                 "ts_ms": _now_ms(),
                 "request_id": request_id,
@@ -268,8 +285,59 @@ def create_app(cfg: Config | None = None) -> FastAPI:
                 "image_path": image_path,
                 "status_code": 200,
             }
-        )
+        _audit(audit_record)
+        bursts.record(audit_record)
         return JSONResponse(body)
+
+    @app.get("/v1/bursts/recent")
+    def recent_bursts(limit: int = 20) -> dict[str, Any]:
+        limit = max(1, min(int(limit), 100))
+        return {
+            "server_ts_ms": _now_ms(),
+            "backend": pipeline.backend,
+            "bursts": bursts.recent_bursts(limit=limit),
+        }
+
+    @app.get("/v1/bursts/{day}/{filename}")
+    def burst_image(day: str, filename: str) -> FileResponse:
+        if dump_dir is None:
+            raise HTTPException(status_code=404, detail="dump dir not configured")
+        path = safe_dump_path(dump_dir, day, filename)
+        if path is None:
+            raise HTTPException(status_code=404, detail="not found")
+        return FileResponse(
+            path,
+            media_type="image/jpeg",
+            headers={"Cache-Control": "public, max-age=86400"},
+        )
+
+    @app.get("/v1/latest_frame.jpg")
+    def latest_frame() -> Response:
+        if dump_dir is None:
+            raise HTTPException(status_code=404, detail="dump dir not configured")
+        url = bursts.latest_image_url()
+        if not url or not url.startswith("/v1/bursts/"):
+            raise HTTPException(status_code=404, detail="no frame yet")
+        # URL form: /v1/bursts/<day>/<filename>
+        _, _, _, day, filename = url.split("/", 4)
+        path = safe_dump_path(dump_dir, day, filename)
+        if path is None:
+            raise HTTPException(status_code=404, detail="not found")
+        return FileResponse(
+            path,
+            media_type="image/jpeg",
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.get("/v1/status")
+    def status() -> dict[str, Any]:
+        return {
+            "ok": True,
+            "backend": pipeline.backend,
+            "uptime_s": int(time.time() - started_at),
+            "latest_image_url": bursts.latest_image_url(),
+            "latest_decision": bursts.latest_decision(),
+        }
 
     def _error(request_id: str, status: int, code: str, message: str) -> JSONResponse:
         return JSONResponse(
