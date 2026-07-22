@@ -161,9 +161,14 @@ def load_existing_labels() -> set[tuple[str, str, int]]:
                 rec = json.loads(line)
             except Exception:
                 continue
-            seen.add((rec.get("image_id", ""),
-                      rec.get("source", ""),
-                      int(rec.get("label", -1))))
+            try:
+                lbl = int(rec.get("label", -1))
+            except (TypeError, ValueError):
+                # Non-integer labels (e.g. cat_id strings like "mazge") belong
+                # to other label sources and don't collide with the int-only
+                # autolabel namespace this function tracks.
+                continue
+            seen.add((rec.get("image_id", ""), rec.get("source", ""), lbl))
     return seen
 
 
