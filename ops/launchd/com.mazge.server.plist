@@ -36,6 +36,9 @@
 	<string>Interactive</string>
 	<key>ProgramArguments</key>
 	<array>
+		<string>/usr/bin/caffeinate</string>
+		<string>-i</string>
+		<string>-s</string>
 		<string>/Users/tomas/Mazge/.venv-server/bin/uvicorn</string>
 		<string>server.app:app</string>
 		<string>--host</string>

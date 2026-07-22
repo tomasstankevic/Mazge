@@ -137,7 +137,10 @@ set -a; source ~/.config/mazge/server.env; set +a
 Plist at [`ops/launchd/com.mazge.server.plist`](../ops/launchd/com.mazge.server.plist).
 It is symlinked into `~/Library/LaunchAgents/` and loaded once at install time;
 launchd brings it back up automatically after crashes, restarts, and macOS
-reboot when the user logs in.
+reboot when the user logs in. The job runs uvicorn through `caffeinate -i -s`,
+so the inference host cannot enter idle/system sleep while the server is live.
+This is required for deterministic door latency; launchd cannot serve requests
+or restart a process while the whole Mac is asleep.
 
 Install:
 
