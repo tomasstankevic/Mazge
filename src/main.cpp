@@ -305,6 +305,7 @@ struct BurstArchive {
   uint16_t v2HttpMs[RING_SIZE];       // wall-clock POST + parse
   int16_t  v2HttpCode[RING_SIZE];     // raw HTTP status (0 if no conn)
   uint16_t v2LockoutSec[RING_SIZE];   // server-prescribed lockout per frame
+  int8_t   v2ShouldContinue[RING_SIZE]; // whether another frame can improve the decision
   char     v2CatId[RING_SIZE][12];    // "mazge"/"benis"/"unknown"
   char     v2Severity[RING_SIZE][12]; // "none"/"low"/"medium"/"high"
   char     v2DoorAction[RING_SIZE][12]; // "allow"/"deny"
@@ -673,6 +674,7 @@ void freezeRingToArchive() {
     burstArchives[slot].v2HttpMs[i] = 0;
     burstArchives[slot].v2HttpCode[i] = 0;
     burstArchives[slot].v2LockoutSec[i] = 0;
+    burstArchives[slot].v2ShouldContinue[i] = -1;
     burstArchives[slot].v2CatId[i][0] = '\0';
     burstArchives[slot].v2Severity[i][0] = '\0';
     burstArchives[slot].v2DoorAction[i][0] = '\0';
@@ -840,11 +842,12 @@ void saveBurstToSd(int archIdx) {
         }
         mf.print('"');
       };
-      mf.printf("{\"status\":%d,\"http\":%d,\"httpMs\":%u,\"decisionMs\":%u,"
+      mf.printf("{\"status\":%d,\"http\":%d,\"httpMs\":%u,\"decisionMs\":%u,\"shouldContinue\":%d,"
                 "\"detected\":%d,\"catRecognized\":%d,"
                 "\"preyScore\":%.4f,\"catConfidence\":%.4f,",
                 (int)arch.v2Status[i], (int)arch.v2HttpCode[i],
                 (unsigned)arch.v2HttpMs[i], (unsigned)arch.v2DecisionMs[i],
+                (int)arch.v2ShouldContinue[i],
                 (int)arch.v2Detected[i], (int)arch.v2CatRecognized[i],
                 arch.v2PreyScore[i], arch.v2CatConfidence[i]);
       mf.print("\"catId\":");      esc(arch.v2CatId[i]);
@@ -884,7 +887,12 @@ void saveBurstToSd(int archIdx) {
 // Endpoint expects raw image/jpeg body + X-* headers. Plain HTTP only —
 // the server runs on the same LAN and TLS would just burn CPU.
 
-#define V2_HTTP_TIMEOUT_MS 1500   // server p50 ~430ms full pipeline + raw frame upload
+// Known-good bound: server p50 ~120ms, normal total HTTP p95 ~1s. 1500ms leaves
+// headroom for the raw-JPEG upload without converting slow-but-successful frames
+// into failures+retries (tightening this to 1000/600 tripled the error rate on a
+// lossy link and did NOT bound single-frame upload stalls, which happen in the
+// TCP write loop below the HTTPClient timeout).
+#define V2_HTTP_TIMEOUT_MS 1500
 #define V2_TLS_MAX_AGE_MS  (10UL * 60UL * 1000UL)
 
 // Dedicated v2 transport state. Owned solely by v2Task — never touched from
@@ -931,24 +939,23 @@ struct V2BurstStat {
 static V2BurstStat g_v2BurstRing[V2_BURST_RING];
 static volatile uint32_t g_v2BurstRingCount = 0;
 
-// Build a fresh HTTPClient + WiFiClient for a single v2 POST.
-// Rationale: Arduino HTTPClient::addHeader() APPENDS to an internal header
-// list. Reusing the same client across calls makes the per-frame
-// X-Burst-Id / X-Request-Id / X-Frame-Index headers pile up, inflating the
-// request and eventually overflowing buffers. Per-call rebuild also
-// sidesteps any half-closed-socket weirdness on the server side.
-//
-// Cost on LAN: ~5-15ms for socket open. Compared to the prey_v3 inference
-// p95 (~320ms), that's noise.
-static bool v2OpenForCall() {
+static void v2CloseTransport() {
   if (g_v2_http) { g_v2_http->end(); delete g_v2_http; g_v2_http = NULL; }
   if (g_v2_tcp)  { g_v2_tcp->stop(); delete g_v2_tcp;  g_v2_tcp  = NULL; }
+}
+
+// Reuse one TCP connection for all frames in a burst. HTTPClient::addHeader()
+// replaces existing same-name headers by default, so per-frame IDs do not
+// accumulate. Reconnecting per frame dominated the live timing variance.
+static bool v2OpenForCall() {
+  if (g_v2_http && g_v2_tcp && g_v2_tcp->connected()) return true;
+  v2CloseTransport();
 
   g_v2_tcp = new WiFiClient();
   if (!g_v2_tcp) return false;
 
   g_v2_http = new HTTPClient();
-  g_v2_http->setReuse(false);
+  g_v2_http->setReuse(true);
   if (!g_v2_http->begin(*g_v2_tcp, PREY_V2_URL)) {
     delete g_v2_http; g_v2_http = NULL;
     delete g_v2_tcp;  g_v2_tcp  = NULL;
@@ -1078,6 +1085,7 @@ static int callPreyV2(BurstArchive *arch, int frameIdx,
     if (ls > 65535) ls = 65535;
     arch->v2LockoutSec[frameIdx] = (uint16_t)ls;
   }
+  arch->v2ShouldContinue[frameIdx] = (int8_t)v2_field_bool(body, "should_continue_burst");
   v2_field_str(body, "cat_id",      arch->v2CatId[frameIdx],      sizeof(arch->v2CatId[0]));
   v2_field_str(body, "severity",    arch->v2Severity[frameIdx],   sizeof(arch->v2Severity[0]));
   v2_field_str(body, "door_action", arch->v2DoorAction[frameIdx], sizeof(arch->v2DoorAction[0]));
@@ -1222,6 +1230,9 @@ void autonomousApiCheck(int archIdx) {
   archive.apiCallMs = millis();
   archive.apiPreyDetected = 0;
   apiAbandonRequested = false;  // fresh task, clear any stale abandon flag
+  // Avoid an idle half-closed socket from a previous burst, then reuse the
+  // new connection for this burst's back-to-back requests.
+  v2CloseTransport();
 
   Serial.printf("API: v2 check, %d frames ready, archive %d (gen %d)\n",
     archive.count, archIdx, archive.generation);
@@ -1302,15 +1313,22 @@ void autonomousApiCheck(int archIdx) {
     // Legacy apiResults compat for SD meta / event log: 1 = prey detected.
     archive.apiResults[i] = (archive.v2Detected[i] == 1) ? 1 : 0;
 
-    // Early-exit when server is confident (high or critical severity).
-    if (!strcmp(archive.v2Severity[i], "high") || !strcmp(archive.v2Severity[i], "critical")) {
-      Serial.printf("API: server signaled %s severity \u2014 stopping early\n",
-                    archive.v2Severity[i]);
+    // Early-exit ONLY when prey is confidently detected (severity high/critical):
+    // the prey is already caught, so more frames can't change the deny decision.
+    // We deliberately do NOT early-exit on a confident CLEAN-cat frame, even
+    // though the server sets should_continue_burst=false for it: a cat can carry
+    // prey that isn't visible in the first clean frame, so we always send all
+    // MAX_API_FRAMES to preserve prey recall (matches pre-2026-07 behaviour).
+    if (archive.v2Detected[i] == 1 &&
+        (!strcmp(archive.v2Severity[i], "high") || !strcmp(archive.v2Severity[i], "critical"))) {
+      Serial.printf("API: confident prey at f[%d] (%s) - stopping early\n",
+                    i, archive.v2Severity[i]);
       break;
     }
   }
 
   archive.apiDoneMs = millis();
+  v2CloseTransport();
   Serial.printf("API: done. %d frames sent, %d ok (denies=%d allows=%d catRec=%d preyDet=%d maxLock=%us)\n",
     archive.apiFramesSent, okSoFar, anyDeny, anyAllow,
     catRecognizedCount, preyDetectedCount, (unsigned)maxLockoutS);
@@ -1457,8 +1475,8 @@ void autonomousApiCheck(int archIdx) {
   if (v2CatRec > 0) v2Flags |= 0x02;
   v2Flags |= (modalCatBits & 0x03) << 2;
   uint8_t v2OkFrames = (uint8_t)(v2Ok > 255 ? 255 : v2Ok);
-  unsigned long v2BurstTotalMs = (archive.apiCallMs && millis() > archive.apiCallMs)
-                                   ? (millis() - archive.apiCallMs) : 0;
+  unsigned long v2BurstTotalMs = (archive.apiCallMs && archive.apiDoneMs > archive.apiCallMs)
+                                   ? (archive.apiDoneMs - archive.apiCallMs) : 0;
   {
     V2BurstStat bs;
     bs.totalMs       = (uint16_t)(v2BurstTotalMs > 65535 ? 65535 : v2BurstTotalMs);
@@ -1499,6 +1517,12 @@ volatile uint32_t apiAbandonCount = 0;              // total abandons since boot
 // Diagnostics: persisted across boots so we can see crash patterns remotely.
 static uint32_t bootResetReason = 0;       // ESP reset-reason code from this boot
 static uint32_t bootCounter = 0;           // total boots since the firmware was first flashed
+// WiFi link diagnostics. The Arduino core auto-reconnects on drops, and every
+// reconnect resets power-save back to the default WIFI_PS_MIN_MODEM (DTIM sleep
+// = periodic 100-300ms stalls). We re-apply WIFI_PS_NONE on each connect and
+// count reconnects so a flaky link is visible in /diag.
+static volatile uint32_t wifiReconnects = 0;   // STA connect events since boot (includes first)
+static volatile uint32_t wifiDisconnects = 0;  // STA disconnect events since boot
 // API_TASK_DEADLINE_MS forward-declared above near autonomousApiCheck
 #define API_TASK_HARD_RESET_AFTER 5                 // consecutive abandons before reboot
 static inline bool apiTaskBusy() {
@@ -2310,7 +2334,7 @@ static esp_err_t diag_handler(httpd_req_t *req) {
     "{\"bootCount\":%u,\"resetReason\":%u,\"resetReasonName\":\"%s\","
     "\"persistedRR\":%u,\"uptimeMs\":%lu,"
     "\"freeHeap\":%u,\"minFreeHeap\":%u,\"freePsram\":%u,\"minFreePsram\":%u,"
-    "\"loopStackHW\":%u,"
+    "\"loopStackHW\":%u,\"wifiReconnects\":%u,\"wifiDisconnects\":%u,"
     "\"apiAbandons\":%u,\"rssi\":%d"
 #ifdef PREY_V2_URL
     ",\"v2Enabled\":%s,\"v2Calls\":%u,\"v2Ok\":%u,\"v2Err\":%u,\"v2Drops\":%u"
@@ -2320,7 +2344,7 @@ static esp_err_t diag_handler(httpd_req_t *req) {
     (unsigned)lastRR, millis(),
     (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMinFreeHeap(),
     (unsigned)ESP.getFreePsram(), (unsigned)ESP.getMinFreePsram(),
-    (unsigned)loopHW,
+    (unsigned)loopHW, (unsigned)wifiReconnects, (unsigned)wifiDisconnects,
     (unsigned)apiAbandonCount, (int)WiFi.RSSI()
 #ifdef PREY_V2_URL
     , g_v2Enabled ? "true" : "false",
@@ -3707,6 +3731,29 @@ void startUIServer() {
   }
 }
 
+// Re-apply WiFi radio settings that the Arduino core resets on every
+// (re)connect. Critically WIFI_PS_NONE: without this, an auto-reconnect on a
+// flaky link silently re-enables DTIM modem-sleep, adding ~100-300ms of
+// buffering to server responses (visible as httpMs spikes / RTT jitter).
+static void wifiApplyRadioSettings() {
+  esp_wifi_set_ps(WIFI_PS_NONE);
+  esp_wifi_set_max_tx_power(78);  // 19.5 dBm
+}
+
+static void onWiFiEvent(WiFiEvent_t event) {
+  switch (event) {
+    case ARDUINO_EVENT_WIFI_STA_CONNECTED:
+      wifiReconnects++;
+      wifiApplyRadioSettings();  // re-assert PS_NONE + TX power after reconnect
+      break;
+    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+      wifiDisconnects++;
+      break;
+    default:
+      break;
+  }
+}
+
 // ===== Setup =====
 void setup() {
   Serial.begin(115200);
@@ -3804,6 +3851,11 @@ void setup() {
   }
   Serial.printf("Camera ready: JPEG %dx%d, HDR gain bracketing\n", CAM_W, CAM_H);
 
+  // Register the WiFi event handler BEFORE connecting so we catch the initial
+  // STA_CONNECTED and re-assert radio settings on every subsequent reconnect.
+  WiFi.onEvent(onWiFiEvent);
+  WiFi.setAutoReconnect(true);
+  WiFi.persistent(false);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   Serial.print("Connecting to WiFi");
   while (WiFi.status() != WL_CONNECTED) {
@@ -3853,14 +3905,12 @@ void setup() {
     }
   }
 
-  // FIX 2: Disable WiFi power save mode.
+  // FIX 2: Disable WiFi power save mode + set near-max TX power.
   // Default is WIFI_PS_MIN_MODEM — the radio sleeps between DTIM beacons
-  // (~100-300ms), causing periodic TCP stalls visible as stream freezes.
-  esp_wifi_set_ps(WIFI_PS_NONE);
-
-  // FIX 7: Set WiFi TX power to near maximum for strongest signal.
-  // Value is in 0.25dBm units. 78 = 19.5dBm (near max of 20dBm).
-  esp_wifi_set_max_tx_power(78);
+  // (~100-300ms), causing periodic TCP stalls visible as stream freezes and
+  // inflated server-response latency. onWiFiEvent() re-asserts these on every
+  // reconnect (the Arduino core resets them each time the link drops).
+  wifiApplyRadioSettings();
 
   // Blynk IoT: connect using already-established WiFi (no Blynk.begin!)
   Blynk.config(BLYNK_AUTH_TOKEN);
