@@ -218,11 +218,29 @@ def create_app(cfg: Config | None = None) -> FastAPI:
 
     @app.get("/healthz")
     def healthz() -> dict[str, Any]:
-        return {
+        esp_status = None
+        if cfg.esp_host:
+            from . import esp_proxy
+            status = esp_proxy.get_status()
+            if status:
+                esp_status = {
+                    "reachable": status.is_healthy,
+                    "last_success_s_ago": (
+                        round((time.time() * 1000 - status.last_success_ms) / 1000)
+                        if status.last_success_ms else None
+                    ),
+                    "success_count": status.success_count,
+                    "error_count": status.error_count,
+                }
+        
+        result = {
             "ok": True,
             "backend": pipeline.backend,
             "uptime_s": int(time.time() - started_at),
         }
+        if esp_status:
+            result["esp"] = esp_status
+        return result
 
     @app.post("/v1/compat")
     async def v1_compat(request: Request) -> JSONResponse:
