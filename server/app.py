@@ -136,7 +136,7 @@ def _setup_logging(log_dir: Path) -> None:
         log_dir / "server.jsonl",
         when="midnight",
         utc=True,
-        backupCount=30,
+        backupCount=0,  # 0 = never delete rotated logs; retain all history forever
         encoding="utf-8",
     )
     handler.suffix = "%Y-%m-%d"
@@ -145,6 +145,11 @@ def _setup_logging(log_dir: Path) -> None:
     root.setLevel(logging.INFO)
     root.addHandler(handler)
     root.addHandler(logging.StreamHandler())
+    # Keep server.jsonl clean, machine-parseable metadata: the httpx/httpcore
+    # clients emit an INFO "HTTP Request: ..." line per ESP poll, which is not
+    # JSON and pollutes the retained history. Silence them below WARNING.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 def create_app(cfg: Config | None = None) -> FastAPI:
