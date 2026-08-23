@@ -4,22 +4,6 @@
 <dict>
 	<key>EnvironmentVariables</key>
 	<dict>
-		<key>MAZGE_DEBUG_DUMP_DIR</key>
-		<string>/Users/tomas/Mazge/logs/server/debug-dump</string>
-		<key>MAZGE_LOG_DIR</key>
-		<string>/Users/tomas/Mazge/logs/server</string>
-		<key>MAZGE_MODEL_BACKEND</key>
-		<string>onnx</string>
-		<key>MAZGE_PORT</key>
-		<string>8080</string>
-		<key>MAZGE_PREY_ONNX</key>
-		<string>/Users/tomas/Mazge/_bench_weights/prey_v3_bodyA_s480_224.onnx</string>
-		<key>MAZGE_THREADS</key>
-		<string>2</string>
-		<key>MAZGE_YOLO_IMGSZ</key>
-		<string>480</string>
-		<key>MAZGE_YOLO_ONNX</key>
-		<string>/Users/tomas/Mazge/_bench_weights/yolo11s_480.onnx</string>
 		<key>PATH</key>
 		<string>/Users/tomas/Mazge/.venv-server/bin:/usr/local/bin:/usr/bin:/bin</string>
 	</dict>
@@ -36,15 +20,7 @@
 	<string>Interactive</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>/usr/bin/caffeinate</string>
-		<string>-i</string>
-		<string>-s</string>
-		<string>/Users/tomas/Mazge/.venv-server/bin/uvicorn</string>
-		<string>server.app:app</string>
-		<string>--host</string>
-		<string>0.0.0.0</string>
-		<string>--port</string>
-		<string>8080</string>
+		<string>/Users/tomas/Mazge/ops/launchd/run-server.sh</string>
 	</array>
 	<key>RunAtLoad</key>
 	<true/>
