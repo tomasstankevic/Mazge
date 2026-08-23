@@ -28,6 +28,7 @@ Keyboard:
   y / n / u   prey: yes / no / unclear
   e / x / U   direction: entering / exiting / unclear (capital U)
   c / h / o   subject: cat / human / other  (E for empty, S for unclear)
+  m / b / k   cat id: mazge / benis / unclear
   enter       save and advance
   ←  →        prev / next burst
   1..9 0      jump to frame f0..f9
@@ -72,6 +73,7 @@ def rebuild_label_index() -> None:
                 continue
             entry = LABEL_INDEX.setdefault(image_id, {
                 "prey": None, "direction": None, "subject": None,
+                "cat_id": None,
                 "yolo_subject": None, "yolo_notes": None,
             })
             src = rec.get("source", "")
@@ -81,6 +83,8 @@ def rebuild_label_index() -> None:
                 entry["direction"] = {"label": rec.get("label"), "notes": rec.get("notes")}
             elif src.startswith("human:") and src.endswith(":burst_subject"):
                 entry["subject"] = {"label": rec.get("label"), "notes": rec.get("notes")}
+            elif src.startswith("human:") and src.endswith(":burst_cat_id"):
+                entry["cat_id"] = {"label": rec.get("label"), "notes": rec.get("notes")}
             elif src == "model:yolo11n_subject_v1":
                 entry["yolo_subject"] = rec.get("label")
                 entry["yolo_notes"] = rec.get("notes")
@@ -101,21 +105,26 @@ def existing_labels(image_id: str) -> dict:
     O(1) lookup using the cached LABEL_INDEX."""
     return LABEL_INDEX.get(image_id, {
         "prey": None, "direction": None, "subject": None,
+        "cat_id": None,
         "yolo_subject": None, "yolo_notes": None,
     })
 
 
 def build_queue(filter_mode: str, since: str | None = None,
-                until: str | None = None) -> list[dict]:
+                until: str | None = None, only: set[str] | None = None) -> list[dict]:
     """Return list of burst dicts to label, in priority order.
 
     `since` / `until` are inclusive 8-digit date prefixes (YYYYMMDD) matched
     against the burst folder name. Folders whose name does not start with an
     8-digit date are skipped when either bound is set.
+
+    `only` restricts the queue to an explicit set of burst-folder names.
     """
     items = []
     for d in sorted(SD.iterdir()):
         if not d.is_dir():
+            continue
+        if only is not None and d.name not in only:
             continue
         if since or until:
             prefix = d.name[:8]
@@ -178,6 +187,21 @@ def build_queue(filter_mode: str, since: str | None = None,
         else:
             burst_yolo = 0  # all empty
 
+        # Server model predictions (present only for server-ingested bursts).
+        srv_frames = meta.get("server", {}).get("frames", [])
+        srv_confs = [sf.get("cat_confidence") for sf in srv_frames
+                     if isinstance(sf.get("cat_confidence"), (int, float))]
+        srv_cat_ids = [sf.get("cat_id") for sf in srv_frames if sf.get("cat_id")]
+        srv_preys = [sf.get("prey_score") for sf in srv_frames
+                     if isinstance(sf.get("prey_score"), (int, float))]
+        server_cat_id = (max(set(srv_cat_ids), key=srv_cat_ids.count)
+                         if srv_cat_ids else None)
+        server_min_cat_conf = min(srv_confs) if srv_confs else None
+        server_max_prey = max(srv_preys) if srv_preys else None
+        # "Borderline" = the model's cat-id confidence sat in the reject band
+        # (CAT_CONF_THRESHOLD=0.70) on any frame -> exactly the failure cases.
+        server_cat_borderline = any(0.50 <= c <= 0.72 for c in srv_confs)
+
         items.append({
             "burst_id": d.name,
             "rep_idx": rep_idx,
@@ -197,6 +221,10 @@ def build_queue(filter_mode: str, since: str | None = None,
             "is_disagreement": is_disagreement,
             "burst_yolo": burst_yolo,        # 0=empty 1=cat 2=human 3=other
             "yolo_counts": yolo_counts,
+            "server_cat_id": server_cat_id,
+            "server_min_cat_conf": server_min_cat_conf,
+            "server_max_prey": server_max_prey,
+            "server_cat_borderline": server_cat_borderline,
         })
 
     if filter_mode == "prey-positive":
@@ -207,6 +235,9 @@ def build_queue(filter_mode: str, since: str | None = None,
         items = [x for x in items if x["burst_yolo"] == 2 or x["yolo_counts"][2] >= 2]
     elif filter_mode == "other":
         items = [x for x in items if x["burst_yolo"] == 3 or x["yolo_counts"][3] >= 1]
+    elif filter_mode == "cat-borderline":
+        # Server-ingested bursts where the cat-id head was in the reject band.
+        items = [x for x in items if x["server_cat_borderline"]]
     elif filter_mode == "unlabelled":
         # Keep items whose representative frame doesn't have a human label
         # for both prey AND direction.
@@ -286,6 +317,7 @@ HTML = r"""<!doctype html>
         <tr><td>frame</td><td><b id="frameInfo">&mdash;</b></td></tr>
         <tr><td>distance</td><td id="distInfo">&mdash;</td></tr>
         <tr><td>API verdict</td><td id="apiInfo">&mdash;</td></tr>
+        <tr><td>server</td><td id="serverInfo">&mdash;</td></tr>
       </table>
     </div>
 
@@ -322,6 +354,15 @@ HTML = r"""<!doctype html>
     </div>
 
     <div class="group">
+      <div class="label">Cat ID <span style="color:#666">(m/b/k)</span></div>
+      <div class="btnrow">
+        <button class="btn" data-cat="mazge" id="btnCatMazge">Mazge</button>
+        <button class="btn exit" data-cat="benis" id="btnCatBenis">Benis</button>
+        <button class="btn unclear" data-cat="u" id="btnCatU">?</button>
+      </div>
+    </div>
+
+    <div class="group">
       <div class="label">Notes (optional)</div>
       <textarea id="notes" placeholder="e.g. mouse, very fast, partial occlusion"></textarea>
     </div>
@@ -337,7 +378,7 @@ HTML = r"""<!doctype html>
 </div>
 
 <script>
-const state = { queue: [], idx: 0, current: null, frame: 7, prey: null, direction: null, subject: null };
+const state = { queue: [], idx: 0, current: null, frame: 7, prey: null, direction: null, subject: null, cat_id: null };
 
 async function fetchJSON(url, opts) {
   const r = await fetch(url, opts);
@@ -387,6 +428,17 @@ function render() {
   document.getElementById("apiInfo").textContent = api;
   document.getElementById("apiInfo").style.color = (c.is_disagreement ? "#fb6" : "#ddd");
 
+  // Server model's own prediction (only for server-ingested bursts).
+  let srv = "\u2014";
+  if (c.server_cat_id) {
+    srv = c.server_cat_id;
+    if (c.server_min_cat_conf != null) srv += " (min conf " + c.server_min_cat_conf.toFixed(2) + ")";
+    if (c.server_max_prey != null) srv += ", prey\u2264" + c.server_max_prey.toFixed(2);
+    if (c.server_cat_borderline) srv += "  \u26a0 borderline";
+  }
+  const si = document.getElementById("serverInfo");
+  if (si) { si.textContent = srv; si.style.color = c.server_cat_borderline ? "#fb6" : "#ddd"; }
+
   // Existing human labels
   const ex = c.existing || {prey:null, direction:null, subject:null, yolo_subject:null, yolo_notes:null};
   const SUBJ = {0:"empty", 1:"cat", 2:"human", 3:"other"};
@@ -394,6 +446,7 @@ function render() {
   if (ex.prey)      parts.push("prey=" + (ex.prey.label === 1 ? "yes" : ex.prey.label === 0 ? "no" : "unclear"));
   if (ex.direction) parts.push("dir="  + (ex.direction.label === 1 ? "exiting" : ex.direction.label === 0 ? "entering" : "unclear"));
   if (ex.subject)   parts.push("subj=" + (SUBJ[ex.subject.label] || "unclear"));
+  if (ex.cat_id)    parts.push("cat=" + (ex.cat_id.label || "unclear"));
   document.getElementById("existing").innerHTML = parts.length ? "Prior human label: <b>" + parts.join(", ") + "</b>" : "No prior human label";
 
   // YOLO hint for the current frame + burst-level (reuse `f` declared above)
@@ -407,7 +460,8 @@ function render() {
 
   // Selection state
   for (const id of ["btnPreyYes","btnPreyNo","btnPreyU","btnDirEnter","btnDirExit","btnDirU",
-                    "btnSubjCat","btnSubjHuman","btnSubjOther","btnSubjEmpty","btnSubjU"]) {
+                    "btnSubjCat","btnSubjHuman","btnSubjOther","btnSubjEmpty","btnSubjU",
+                    "btnCatMazge","btnCatBenis","btnCatU"]) {
     document.getElementById(id).classList.remove("sel");
   }
   if (state.prey === 1) document.getElementById("btnPreyYes").classList.add("sel");
@@ -421,6 +475,9 @@ function render() {
   if (state.subject === 3) document.getElementById("btnSubjOther").classList.add("sel");
   if (state.subject === 0) document.getElementById("btnSubjEmpty").classList.add("sel");
   if (state.subject === "u") document.getElementById("btnSubjU").classList.add("sel");
+  if (state.cat_id === "mazge") document.getElementById("btnCatMazge").classList.add("sel");
+  if (state.cat_id === "benis") document.getElementById("btnCatBenis").classList.add("sel");
+  if (state.cat_id === "u") document.getElementById("btnCatU").classList.add("sel");
 
   renderStrip();
 }
@@ -428,9 +485,10 @@ function render() {
 function selectPrey(v)      { state.prey = v;      render(); }
 function selectDirection(v) { state.direction = v; render(); }
 function selectSubject(v)   { state.subject = v;   render(); }
+function selectCatId(v)     { state.cat_id = v;    render(); }
 
 async function save() {
-  if (state.prey === null && state.direction === null && state.subject === null) {
+  if (state.prey === null && state.direction === null && state.subject === null && state.cat_id === null) {
     document.getElementById("saved").textContent = "Nothing to save.";
     return;
   }
@@ -443,6 +501,7 @@ async function save() {
       prey: state.prey,
       direction: state.direction,
       subject: state.subject,
+      cat_id: state.cat_id,
       notes: notes || null,
     }),
   });
@@ -462,6 +521,8 @@ async function loadIdx(i) {
   state.prey = state.current.existing?.prey?.label ?? null;
   state.direction = state.current.existing?.direction?.label ?? null;
   state.subject = state.current.existing?.subject?.label ?? null;
+  const _cid = state.current.existing?.cat_id?.label ?? null;
+  state.cat_id = (_cid === "unknown") ? "u" : _cid;
   document.getElementById("notes").value = "";
   document.getElementById("saved").textContent = "\u00a0";
   render();
@@ -480,6 +541,9 @@ window.addEventListener("keydown", (e) => {
   else if (e.key === "o") selectSubject(3);
   else if (e.key === "E") selectSubject(0);
   else if (e.key === "S") selectSubject("u");
+  else if (e.key === "m") selectCatId("mazge");
+  else if (e.key === "b") selectCatId("benis");
+  else if (e.key === "k") selectCatId("u");
   else if (e.key === "Enter") save();
   else if (e.key === "ArrowRight") advance(+1);
   else if (e.key === "ArrowLeft")  advance(-1);
@@ -499,6 +563,9 @@ document.getElementById("btnSubjHuman").onclick = () => selectSubject(2);
 document.getElementById("btnSubjOther").onclick = () => selectSubject(3);
 document.getElementById("btnSubjEmpty").onclick = () => selectSubject(0);
 document.getElementById("btnSubjU").onclick     = () => selectSubject("u");
+document.getElementById("btnCatMazge").onclick  = () => selectCatId("mazge");
+document.getElementById("btnCatBenis").onclick  = () => selectCatId("benis");
+document.getElementById("btnCatU").onclick      = () => selectCatId("u");
 document.getElementById("btnPrev").onclick    = () => advance(-1);
 document.getElementById("btnSkip").onclick    = () => advance(+1);
 document.getElementById("btnSave").onclick    = () => save();
@@ -583,6 +650,7 @@ def make_handler(filter_mode: str):
             prey = body.get("prey")
             direction = body.get("direction")
             subject = body.get("subject")
+            cat_id = body.get("cat_id")
             notes = body.get("notes")
             burst_dir = SD / burst_id
             meta = burst_meta(burst_dir) or {}
@@ -628,6 +696,17 @@ def make_handler(filter_mode: str):
                         }
                         f.write(json.dumps(rec, sort_keys=True) + "\n")
                         added += 1
+                    if cat_id is not None:
+                        rec = {
+                            "image_id": image_id,
+                            "source": f"human:{USER}:burst_cat_id",
+                            "label": "unknown" if cat_id == "u" else cat_id,
+                            "confidence": 1.0 if cat_id != "u" else 0.0,
+                            "ts": now,
+                            "notes": (notes or "") + (" [unclear]" if cat_id == "u" else ""),
+                        }
+                        f.write(json.dumps(rec, sort_keys=True) + "\n")
+                        added += 1
             rep_name = next(
                 (img.get("f") for img in images if img.get("f")), images[0].get("f")
                 if images else "")
@@ -646,17 +725,25 @@ def main() -> None:
         "--filter",
         default="prey-positive",
         choices=["prey-positive", "disagreement", "unlabelled", "all",
-                 "human", "other"],
+                 "human", "other", "cat-borderline"],
     )
     ap.add_argument("--since", help="YYYYMMDD, inclusive lower bound on burst date")
     ap.add_argument("--until", help="YYYYMMDD, inclusive upper bound on burst date")
+    ap.add_argument("--bursts", help="path to a newline-separated burst-id "
+                    "allowlist; serves exactly those bursts (implies --filter all)")
     args = ap.parse_args()
+
+    only = None
+    if args.bursts:
+        only = {l.strip() for l in open(args.bursts) if l.strip()}
+        args.filter = "all"
+        print(f"Restricting to {len(only)} bursts from {args.bursts}", flush=True)
 
     print(f"Building queue (filter={args.filter})...", flush=True)
     rebuild_label_index()
     print(f"  loaded {len(LABEL_INDEX)} labelled image entries", flush=True)
     global BURSTS
-    BURSTS = build_queue(args.filter, since=args.since, until=args.until)
+    BURSTS = build_queue(args.filter, since=args.since, until=args.until, only=only)
     print(f"  -> {len(BURSTS)} bursts in queue", flush=True)
     if not BURSTS:
         print("Nothing to label. Try --filter all", flush=True)

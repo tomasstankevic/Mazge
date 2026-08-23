@@ -56,6 +56,13 @@ dataset/crops_*/
 # Auto-downloaded YOLO weights in repo root
 /yolo11*.pt
 
+# Manually-copied production data dump from the server Mac (large, unlabeled)
+_server_dump/
+_server_logs/
+
+# Multitask model training outputs (checkpoints + logs, regenerated)
+models/multitask/
+
 # Subject-detection benchmark outputs (regenerated)
 models/subject_detection_eval/
 
