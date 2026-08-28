@@ -156,10 +156,11 @@ prey+cat. subject/direction outputs are latent until wired up (optional, below).
    ```bash
    # ~/.config/mazge/server.env
    MAZGE_PREY_ONNX=/Users/tomas/Mazge/_bench_weights/multitask_combined_v1_224.onnx
+   MAZGE_PREY_DETECT=0.76     # per-frame prey detect floor, calibrated to combined_v1 (FN=0)
    ```
-   Threshold: change `PREY_MEDIUM = 0.50` → `PREY_MEDIUM = 0.76` in
-   `server/decisions.py` (per-frame detect floor). **Do this atomically with the
-   ONNX swap** — 0.76 is calibrated to the new model's scores, not the old one.
+   Both are read at server startup, so the threshold swaps atomically with the
+   model — no code edit needed (`PREY_MEDIUM`/`PREY_HIGH`/`CAT_CONF_THRESHOLD` in
+   `server/decisions.py` are now env-overridable, defaults unchanged at 0.50/0.90/0.70).
 4. Restart + verify:
    ```bash
    launchctl kickstart -k gui/$(id -u)/com.mazge.server
@@ -167,7 +168,7 @@ prey+cat. subject/direction outputs are latent until wired up (optional, below).
    uv run python -m pytest server/tests/ -q     # 18 pass
    ```
 5. **Rollback:** point `MAZGE_PREY_ONNX` back at the old
-   `prey_v3_bodyA_s480_224.onnx`, revert the `PREY_MEDIUM` line, kickstart.
+   `prey_v3_bodyA_s480_224.onnx`, remove `MAZGE_PREY_DETECT` (reverts to 0.50), kickstart.
 
 ### Optional (later): use the subject + direction heads
 

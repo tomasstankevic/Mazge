@@ -5,6 +5,7 @@ See doc/inference_api_v2_contract.md "normative severity to lockout mapping".
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 # Cat IDs that the prey_v3 / cat_id_v2 heads emit (train_prey_v3.CAT_MAP order).
@@ -19,11 +20,13 @@ SEVERITY_LOCKOUT_S: dict[str, int] = {
 }
 
 # Threshold above which we treat cat_id softmax as a confident identification.
-CAT_CONF_THRESHOLD = 0.70
+CAT_CONF_THRESHOLD = float(os.environ.get("MAZGE_CAT_CONF_THRESHOLD", "0.70"))
 
-# prey_score thresholds for severity bucketing. Tunable; keep in one place.
-PREY_HIGH = 0.90
-PREY_MEDIUM = 0.50
+# prey_score thresholds for severity bucketing. Env-overridable so a model swap
+# ships its calibrated threshold via server.env, atomically with MAZGE_PREY_ONNX.
+# combined_v1 (2026-08 retrain) wants MAZGE_PREY_DETECT=0.76 (keeps FN=0, cuts FP).
+PREY_HIGH = float(os.environ.get("MAZGE_PREY_HIGH", "0.90"))
+PREY_MEDIUM = float(os.environ.get("MAZGE_PREY_DETECT", "0.50"))
 
 
 @dataclass(frozen=True)
